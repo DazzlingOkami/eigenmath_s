@@ -1,284 +1,311 @@
-/* March 26, 2019
-
-License: FreeBSD
+/* December 27, 2020
 
 To build and run:
 
-	$ gcc -O0 -o eigenmath eigenmath.c -lm
-	$ ./eigenmath
+	gcc -O0 eigenmath.c -lm
+	./a.out
 
-Press control-C to exit.
+Press ctrl-C to exit.
 
-To run a script:
+See also github.com/georgeweigt/eigenmath
 
-	$ ./eigenmath scriptfilename
 
-A test script is available here:
+BSD 2-Clause License
 
-	www.eigenmath.org/selftest
+Copyright (c) 2020, George Weigt
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <string.h>
 #include <ctype.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <setjmp.h>
 #include <math.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <setjmp.h>
-#include <unistd.h>
-//#include <pthread.h>
 
-#define TOS 1000000 // size of evaluation stack
+#define STACKSIZE 1000000 // evaluation stack
+#define FRAMESIZE 10000 // limits recursion depth, prevents seg fault
+#define BLOCKSIZE 100000
+#define MAXBLOCKS 250
+#define NSYM 100
 
-#define NSYM 1000 // size of symbol table
+// MAXBLOCKS * BLOCKSIZE * sizeof (struct atom) = 600,000,000 bytes
 
-// Symbolic expressions are built by connecting U structs.
+// Symbolic expressions are built by linking structs of type "atom".
 //
-// For example, (a * b + c) is built like this:
+// For example, the expression "a b + c" is built like this:
 //
-//           _______      _______                                _______
-//          |CONS   |--->|CONS   |----------------------------->|CONS   |
-//          |       |    |       |                              |       |
-//          |_______|    |_______|                              |_______|
-//              |            |                                      |
-//           ___v___      ___v___      _______      _______      ___v___
-//          |ADD    |    |CONS   |--->|CONS   |--->|CONS   |    |SYM c  |
-//          |       |    |       |    |       |    |       |    |       |
-//          |_______|    |_______|    |_______|    |_______|    |_______|
-//                           |            |            |
-//                        ___v___      ___v___      ___v___
-//                       |MUL    |    |SYM a  |    |SYM b  |
-//                       |       |    |       |    |       |
-//                       |_______|    |_______|    |_______|
+//  _______      _______                                _______      _______
+// |CONS   |    |CONS   |                              |CONS   |    |SYM    |
+// |car cdr|--->|car cdr|----------------------------->|car cdr|--->|"nil"  |
+// |_|_____|    |_|_____|                              |_|_____|    |_______|
+//   |            |                                      |
+//   |            |                                     _v_____
+//   |            |                                    |SYM    |
+//   |            |                                    |"c"    |
+//   |            |                                    |_______|
+//   |            |
+//  _v_____      _v_____      _______      _______      _______
+// |SYM    |    |CONS   |    |CONS   |    |CONS   |    |SYM    |
+// |"add"  |    |car cdr|--->|car cdr|--->|car cdr|--->|"nil"  |
+// |_______|    |_|_____|    |_|_____|    |_|_____|    |_______|
+//                |            |            |
+//               _v_____      _v_____      _v_____
+//              |SYM    |    |SYM    |    |SYM    |
+//              |"mul"  |    |"a"    |    |"b"    |
+//              |_______|    |_______|    |_______|
+//
+// Programming notes:
+//
+// 1. Automatic C variables of type "struct atom *" should not be used.
+//    Use the global variables p0-p9 instead.
+//    Call save() before using p0-p9, then call restore() when finished.
+//    The use of p0-p9 is required by the garbage collector.
+//
+// 2. Do not use NULL for a car or cdr.
+//    Use the pointer returned by symbol(NIL) instead.
+//    The code does not test for NULL.
 
-typedef struct U {
+struct atom {
 	union {
 		struct {
-			struct U *car;		// pointing down
-			struct U *cdr;		// pointing right
+			struct atom *car;
+			struct atom *cdr;
 		} cons;
-		char *printname;
-		char *str;
-		struct tensor *tensor;
 		struct {
-			unsigned int *a, *b;	// rational number a over b
+			char *name;
+			void (*func)(void);
+		} ksym;
+		struct {
+			char *name;
+			uint32_t index;
+		} usym;
+		struct {
+			uint32_t *a; // rational number a over b
+			uint32_t *b;
 		} q;
 		double d;
+		char *str;
+		struct tensor *tensor;
 	} u;
-	unsigned char k, tag;
-} U;
-
-// the following enum is for struct U, member k
-
-enum {
-	CONS,
-	NUM,
-	DOUBLE,
-	STR,
-	TENSOR,
-	SYM,
+	uint8_t k, tag, sign;
 };
 
-// the following enum is for indexing the symbol table
+#define CONS		0
+#define KSYM		1
+#define USYM		2
+#define RATIONAL	3
+#define DOUBLE		4
+#define STR		5
+#define TENSOR		6
 
-enum {
-	ABS,
-	ADD,
-	ADJ,
-	AND,
-	ARCCOS,
-	ARCCOSH,
-	ARCSIN,
-	ARCSINH,
-	ARCTAN,
-	ARCTANH,
-	ARG,
-	ATOMIZE,
-	BESSELJ,
-	BESSELY,
-	BINDING,
-	BINOMIAL,
-	CEILING,
-	CHECK,
-	CHOOSE,
-	CIRCEXP,
-	CLOCK,
-	COEFF,
-	COFACTOR,
-	CONDENSE,
-	CONJ,
-	CONTRACT,
-	COS,
-	COSH,
-	DECOMP,
-	DEFINT,
-	DEGREE,
-	DENOMINATOR,
-	DERIVATIVE,
-	DET,
-	DIM,
-	DISPLAY,
-	DIVISORS,
-	DO,
-	DOT,
-	DRAW,
-	EIGEN,
-	EIGENVAL,
-	EIGENVEC,
-	ERF,
-	ERFC,
-	EVAL,
-	EXP,
-	EXPAND,
-	EXPCOS,
-	EXPSIN,
-	FACTOR,
-	FACTORIAL,
-	FACTORPOLY,
-	FILTER,
-	FLOATF,
-	FLOOR,
-	FOR,
-	GCD,
-	HERMITE,
-	HILBERT,
-	IMAG,
-	INDEX,
-	INNER,
-	INTEGRAL,
-	INV,
-	INVG,
-	ISINTEGER,
-	ISPRIME,
-	LAGUERRE,
-	LCM,
-	LEADING,
-	LEGENDRE,
-	LOG,
-	MAG,
-	MOD,
-	MULTIPLY,
-	NOT,
-	NROOTS,
-	NUMBER,
-	NUMERATOR,
-	OPERATOR,
-	OR,
-	OUTER,
-	POLAR,
-	POWER,
-	PRIME,
-	PRINT,
-	PRODUCT,
-	QUOTE,
-	QUOTIENT,
-	RANK,
-	RATIONALIZE,
-	REAL,
-	YYRECT,
-	ROOTS,
-	SETQ,
-	SGN,
-	SIMPLIFY,
-	SIN,
-	SINH,
-	SQRT,
-	STOP,
-	SUBST,
-	SUM,
-	TAN,
-	TANH,
-	TAYLOR,
-	TEST,
-	TESTEQ,
-	TESTGE,
-	TESTGT,
-	TESTLE,
-	TESTLT,
-	TRANSPOSE,
-	UNIT,
-	ZERO,
+#define ABS		0
+#define ADJ		1
+#define AND		2
+#define ARCCOS		3
+#define ARCCOSH		4
+#define ARCSIN		5
+#define ARCSINH		6
+#define ARCTAN		7
+#define ARCTANH		8
+#define ARG		9
+#define ATOMIZE		10
 
-	MARK1,	// boundary (symbols above are functions)
+#define BESSELJ		(NSYM + 0)
+#define BESSELY		(NSYM + 1)
+#define BINDING		(NSYM + 2)
+#define BINOMIAL	(NSYM + 3)
 
-	NATNUM,	// natural number
-	NIL,
-	PI,
-	V0,
-	V1,
-	IU,
+#define CEILING		(2 * NSYM + 0)
+#define CHECK		(2 * NSYM + 1)
+#define CHOOSE		(2 * NSYM + 2)
+#define CIRCEXP		(2 * NSYM + 3)
+#define CLEAR		(2 * NSYM + 4)
+#define CLOCK		(2 * NSYM + 5)
+#define COEFF		(2 * NSYM + 6)
+#define COFACTOR	(2 * NSYM + 7)
+#define CONJ		(2 * NSYM + 8)
+#define CONTRACT	(2 * NSYM + 9)
+#define COS		(2 * NSYM + 10)
+#define COSH		(2 * NSYM + 11)
 
-	MARK2,	// boundary (symbols above cannot be bound)
+#define SYMBOL_D	(3 * NSYM + 0)
+#define DEFINT		(3 * NSYM + 1)
+#define DEGREE		(3 * NSYM + 2)
+#define DENOMINATOR	(3 * NSYM + 3)
+#define DERIVATIVE	(3 * NSYM + 4)
+#define DET		(3 * NSYM + 5)
+#define DIM		(3 * NSYM + 6)
+#define DO		(3 * NSYM + 7)
+#define DOT		(3 * NSYM + 8)
+#define DRAW		(3 * NSYM + 9)
 
-	METAA,
-	METAB,
-	METAX,
-	SPECX,
+#define EIGEN		(4 * NSYM + 0)
+#define EIGENVAL	(4 * NSYM + 1)
+#define EIGENVEC	(4 * NSYM + 2)
+#define ERF		(4 * NSYM + 3)
+#define ERFC		(4 * NSYM + 4)
+#define EVAL		(4 * NSYM + 5)
+#define EXIT		(4 * NSYM + 6)
+#define EXP		(4 * NSYM + 7)
+#define EXPAND		(4 * NSYM + 8)
+#define EXPCOS		(4 * NSYM + 9)
+#define EXPCOSH		(4 * NSYM + 10)
+#define EXPSIN		(4 * NSYM + 11)
+#define EXPSINH		(4 * NSYM + 12)
+#define EXPTAN		(4 * NSYM + 13)
+#define EXPTANH		(4 * NSYM + 14)
 
-	SYMBOL_A,
-	SYMBOL_B,
-	SYMBOL_C,
-	SYMBOL_D,
-	SYMBOL_I,
-	SYMBOL_J,
-	SYMBOL_N,
-	SYMBOL_R,
-	SYMBOL_S,
-	SYMBOL_T,
-	SYMBOL_X,
-	SYMBOL_Y,
-	SYMBOL_Z,
+#define FACTOR		(5 * NSYM + 0)
+#define FACTORIAL	(5 * NSYM + 1)
+#define FILTER		(5 * NSYM + 2)
+#define FLOATF		(5 * NSYM + 3)
+#define FLOOR		(5 * NSYM + 4)
+#define FOR		(5 * NSYM + 5)
 
-	AUTOEXPAND,
-	BAKE,
-	LAST,
-	TRACE,
-	TTY,
+#define GCD		(6 * NSYM + 0)
 
-	MARK3,	// boundary (user defined symbols follow)
-};
+#define HERMITE		(7 * NSYM + 0)
+#define HILBERT		(7 * NSYM + 1)
 
-#define EXP1 NATNUM
+#define SYMBOL_I	(8 * NSYM + 0)
+#define IMAG		(8 * NSYM + 1)
+#define INNER		(8 * NSYM + 2)
+#define INTEGRAL	(8 * NSYM + 3)
+#define INV		(8 * NSYM + 4)
+#define ISPRIME		(8 * NSYM + 5)
+
+#define SYMBOL_J	(9 * NSYM + 0)
+
+#define LAGUERRE	(11 * NSYM + 0)
+#define LAST		(11 * NSYM + 1)
+#define LATEX		(11 * NSYM + 2)
+#define LCM		(11 * NSYM + 3)
+#define LEADING		(11 * NSYM + 4)
+#define LEGENDRE	(11 * NSYM + 5)
+#define LISP		(11 * NSYM + 6)
+#define LOG		(11 * NSYM + 7)
+
+#define MAG		(12 * NSYM + 0)
+#define MATHJAX		(12 * NSYM + 1)
+#define MATHML		(12 * NSYM + 2)
+#define MOD		(12 * NSYM + 3)
+
+#define NIL		(13 * NSYM + 0)
+#define NOT		(13 * NSYM + 1)
+#define NROOTS		(13 * NSYM + 2)
+#define NUMBER		(13 * NSYM + 3)
+#define NUMERATOR	(13 * NSYM + 4)
+
+#define OR		(14 * NSYM + 0)
+#define OUTER		(14 * NSYM + 1)
+
+#define PI		(15 * NSYM + 0)
+#define POLAR		(15 * NSYM + 1)
+#define PRIME		(15 * NSYM + 2)
+#define PRINT		(15 * NSYM + 3)
+#define PRODUCT		(15 * NSYM + 4)
+
+#define QUOTE		(16 * NSYM + 0)
+#define QUOTIENT	(16 * NSYM + 1)
+
+#define RANK		(17 * NSYM + 0)
+#define RATIONALIZE	(17 * NSYM + 1)
+#define REAL		(17 * NSYM + 2)
+#define RECTF		(17 * NSYM + 3)
+#define ROOTS		(17 * NSYM + 4)
+#define RUN		(17 * NSYM + 5)
+
+#define SYMBOL_S	(18 * NSYM + 0)
+#define SGN		(18 * NSYM + 1)
+#define SIMPLIFY	(18 * NSYM + 2)
+#define SIN		(18 * NSYM + 3)
+#define SINH		(18 * NSYM + 4)
+#define SQRT		(18 * NSYM + 5)
+#define STATUS		(18 * NSYM + 6)
+#define STOP		(18 * NSYM + 7)
+#define STRING		(18 * NSYM + 8)
+#define SUBST		(18 * NSYM + 9)
+#define SUM		(18 * NSYM + 10)
+
+#define SYMBOL_T	(19 * NSYM + 0)
+#define TAN		(19 * NSYM + 1)
+#define TANH		(19 * NSYM + 2)
+#define TAYLOR		(19 * NSYM + 3)
+#define TEST		(19 * NSYM + 4)
+#define TESTEQ		(19 * NSYM + 5)
+#define TESTGE		(19 * NSYM + 6)
+#define TESTGT		(19 * NSYM + 7)
+#define TESTLE		(19 * NSYM + 8)
+#define TESTLT		(19 * NSYM + 9)
+#define TRACE		(19 * NSYM + 10)
+#define TRANSPOSE	(19 * NSYM + 11)
+#define TTY		(19 * NSYM + 12)
+
+#define UNIT		(20 * NSYM + 0)
+
+#define SYMBOL_X	(23 * NSYM + 0)
+
+#define SYMBOL_Y	(24 * NSYM + 0)
+
+#define SYMBOL_Z	(25 * NSYM + 0)
+#define ZERO		(25 * NSYM + 1)
+
+#define ADD		(26 * NSYM + 0)
+#define MULTIPLY	(26 * NSYM + 1)
+#define POWER		(26 * NSYM + 2)
+#define INDEX		(26 * NSYM + 3)
+#define SETQ		(26 * NSYM + 4)
+#define EXP1		(26 * NSYM + 5)
+#define METAA		(26 * NSYM + 6)
+#define METAB		(26 * NSYM + 7)
+#define METAX		(26 * NSYM + 8)
+#define SPECX		(26 * NSYM + 9)
+
 #define MAXPRIMETAB 10000
 #define MAXDIM 24
 
-typedef struct tensor {
+struct tensor {
 	int ndim;
 	int dim[MAXDIM];
 	int nelem;
-	U *elem[1];
-} T;
-
-struct display {
-	struct display *next;
-	unsigned char type, attr;
-	int h, w;
-	int tot_h, tot_w;
-	int len;
-	unsigned char buf[0];
+	struct atom *elem[1];
 };
 
-struct text_metric {
-	float size;
-	int ascent, descent, width, xheight, em;
-};
-
-#define zero binding[V0]
-#define one binding[V1]
-#define imaginaryunit binding[IU]
-
-#define symbol(x) (symtab + (x))
+#define symbol(x) symtab[x]
 #define push_symbol(x) push(symbol(x))
 #define iscons(p) ((p)->k == CONS)
-#define isrational(p) ((p)->k == NUM)
+#define isrational(p) ((p)->k == RATIONAL)
 #define isdouble(p) ((p)->k == DOUBLE)
 #define isnum(p) (isrational(p) || isdouble(p))
 #define isstr(p) ((p)->k == STR)
 #define istensor(p) ((p)->k == TENSOR)
-#define issymbol(p) ((p)->k == SYM)
-#define iskeyword(p) ((p)->k == SYM && (p) - symtab < MARK1)
+#define issymbol(p) ((p)->k == KSYM || (p)->k == USYM)
+#define iskeyword(p) ((p)->k == KSYM)
 
 #define car(p) (iscons(p) ? (p)->u.cons.car : symbol(NIL))
 #define cdr(p) (iscons(p) ? (p)->u.cons.cdr : symbol(NIL))
@@ -295,8 +322,9 @@ struct text_metric {
 #define caaddr(p) car(car(cdr(cdr(p))))
 #define cadadr(p) car(cdr(car(cdr(p))))
 #define caddar(p) car(cdr(cdr(car(p))))
-#define cdaddr(p) cdr(car(cdr(cdr(p))))
 #define cadddr(p) car(cdr(cdr(cdr(p))))
+#define cdaddr(p) cdr(car(cdr(cdr(p))))
+#define cddadr(p) cdr(cdr(car(cdr(p))))
 #define cddddr(p) cdr(cdr(cdr(cdr(p))))
 #define caddddr(p) car(cdr(cdr(cdr(cdr(p)))))
 #define cadaddr(p) car(cdr(car(cdr(cdr(p)))))
@@ -305,166 +333,185 @@ struct text_metric {
 #define cdddaddr(p) cdr(cdr(cdr(car(cdr(cdr(p))))))
 #define caddaddr(p) car(cdr(cdr(car(cdr(cdr(p))))))
 
-#define isadd(p) (car(p) == symbol(ADD))
-#define ispower(p) (car(p) == symbol(POWER))
-#define isfactorial(p) (car(p) == symbol(FACTORIAL))
+#define ERR ((int) 0x80000000)
 
-#define MSIGN(p) (((int *) (p))[-2])
+#define MPLUS 0
+#define MMINUS 1
 #define MLENGTH(p) (((int *) (p))[-1])
-
 #define MZERO(p) (MLENGTH(p) == 1 && (p)[0] == 0)
-#define MEQUAL(p, n) (MLENGTH(p) == 1 && (long long) MSIGN(p) * (p)[0] == (n))
-
-extern int tos;
-extern int expanding;
-extern int primetab[MAXPRIMETAB];
-extern int esc_flag;
-extern int draw_flag;
-extern int trigmode;
-extern int term_flag;
-
-extern U symtab[];
-extern U *binding[];
-extern U *arglist[];
-extern U *stack[];
-extern U **frame;
-extern U *p0, *p1, *p2, *p3, *p4, *p5, *p6, *p7, *p8, *p9;
-
-extern jmp_buf draw_stop_return;
+#define MEQUAL(p, n) (MLENGTH(p) == 1 && (p)[0] == (n))
 
 #define BLACK 0
 #define BLUE 1
 #define RED 2
 
+#define Trace fprintf(stderr, "%s %d\n", __func__, __LINE__);
+
+extern int primetab[MAXPRIMETAB];
+
 void eval_abs(void);
 void absval(void);
+void absval_nib(void);
 void absval_tensor(void);
 void eval_add(void);
-void add_terms(int n);
-int cmp_terms(const void *q1, const void *q2);
-int combine_terms(U **s, int n);
-void push_terms(U *p);
 void add(void);
-void add_all(int k);
+void add_terms(int n);
+void add_terms_nib(int n);
+void flatten_terms(int h);
+void combine_terms(int h);
+void combine_terms(int h);
+int combine_terms_nib(int i, int j);
+void sort_terms(int n);
+int sort_terms_func(const void *q1, const void *q2);
+int cmp_terms(struct atom *p1, struct atom *p2);
+int is_imaginary_term(struct atom *p);
+void add_numbers(void);
+void add_rationals(void);
+void add_integers(void);
 void subtract(void);
 void eval_adj(void);
 void adj(void);
-U * alloc(void);
-U * alloc_tensor(int nelem);
-void gc(void);
-void untag(U *p);
-void alloc_mem(void);
-void print_mem_info(void);
-void append(void);
+void adj_nib(void);
 void eval_arccos(void);
 void arccos(void);
+void arccos_nib(void);
 void eval_arccosh(void);
 void arccosh(void);
+void arccosh_nib(void);
 void eval_arcsin(void);
 void arcsin(void);
+void arcsin_nib(void);
 void eval_arcsinh(void);
 void arcsinh(void);
+void arcsinh_nib(void);
 void eval_arctan(void);
 void arctan(void);
+void arctan_nib(void);
+void arctan_numerical_args(void);
 void eval_arctanh(void);
 void arctanh(void);
+void arctanh_nib(void);
 void eval_arg(void);
 void arg(void);
-void yyarg(void);
+void arg_nib(void);
 void eval_atomize(void);
 void atomize(void);
-void bake(void);
-void polyform(void);
-void bake_poly(void);
-void bake_poly_term(int k);
 void eval_besselj(void);
 void besselj(void);
-void yybesselj(void);
+void besselj_nib(void);
 void eval_bessely(void);
 void bessely(void);
-void yybessely(void);
-unsigned int * mnew(int n);
-void mfree(unsigned int *p);
-unsigned int * mint(int n);
-unsigned int * mcopy(unsigned int *a);
-int ge(unsigned int *a, unsigned int *b, int len);
-void add_numbers(void);
-void subtract_numbers(void);
-void multiply_numbers(void);
-void divide_numbers(void);
-void invert_number(void);
-int compare_rationals(U *a, U *b);
-int compare_numbers(U *a, U *b);
-void negate_number(void);
-void bignum_truncate(void);
-void mp_numerator(void);
-void mp_denominator(void);
-void bignum_power_number(int expo);
-double convert_bignum_to_double(unsigned int *p);
-double convert_rational_to_double(U *p);
+void bessely_nib(void);
+void init_bignums(void);
 void push_integer(int n);
-void push_double(double d);
 void push_rational(int a, int b);
+void push_rational_number(int sign, uint32_t *a, uint32_t *b);
 int pop_integer(void);
-void print_double(U *p, int flag);
-void bignum_scan_integer(char *s);
-void bignum_scan_float(char *s);
-void print_number(U *p);
-void gcd_numbers(void);
+void push_double(double d);
 double pop_double(void);
+int equaln(struct atom *p, int n);
+int equalq(struct atom *p, int a, int b);
+int compare_numbers(struct atom *a, struct atom *b);
+int compare_rationals(struct atom *a, struct atom *b);
+double convert_rational_to_double(struct atom *p);
+void convert_double_to_rational(double d);
+void best_rational_approximation(double x);
+void bignum_scan_integer(char *s);
 void bignum_float(void);
 void bignum_factorial(int n);
-unsigned int * bignum_factorial_nib(int n);
-void mp_set_bit(unsigned int *x, unsigned int k);
-void mp_clr_bit(unsigned int *x, unsigned int k);
-void mshiftright(unsigned int *a);
+uint32_t * bignum_factorial_nib(int n);
+void msetbit(uint32_t *x, uint32_t k);
+void mclrbit(uint32_t *x, uint32_t k);
+void mshiftright(uint32_t *a);
+uint32_t * mscan(char *s);
+char * mstr(uint32_t *u);
+int mdivby1billion(uint32_t *u);
+uint32_t * madd(uint32_t *u, uint32_t *v);
+uint32_t * msub(uint32_t *u, uint32_t *v);
+uint32_t * mmul(uint32_t *u, uint32_t *v);
+uint32_t * mdiv(uint32_t *u, uint32_t *v);
+uint32_t * mmod(uint32_t *u, uint32_t *v);
+uint32_t * mpow(uint32_t *u, uint32_t *v);
+void mshr(uint32_t *u);
+int mcmp(uint32_t *u, uint32_t *v);
+int meq(uint32_t *u, uint32_t *v);
+uint32_t * mint(uint32_t n);
+uint32_t * mnew(int n);
+void mfree(uint32_t *u);
+uint32_t * mcopy(uint32_t *u);
+void mnorm(uint32_t *u);
+uint32_t * mgcd(uint32_t *u, uint32_t *v);
+uint32_t * mmodpow(uint32_t *x, uint32_t *n, uint32_t *m);
+uint32_t * mroot(uint32_t *a, uint32_t *n);
+int mprime(uint32_t *n);
+int mprimef(uint32_t *n, uint32_t *q, int k);
 void eval_binomial(void);
 void binomial(void);
 void binomial_nib(void);
 int binomial_check_args(void);
 void eval_ceiling(void);
-void ceiling(void);
-void yyceiling(void);
+void ceiling_nib(void);
 void eval_choose(void);
 void choose(void);
+void choose_nib(void);
 int choose_check_args(void);
 void eval_circexp(void);
 void circexp(void);
-void clear(void);
+void circexp_subst(void);
+void circexp_subst_nib(void);
+void eval_exptan(void);
+void exptan(void);
+void eval_expcosh(void);
+void expcosh(void);
+void eval_expsinh(void);
+void expsinh(void);
+void eval_exptanh(void);
+void exptanh(void);
 void eval_clock(void);
 void clockform(void);
-void cmdisplay(void);
 void eval_coeff(void);
 int coeff(void);
 void eval_cofactor(void);
-void cofactor(U *p, int n, int row, int col);
-void eval_condense(void);
-void Condense(void);
-void yycondense(void);
 void eval_conj(void);
 void conjugate(void);
-void cons(void);
+void conjugate_subst(void);
+void conjugate_subst_nib(void);
 void eval_contract(void);
 void contract(void);
-void yycontract(void);
+void contract_nib(void);
+struct atom * alloc(void);
+struct atom * alloc_matrix(int nrow, int ncol);
+struct atom * alloc_tensor(int nelem);
+void gc(void);
+void untag(struct atom *p);
+void alloc_block(void);
+void append(void);
+void cons(void);
+int find(struct atom *p, struct atom *q);
+void list(int n);
+void subst(void);
+int length(struct atom *p);
+int complexity(struct atom *p);
+int equal(struct atom *p1, struct atom *p2);
+int lessp(struct atom *p1, struct atom *p2);
+void sort(int n);
+int sort_func(const void *q1, const void *q2);
+int cmp_expr(struct atom *p1, struct atom *p2);
+int sign(int n);
 void eval_cos(void);
-void cosine(void);
-void cosine_of_angle_sum(void);
-void cosine_of_angle(void);
+void scos(void);
+void scos_nib(void);
+void scos_of_sum(void);
 void eval_cosh(void);
-void ycosh(void);
-void yycosh(void);
-void eval_decomp(void);
-void decomp_nib(void);
-void decomp_sum(void);
-void decomp_product(void);
-void define_user_function(void);
+void scosh(void);
+void scosh_nib(void);
 void eval_defint(void);
 void eval_degree(void);
 void degree(void);
-void yydegree(U *p);
+void degree_nib(struct atom *p);
 void eval_denominator(void);
 void denominator(void);
+void denominator_nib(void);
 void eval_derivative(void);
 void derivative(void);
 void d_scalar_scalar(void);
@@ -488,7 +535,6 @@ void darcsinh(void);
 void darccosh(void);
 void darctanh(void);
 void dabs(void);
-void dhermite(void);
 void derf(void);
 void derfc(void);
 void dbesselj0(void);
@@ -496,76 +542,55 @@ void dbesseljn(void);
 void dbessely0(void);
 void dbesselyn(void);
 void derivative_of_integral(void);
-int det_check_arg(void);
+void eval_det(void);
 void det(void);
-void determinant(int n);
-void detg(void);
-void yydetg(void);
-void lu_decomp(int n);
+void det_nib(void);
 void display(void);
-void emit_top_expr(U *p);
-int will_be_displayed_as_fraction(U *p);
-void emit_expr(U *p);
-void emit_unsigned_expr(U *p);
-int is_negative(U *p);
-void emit_term(U *p);
-int isdenominator(U *p);
-int count_denominators(U *p);
-void emit_multiply(U *p, int n);
-void emit_fraction(U *p, int d);
-void emit_numerators(U *p);
-void emit_denominators(U *p);
-void emit_factor(U *p);
-void emit_numerical_fraction(U *p);
-int isfactor(U *p);
-void emit_power(U *p);
-void emit_denominator(U *p, int n);
-void emit_function(U *p);
-void emit_index_function(U *p);
-void emit_factorial_function(U *p);
-void emit_subexpr(U *p);
-void emit_symbol(U *p);
-void emit_string(U *p);
-void fixup_fraction(int x, int k1, int k2);
-void fixup_power(int k1, int k2);
-void move(int j, int k, int dx, int dy);
-void get_size(int j, int k, int *h, int *w, int *y);
-void displaychar(int c);
-void emit_char(int c);
-void emit_str(char *s);
-void emit_number(U *p, int emit_sign);
-int display_cmp(const void *aa, const void *bb);
-void print_it(void);
-char * getdisplaystr(void);
-void fill_buf(void);
-void emit_tensor(U *p);
-void emit_flat_tensor(U *p);
-void emit_tensor_inner(U *p, int j, int *k);
-void distill(void);
-void distill_nib(void);
-void distill_sum(void);
-void distill_product(void);
-void divisors(void);
-void divisors_onstack(void);
-void gen(int h, int k);
-void factor_add(void);
-int divisors_cmp(const void *p1, const void *p2);
-void dpow(void);
-void eval_draw(void);
-void draw_main(void);
-void check_for_parametric_draw(void);
-void create_point_set(void);
-void new_point(double t);
-void get_xy(double t);
-void eval_f(double t);
-void fill(int i, int j, int level);
-void setup_trange(void);
-void setup_trange_f(void);
-void setup_xrange(void);
-void setup_xrange_f(void);
-void setup_yrange(void);
-void setup_yrange_f(void);
-void emit_graph(void);
+void fmt_args(struct atom *p);
+void fmt_base(struct atom *p);
+void fmt_denominators(struct atom *p);
+void fmt_double(struct atom *p);
+void fmt_exponent(struct atom *p);
+void fmt_expr(struct atom *p);
+void fmt_expr_nib(struct atom *p);
+void fmt_factor(struct atom *p);
+void fmt_frac(struct atom *p);
+void fmt_function(struct atom *p);
+void fmt_indices(struct atom *p);
+void fmt_infix_operator(int c);
+void fmt_list(struct atom *p);
+void fmt_matrix(struct atom *p, int d, int k);
+void fmt_numerators(struct atom *p);
+void fmt_numeric_exponent(struct atom *p);
+void fmt_power(struct atom *p);
+void fmt_rational(struct atom *p);
+void fmt_reciprocal(struct atom *p);
+void fmt_roman_char(int c);
+void fmt_roman_string(char *s);
+void fmt_space(void);
+void fmt_string(struct atom *p);
+void fmt_subexpr(struct atom *p);
+void fmt_symbol(struct atom *p);
+int fmt_symbol_fragment(char *s, int k);
+void fmt_table(int x, int y, struct atom *p);
+void fmt_tensor(struct atom *p);
+void fmt_term(struct atom *p);
+void fmt_term_nib(struct atom *p);
+void fmt_update_fraction(void);
+void fmt_update_list(int t);
+void fmt_update_subexpr(void);
+void fmt_update_subscript(void);
+void fmt_update_superscript(void);
+void fmt_update_table(int n, int m);
+void fmt_vector(struct atom *p);
+int count_denominators(struct atom *p);
+int isdenominator(struct atom *p);
+void fmt_draw(int x, int y, struct atom *p);
+void fmt_draw_char(int x, int y, int c);
+void fmt_draw_delims(int x, int y, int h, int d, int w);
+void fmt_draw_ldelim(int x, int y, int h, int d, int w);
+void fmt_draw_rdelim(int x, int y, int h, int d, int w);
+void fmt_draw_table(int x, int y, struct atom *p);
 void eval_eigen(void);
 void eval_eigenval(void);
 void eval_eigenvec(void);
@@ -574,45 +599,28 @@ void eigen(int op);
 int step(void);
 void step2(int p, int q);
 void eval_erf(void);
-void yerf(void);
-void yyerf(void);
+void serf(void);
+void serf_nib(void);
 void eval_erfc(void);
-void yerfc(void);
-void yyerfc(void);
+void serfc(void);
+void serfc_nib(void);
 void eval(void);
-void eval_sym(void);
 void eval_cons(void);
+void eval_ksym(void);
+void eval_usym(void);
 void eval_binding(void);
-void eval_check(void);
-void eval_det(void);
-void eval_dim(void);
-void eval_divisors(void);
+void eval_clear(void);
 void eval_do(void);
 void eval_eval(void);
-void eval_exp(void);
-void eval_factorial(void);
-void eval_factorpoly(void);
-void eval_hermite(void);
-void eval_hilbert(void);
-void eval_index(void);
-void eval_inv(void);
-void eval_invg(void);
-void eval_isinteger(void);
-void eval_multiply(void);
+void eval_nil(void);
 void eval_number(void);
-void eval_operator(void);
-void eval_print(void);
 void eval_quote(void);
-void eval_rank(void);
-void setq_indexed(void);
-void eval_setq(void);
 void eval_sqrt(void);
 void eval_stop(void);
 void eval_subst(void);
-void eval_unit(void);
-void eval_noexpand(void);
-void eval_predicate(void);
-void eval_and_print_result(int update);
+void expand_expr(void);
+void eval_exp(void);
+void exponential(void);
 void eval_expand(void);
 void expand(void);
 void expand_tensor(void);
@@ -630,286 +638,322 @@ void expsin(void);
 void eval_factor(void);
 void factor_again(void);
 void factor_term(void);
-void factor(void);
+void factor_rational(void);
 void factor_small_number(void);
+void factor_factor(void);
+void factor_factor_nib(void);
+void factor_bignum(uint32_t *a);
+void eval_factorial(void);
 void factorial(void);
-void simplifyfactorials(void);
-void sfac_product(void);
-void sfac_product_f(U **s, int a, int b);
+void factorial_nib(void);
 void factorpoly(void);
-void yyfactorpoly(void);
+void factorpoly_nib(void);
 void rationalize_coefficients(int h);
 int get_factor(void);
-void yydivpoly(void);
+void factor_divpoly(void);
 void evalpoly(void);
-int factors(U *p);
-void push_term_factors(U *p);
+void divisors_onstack(void);
+void gen(int h, int k);
+void factor_add(void);
+int factors(struct atom *p);
+void push_term_factors(struct atom *p);
 void eval_filter(void);
 void filter(void);
 void filter_main(void);
 void filter_sum(void);
 void filter_tensor(void);
-int find(U *p, U *q);
 void eval_float(void);
-void yyfloat(void);
+void sfloat(void);
+void sfloat_subst(void);
+void sfloat_subst_nib(void);
 void eval_floor(void);
-void yfloor(void);
-void yyfloor(void);
-void init_font(void);
-void draw_text(int font, int x, int y, char *s, int len, int color);
-int text_width(int font, char *s);
-void get_height_width(int *h, int *w, int font, char *s);
-void draw_line(int x1, int y1, int x2, int y2);
-void draw_left_bracket(int x, int y, int w, int h);
-void draw_right_bracket(int x, int y, int w, int h);
-void draw_point(int x, int dx, int y, int dy);
-void draw_box(int x1, int y1, int x2, int y2);
-void draw_hrule(int x, int y, int w);
-void draw_selection_rect(float x, float y, float width, float height);
+void sfloor(void);
+void sfloor_nib(void);
 void eval_for(void);
 void eval_gcd(void);
 void gcd(void);
 void gcd_main(void);
 void gcd_expr_expr(void);
-void gcd_expr(U *p);
+void gcd_expr(struct atom *p);
 void gcd_term_term(void);
 void gcd_term_factor(void);
 void gcd_factor_term(void);
+void gcd_numbers(void);
 void guess(void);
-void hermite(void);
-void yyhermite(void);
-void yyhermite2(int n);
+void eval_hermite(void);
+void eval_hilbert(void);
 void hilbert(void);
+void push_zero_matrix(int i, int j);
 void eval_imag(void);
 void imag(void);
+void eval_index(void);
 void index_function(int n);
-void set_component(int n);
-void init(void);
-void init_symbol_table(void);
+void index_function_nib(int n);
 void eval_inner(void);
 void inner(void);
-void inner_f(void);
+void inner_nib(void);
 void eval_integral(void);
 void integral(void);
-void integral_of_sum(void);
-void integral_of_product(void);
+void integral_nib(void);
 void integral_of_form(void);
-int inv_check_arg(void);
+void integral_lookup(int h);
+int integral_classify(struct atom *p);
+int find_integral(int h, char **s);
+int find_integral_nib(int h);
+void decomp(void);
+void decomp_nib(void);
+void decomp_sum(void);
+void decomp_product(void);
+void collect_coeffs(void);
+void collect_coeffs_nib(void);
+int collect_coeffs_sort_func(const void *q1, const void *q2);
+void partition_integrand(void);
+void eval_inv(void);
 void inv(void);
-void invg(void);
-void yyinvg(void);
-void inv_decomp(int n);
-int iszero(U *p);
-int isnegativenumber(U *p);
-int isplusone(U *p);
-int isminusone(U *p);
-int isinteger(U *p);
-int isnonnegativeinteger(U *p);
-int isposint(U *p);
-int ispoly(U *p, U *x);
-int ispoly_expr(U *p, U *x);
-int ispoly_term(U *p, U *x);
-int ispoly_factor(U *p, U *x);
-int isnegativeterm(U *p);
-int isimaginarynumber(U *p);
-int iscomplexnumber(U *p);
-int iseveninteger(U *p);
-int isnegative(U *p);
-int issymbolic(U *p);
-int isintegerfactor(U *p);
-int isoneover(U *p);
-int isfraction(U *p);
-int equaln(U *p, int n);
-int equalq(U *p, int a, int b);
-int isoneoversqrttwo(U *p);
-int isminusoneoversqrttwo(U *p);
-int isfloating(U *p);
-int isimaginaryunit(U *p);
-int isquarterturn(U *p);
-int isnpi(U *p);
+void inv_nib(void);
+int iszero(struct atom *p);
+int isplusone(struct atom *p);
+int isminusone(struct atom *p);
+int isinteger(struct atom *p);
+int isfraction(struct atom *p);
+int isposint(struct atom *p);
+int iseveninteger(struct atom *p);
+int isradical(struct atom *p);
+int isnegative(struct atom *p);
+int isnegativeterm(struct atom *p);
+int isnegativenumber(struct atom *p);
+int iscomplexnumber(struct atom *p);
+int isimaginarynumber(struct atom *p);
+int isimaginaryunit(struct atom *p);
+int isoneoversqrttwo(struct atom *p);
+int isminusoneoversqrttwo(struct atom *p);
+int isdoublez(struct atom *p);
+int ispoly(struct atom *p, struct atom *x);
+int ispoly_expr(struct atom *p, struct atom *x);
+int ispoly_term(struct atom *p, struct atom *x);
+int ispoly_factor(struct atom *p, struct atom *x);
 void eval_isprime(void);
 void eval_laguerre(void);
-void laguerre(void);
-void laguerre2(int n);
+void eval_latex(void);
+void latex(void);
+void latex_nib(void);
+void latex_expr(struct atom *p);
+void latex_term(struct atom *p);
+void latex_numerators(struct atom *p);
+void latex_denominators(struct atom *p);
+void latex_factor(struct atom *p);
+void latex_number(struct atom *p);
+void latex_rational(struct atom *p);
+void latex_double(struct atom *p);
+void latex_power(struct atom *p);
+void latex_base(struct atom *p);
+void latex_exponent(struct atom *p);
+void latex_imaginary(struct atom *p);
+void latex_function(struct atom *p);
+void latex_arglist(struct atom *p);
+void latex_subexpr(struct atom *p);
+void latex_symbol(struct atom *p);
+int latex_symbol_scan(char *s);
+void latex_symbol_shipout(char *s, int n);
+void latex_tensor(struct atom *p);
+void latex_tensor_matrix(struct tensor *t, int d, int *k);
+void latex_string(struct atom *p);
 void eval_lcm(void);
 void lcm(void);
-void yylcm(void);
+void lcm_nib(void);
 void eval_leading(void);
 void leading(void);
 void eval_legendre(void);
-void legendre(void);
-void legendre_nib(void);
-void legendre2(int n, int m);
-void legendre3(int m);
-void list(int n);
 void eval_log(void);
 void logarithm(void);
-void yylog(void);
-unsigned int * madd(unsigned int *a, unsigned int *b);
-unsigned int * msub(unsigned int *a, unsigned int *b);
-unsigned int * madd_nib(unsigned int *a, unsigned int *b);
-unsigned int * msub_nib(unsigned int *a, unsigned int *b);
-int add_ucmp(unsigned int *a, unsigned int *b);
+void log_nib(void);
 void eval_mag(void);
 void mag(void);
-void yymag(void);
+void mag_nib(void);
 int main(int argc, char *argv[]);
-void run_script(char *filename);
-void printstr(char *s);
-void printchar(int c);
-void printchar_nowrap(int c);
-void eval_draw(void);
-void eval_sample(void);
-void clear_display(void);
+void run_stdin(void);
+void prompt(void);
+void echo(void);
+void run_infile(void);
+void printbuf(char *s, int color);
 void cmdisplay(void);
-int mcmp(unsigned int *a, unsigned int *b);
-int mcmpint(unsigned int *a, int n);
-unsigned int * mgcd(unsigned int *u, unsigned int *v);
-void new_string(char *s);
-void out_of_memory(void);
-void push_zero_matrix(int i, int j);
-void push_identity_matrix(int n);
-void push_cars(U *p);
-void peek(void);
-void peek2(void);
-int equal(U *p1, U *p2);
-int lessp(U *p1, U *p2);
-int sign(int n);
-int cmp_expr(U *p1, U *p2);
-int length(U *p);
-U * unique(U *p);
-void unique_f(U *p);
-void ssqrt(void);
-void yyexpand(void);
-void exponential(void);
-void square(void);
-int sort_stack_cmp(const void *p1, const void *p2);
-void sort_stack(int n);
-unsigned int * mmodpow(unsigned int *x, unsigned int *n, unsigned int *m);
-unsigned int * mmul(unsigned int *a, unsigned int *b);
-unsigned int * mdiv(unsigned int *a, unsigned int *b);
-void addf(unsigned int *a, unsigned int *b, int len);
-void subf(unsigned int *a, unsigned int *b, int len);
-void mulf(unsigned int *a, unsigned int *b, int len, unsigned int c);
-unsigned int * mmod(unsigned int *a, unsigned int *b);
-void mdivrem(unsigned int **q, unsigned int **r, unsigned int *a, unsigned int *b);
+void begin_document(void);
+void end_document(void);
+void begin_latex(void);
+void end_latex(void);
+void begin_mathml(void);
+void end_mathml(void);
+void begin_mathjax(void);
+void end_mathjax(void);
+void eval_draw(void);
+void eval_exit(void);
+void eval_mathjax(void);
+void mathjax(void);
+void mathjax_nib(void);
+void eval_mathml(void);
+void mathml(void);
+void mathml_nib(void);
+void mml_expr(struct atom *p);
+void mml_term(struct atom *p);
+void mml_numerators(struct atom *p);
+void mml_denominators(struct atom *p);
+void mml_factor(struct atom *p);
+void mml_number(struct atom *p);
+void mml_rational(struct atom *p);
+void mml_double(struct atom *p);
+void mml_power(struct atom *p);
+void mml_base(struct atom *p);
+void mml_exponent(struct atom *p);
+void mml_imaginary(struct atom *p);
+void mml_function(struct atom *p);
+void mml_arglist(struct atom *p);
+void mml_subexpr(struct atom *p);
+void mml_symbol(struct atom *p);
+int mml_symbol_scan(char *s);
+void mml_symbol_shipout(char *s, int n);
+void mml_tensor(struct atom *p);
+void mml_matrix(struct tensor *t, int d, int *k);
+void mml_string(struct atom *p, int mathmode);
+void mml_mi(char *s);
+void mml_mn(char *s);
+void mml_mo(char *s);
 void eval_mod(void);
-void mod(void);
-unsigned int * mpow(unsigned int *a, unsigned int n);
-int mprime(unsigned int *n);
-int mprimef(unsigned int *n, unsigned int *q, int k);
-unsigned int * mroot(unsigned int *n, unsigned int index);
-unsigned int * mscan(char *s);
-unsigned int * maddf(unsigned int *a, int n);
-unsigned int * mmulf(unsigned int *a, int n);
-char * mstr(unsigned int *a);
-int divby1billion(unsigned int *a);
+void smod(void);
+void smod_nib(void);
+void smod_numbers(void);
+void smod_rationals(void);
+void eval_multiply(void);
 void multiply(void);
-void yymultiply(void);
-void parse_p1(void);
-void parse_p2(void);
+void multiply_factors(int n);
+void multiply_factors_nib(int n);
+void multiply_scalar_factors(int h);
+void flatten_factors(int h);
+void pop_tensor_factor(int h);
+void combine_numerical_factors(int h);
 void combine_factors(int h);
+void sort_factors_provisional(int n);
+int sort_factors_provisional_func(const void *q1, const void *q2);
+int cmp_factors_provisional(struct atom *p1, struct atom *p2);
+int combine_adjacent_factors(struct atom **s);
+void factor_factors_maybe(int h);
+void normalize_power_factors(int h);
+void expand_sum_factors(int h);
+void sort_factors(int n);
+int sort_factors_func(const void *q1, const void *q2);
+int cmp_factors(struct atom *p1, struct atom *p2);
+int order_factor(struct atom *p);
+void multiply_numbers(void);
+void multiply_rationals(void);
+void reduce_radical_factors(int h);
 void multiply_noexpand(void);
-void multiply_all(int n);
-void multiply_all_noexpand(int n);
-void divide(void);
-void inverse(void);
-void reciprocate(void);
+void multiply_factors_noexpand(int n);
 void negate(void);
-void negate_expand(void);
 void negate_noexpand(void);
-void normalize_radical_factors(int h);
-int is_radical_number(U *p);
+void reciprocate(void);
+void divide(void);
 void eval_nroots(void);
 void monic(int n);
 void findroot(int n);
 void compute_fa(int n);
-void divpoly_FIXME(int n);
+void nroots_divpoly(int n);
 void eval_numerator(void);
 void numerator(void);
+void numerator_nib(void);
 void eval_outer(void);
 void outer(void);
-void yyouter(void);
-void partition(void);
+void outer_nib(void);
 void eval_polar(void);
 void polar(void);
 void factor_number(void);
 void factor_a(void);
 void try_kth_prime(int k);
 int factor_b(void);
-void push_factor(unsigned int *d, int count);
+void push_factor(uint32_t *d, int count);
 void eval_power(void);
 void power(void);
-void yypower(void);
-int simplify_polar(void);
+void power_nib(void);
+int power_precheck(void);
+void power_natural_number(void);
+int simplify_polar_expr(void);
+int simplify_polar_term(struct atom *p);
+void power_sum(void);
+void power_imaginary_unit(void);
+void power_complex_number(void);
+void power_complex_plus(int n);
+void power_complex_minus(int n);
+void power_complex_double(void);
+void power_complex_rational(void);
+void power_numbers(void);
+void power_rationals(void);
+void power_rationals_nib(void);
 void eval_prime(void);
 void prime(void);
-void print(U *p);
-void print_subexpr(U *p);
-void print_expr(U *p);
-int sign_of_term(U *p);
-void print_a_over_b(U *p);
-void print_term(U *p);
-void print_denom(U *p, int d);
-void print_factor(U *p);
-void print_index_function(U *p);
-void print_factorial_function(U *p);
-void print_tensor(U *p);
-void print_tensor_inner(U *p, int j, int *k);
+void eval_print(void);
+void print_result(void);
+void print_result_nib(void);
+void prep_symbol_equals(void);
+void eval_string(void);
+void print(struct atom *p);
+void print_nib(struct atom *p);
+void print_subexpr(struct atom *p);
+void print_expr(struct atom *p);
+int sign_of_term(struct atom *p);
+void print_a_over_b(struct atom *p);
+void print_term(struct atom *p);
+void print_denom(struct atom *p, int d);
+void print_factor(struct atom *p);
+void print_index_function(struct atom *p);
+void print_factorial_function(struct atom *p);
+void print_tensor(struct atom *p);
+void print_tensor_inner(struct atom *p, int j, int *k);
+void print_function_definition(struct atom *p);
+void print_arg_list(struct atom *p);
+void print_multiply_sign(void);
+int is_denominator(struct atom *p);
+int any_denominators(struct atom *p);
+void print_number(struct atom *p);
+void eval_lisp(void);
+void print_lisp(struct atom *p);
+void print_lisp_nib(struct atom *p);
 void print_str(char *s);
 void print_char(int c);
-void print_function_definition(U *p);
-void print_arg_list(U *p);
-void print_lisp(U *p);
-void print1(U *p);
-void print_multiply_sign(void);
-int is_denominator(U *p);
-int any_denominators(U *p);
 void eval_product(void);
-void qadd(void);
-void qdiv(void);
-void qmul(void);
-void qpow(void);
-void qpowf(void);
-void normalize_angle(void);
-int is_small_integer(U *p);
-void qsub(void);
-void quickfactor(void);
-void quickpower(void);
 void eval_quotient(void);
 void divpoly(void);
 void eval_rationalize(void);
 void rationalize(void);
-void yyrationalize(void);
-void multiply_denominators(U *p);
-void multiply_denominators_term(U *p);
-void multiply_denominators_factor(U *p);
-void rationalize_tensor(void);
-void rationalize_lcm(void);
+void rationalize_nib(void);
 void eval_real(void);
 void real(void);
 void eval_rect(void);
 void rect(void);
-void rewrite(void);
-void rewrite_tensor(void);
+void rect_nib(void);
 void eval_roots(void);
 void roots(void);
 void roots2(void);
 void roots3(void);
 void mini_solve(void);
-void run_as_thread(char *s);
-void * run1(void *s);
 void run(char *s);
-void check_stack(void);
-void echo_input(char *s);
-void check_esc_flag(void);
+void init(void);
+void prep(void);
+char * scan_input(char *s);
+void eval_and_print_result(void);
 void stop(char *s);
-int scan(char *s);
-int scan_meta(char *s);
+void eval_run(void);
+void run_file(char *filename);
+void trace_input(void);
+void print_input_line(void);
+void print_scan_line(char *s);
+void eval_status(void);
+void run_init_script(void);
+void malloc_kaput(void);
+char * scan(char *s);
+char * scan1(char *s);
+char * scan_nib(char *s);
 void scan_stmt(void);
-void scan_relation(void);
+void scan_comparison(void);
 void scan_expression(void);
-int is_factor(void);
+int another_factor_pending(void);
 void scan_term(void);
 void scan_power(void);
 void scan_factor(void);
@@ -917,97 +961,86 @@ void scan_symbol(void);
 void scan_string(void);
 void scan_function_call(void);
 void scan_subexpr(void);
-void error(char *errmsg);
-void build_tensor(int n);
-void get_next_token(void);
+void get_token_skip_newlines(void);
 void get_token(void);
+void get_token_nib(void);
 void update_token_buf(char *a, char *b);
-void test_madd(void);
-void test_maddf(int na, int nb, int nc);
-void test_msub(void);
-void test_msubf(int na, int nb, int nc);
-void test_mcmp(void);
-void test_mgcd(void);
-unsigned int * egcd(unsigned int *a, unsigned int *b);
-void test_mmodpow(void);
-void test_mmul(void);
-void test_mmulf(int na, int nb, int nc);
-void test_mdiv(void);
-void test_mdivf(int na, int nb, int nc);
-void test_mmod(void);
-void test_mmodf(int na, int nb, int nc);
-void test_mpow(void);
-void test_mroot(void);
-void test_quickfactor(void);
-void test_all(void);
+void scan_error(char *errmsg);
+void build_tensor(int h);
+void static_negate(void);
+void static_negate_nib(void);
+void static_reciprocate(void);
+void static_reciprocate_nib(void);
+void eval_setq(void);
+void setq_indexed(void);
+void set_component(int h);
+void set_component_nib(int h);
+void setq_userfunc(void);
 void eval_sgn(void);
 void sgn(void);
-void eval_simfac(void);
-void simfac(void);
-void simfac(void);
-void simfac_term(void);
-int yysimfac(int h);
 void eval_simplify(void);
 void simplify(void);
-void simplify_main(void);
-void simplify_tensor(void);
-int count(U *p);
-void f1(void);
-void f2(void);
-void f3(void);
-void f4(void);
+void simplify_nib(void);
+void simplify_expr(void);
+void simplify_expr_nib(void);
 void simplify_trig(void);
-void f5(void);
-void f9(void);
-int nterms(U *p);
 void eval_sin(void);
-void sine(void);
-void sine_of_angle_sum(void);
-void sine_of_angle(void);
+void ssin(void);
+void ssin_nib(void);
+void ssin_of_sum(void);
 void eval_sinh(void);
-void ysinh(void);
-void yysinh(void);
-void push(U *p);
-U * pop(void);
-void push_frame(int n);
-void pop_frame(int n);
+void ssinh(void);
+void ssinh_nib(void);
+void push(struct atom *p);
+struct atom * pop(void);
 void save(void);
 void restore(void);
+void save_binding(struct atom *p);
+void restore_binding(struct atom *p);
 void swap(void);
-void dupl(void);
-void subst(void);
+void push_string(char *s);
 void eval_sum(void);
-void std_symbol(char *s, int n);
-U * usr_symbol(char *s);
-char * get_printname(U *p);
-void set_binding(U *p, U *b);
-void set_binding_and_arglist(U *p, U *b, U *a);
-U * get_binding(U *p);
-U * get_arglist(U *p);
-int symnum(U *p);
-void push_binding(U *p);
-void pop_binding(U *p);
+struct atom * lookup(char *s);
+char * printname(struct atom *p);
+void set_binding(struct atom *p, struct atom *b);
+void set_binding_and_arglist(struct atom *p, struct atom *b, struct atom *a);
+struct atom * get_binding(struct atom *p);
+struct atom * get_arglist(struct atom *p);
+void init_symbol_table(void);
+void clear_symbols(void);
 void eval_tan(void);
-void tangent(void);
-void yytangent(void);
+void stan(void);
+void stan_nib(void);
+void stan_of_sum(void);
 void eval_tanh(void);
+void stanh(void);
+void stanh_nib(void);
 void eval_taylor(void);
 void taylor(void);
+void taylor_nib(void);
 void eval_tensor(void);
-void tensor_plus_tensor(void);
-void tensor_times_scalar(void);
-void scalar_times_tensor(void);
-int is_square_matrix(U *p);
+void promote_tensor(void);
+void promote_tensor_nib(void);
+int compatible_dimensions(struct atom *p, struct atom *q);
+void add_tensors(void);
 void d_tensor_tensor(void);
 void d_scalar_tensor(void);
 void d_tensor_scalar(void);
-int compare_tensors(U *p1, U *p2);
+int compare_tensors(struct atom *p1, struct atom *p2);
 void power_tensor(void);
 void copy_tensor(void);
-void promote_tensor(void);
-int compatible(U *p, U *q);
+void eval_dim(void);
+void eval_rank(void);
+void eval_unit(void);
+void eval_zero(void);
 void eval_test(void);
+void eval_check(void);
 void eval_testeq(void);
+int testeq(struct atom *q1, struct atom *q2);
+int cross_expr(struct atom *p);
+int cross_term(struct atom *p);
+int cross_factor(struct atom *p);
+void cancel_factor(void);
 void eval_testge(void);
 void eval_testgt(void);
 void eval_testle(void);
@@ -1016,28 +1049,67 @@ void eval_not(void);
 void eval_and(void);
 void eval_or(void);
 int cmp_args(void);
-void transform(char **s);
-int f_equals_a(int h);
+void evalp(void);
 void eval_transpose(void);
 void transpose(void);
+void transpose_nib(void);
 void eval_user_function(void);
-int rewrite_args(void);
-int rewrite_args_tensor(void);
-void variables(void);
-void lscan(U *p);
-int var_cmp(const void *p1, const void *p2);
-void vectorize(int n);
-void printchar(int c);
-void printchar_nowrap(int c);
-void printstr(char *s);
-void shipout(struct display *p);
-void clear_display(void);
-int check_display(void);
-void get_view(int *h, int *w);
-void draw_display(int y1, int y2);
-void eval_zero(void);
+int rewrite(void);
+int rewrite_nib(void);
 
-// Absolute value, aka vector magnitude
+struct atom *mem[MAXBLOCKS];
+struct atom *free_list;
+
+int tos; // top of stack
+int tof; // top of frame
+
+struct atom *stack[STACKSIZE];
+struct atom *frame[FRAMESIZE];
+
+struct atom *symtab[27 * NSYM];
+struct atom *binding[27 * NSYM];
+struct atom *arglist[27 * NSYM];
+
+struct atom *p0;
+struct atom *p1;
+struct atom *p2;
+struct atom *p3;
+struct atom *p4;
+struct atom *p5;
+struct atom *p6;
+struct atom *p7;
+struct atom *p8;
+struct atom *p9;
+
+struct atom *zero;
+struct atom *one;
+struct atom *minusone;
+struct atom *imaginaryunit;
+
+int expanding;
+int drawing;
+
+int interrupt;
+
+jmp_buf stop_return;
+jmp_buf draw_stop_return;
+
+int block_count;
+int free_count;
+int gc_count;
+int bignum_count;
+int ksym_count;
+int usym_count;
+int string_count;
+int tensor_count;
+int max_stack;
+int max_frame;
+
+char tbuf[1000];
+
+char *outbuf;
+int outbuf_index;
+int outbuf_length;
 
 void
 eval_abs(void)
@@ -1050,19 +1122,24 @@ eval_abs(void)
 void
 absval(void)
 {
-	int h;
 	save();
+	absval_nib();
+	restore();
+}
+
+void
+absval_nib(void)
+{
+	int h;
 	p1 = pop();
 	if (istensor(p1)) {
 		absval_tensor();
-		restore();
 		return;
 	}
 	if (isnum(p1)) {
 		push(p1);
 		if (isnegativenumber(p1))
 			negate();
-		restore();
 		return;
 	}
 	if (iscomplexnumber(p1)) {
@@ -1072,7 +1149,6 @@ absval(void)
 		multiply();
 		push_rational(1, 2);
 		power();
-		restore();
 		return;
 	}
 	// abs(1/a) evaluates to 1/abs(a)
@@ -1081,7 +1157,6 @@ absval(void)
 		reciprocate();
 		absval();
 		reciprocate();
-		restore();
 		return;
 	}
 	// abs(a*b) evaluates to abs(a)*abs(b)
@@ -1093,8 +1168,7 @@ absval(void)
 			absval();
 			p1 = cdr(p1);
 		}
-		multiply_all(tos - h);
-		restore();
+		multiply_factors(tos - h);
 		return;
 	}
 	if (isnegativeterm(p1) || (car(p1) == symbol(ADD) && isnegativeterm(cadr(p1)))) {
@@ -1105,47 +1179,20 @@ absval(void)
 	push_symbol(ABS);
 	push(p1);
 	list(2);
-	restore();
 }
 
 void
 absval_tensor(void)
 {
 	if (p1->u.tensor->ndim != 1)
-		stop("abs(tensor) with tensor rank > 1");
+		stop("abs: tensor rank > 1");
 	push(p1);
 	push(p1);
 	conjugate();
 	inner();
 	push_rational(1, 2);
 	power();
-	simplify();
-	eval();
 }
-
-/* Symbolic addition
-
-	Terms in a sum are combined if they are identical modulo rational
-	coefficients.
-
-	For example, A + 2A becomes 3A.
-
-	However, the sum A + sqrt(2) A is not modified.
-
-	Combining terms can lead to second-order effects.
-
-	For example, consider the case of
-
-		1/sqrt(2) A + 3/sqrt(2) A + sqrt(2) A
-
-	The first two terms are combined to yield 2 sqrt(2) A.
-
-	This result can now be combined with the third term to yield
-
-		3 sqrt(2) A
-*/
-
-int flag;
 
 void
 eval_add(void)
@@ -1155,248 +1202,394 @@ eval_add(void)
 	while (iscons(p1)) {
 		push(car(p1));
 		eval();
-		p2 = pop();
-		push_terms(p2);
 		p1 = cdr(p1);
 	}
 	add_terms(tos - h);
 }
 
-/* Add n terms, returns one expression on the stack. */
+void
+add(void)
+{
+	add_terms(2);
+}
 
 void
 add_terms(int n)
 {
-	int i, h;
-	U **s;
-	h = tos - n;
-	s = stack + h;
-	/* ensure no infinite loop, use "for" */
-	for (i = 0; i < 10; i++) {
-		if (n < 2)
-			break;
-		flag = 0;
-		qsort(s, n, sizeof (U *), cmp_terms);
-		if (flag == 0)
-			break;
-		n = combine_terms(s, n);
-	}
-	tos = h + n;
+	save();
+	add_terms_nib(n);
+	restore();
+}
+
+void
+add_terms_nib(int n)
+{
+	int h = tos - n;
+	if (n < 2)
+		return;
+	flatten_terms(h);
+	combine_terms(h);
+	n = tos - h;
 	switch (n) {
 	case 0:
-		push_integer(0);
+		push_integer(0); // all terms canceled
 		break;
 	case 1:
 		break;
 	default:
 		list(n);
-		p1 = pop();
 		push_symbol(ADD);
-		push(p1);
+		swap();
 		cons();
 		break;
 	}
 }
 
-/* Compare terms for order, clobbers p1 and p2. */
-
-int
-cmp_terms(const void *q1, const void *q2)
+void
+flatten_terms(int h)
 {
-	int i, t;
-	p1 = *((U **) q1);
-	p2 = *((U **) q2);
-	/* numbers can be combined */
-	if (isnum(p1) && isnum(p2)) {
-		flag = 1;
-		return 0;
-	}
-	/* congruent tensors can be combined */
-	if (istensor(p1) && istensor(p2)) {
-		if (p1->u.tensor->ndim < p2->u.tensor->ndim)
-			return -1;
-		if (p1->u.tensor->ndim > p2->u.tensor->ndim)
-			return 1;
-		for (i = 0; i < p1->u.tensor->ndim; i++) {
-			if (p1->u.tensor->dim[i] < p2->u.tensor->dim[i])
-				return -1;
-			if (p1->u.tensor->dim[i] > p2->u.tensor->dim[i])
-				return 1;
-		}
-		flag = 1;
-		return 0;
-	}
-	if (car(p1) == symbol(MULTIPLY)) {
-		p1 = cdr(p1);
-		if (isnum(car(p1))) {
-			p1 = cdr(p1);
-			if (cdr(p1) == symbol(NIL))
-				p1 = car(p1);
+	int i, n;
+	n = tos;
+	for (i = h; i < n; i++) {
+		p1 = stack[i];
+		if (car(p1) == symbol(ADD)) {
+			stack[i] = cadr(p1);
+			p1 = cddr(p1);
+			while (iscons(p1)) {
+				push(car(p1));
+				p1 = cdr(p1);
+			}
 		}
 	}
-	if (car(p2) == symbol(MULTIPLY)) {
-		p2 = cdr(p2);
-		if (isnum(car(p2))) {
-			p2 = cdr(p2);
-			if (cdr(p2) == symbol(NIL))
-				p2 = car(p2);
-		}
-	}
-	t = cmp_expr(p1, p2);
-	if (t == 0)
-		flag = 1;
-	return t;
 }
 
-/* Compare adjacent terms in s[] and combine if possible.
+// congruent terms are combined by adding numerical coefficients
 
-	Returns the number of terms remaining in s[].
-
-	n	number of terms in s[] initially
-*/
-
-int
-combine_terms(U **s, int n)
+void
+combine_terms(int h)
 {
-	int i, j, t;
-	for (i = 0; i < n - 1; i++) {
-		check_esc_flag();
-		p3 = s[i];
-		p4 = s[i + 1];
-		if (istensor(p3) && istensor(p4)) {
-			push(p3);
-			push(p4);
-			tensor_plus_tensor();
-			p1 = pop();
-			if (p1 != symbol(NIL)) {
-				s[i] = p1;
-				for (j = i + 1; j < n - 1; j++)
-					s[j] = s[j + 1];
-				n--;
-				i--;
-			}
-			continue;
-		}
-		if (istensor(p3) || istensor(p4))
-			continue;
-		if (isnum(p3) && isnum(p4)) {
-			push(p3);
-			push(p4);
-			add_numbers();
-			p1 = pop();
-			if (iszero(p1)) {
-				for (j = i; j < n - 2; j++)
-					s[j] = s[j + 2];
-				n -= 2;
+	int i, j;
+	sort_terms(tos - h);
+	for (i = h; i < tos - 1; i++) {
+		if (combine_terms_nib(i, i + 1)) {
+			if (!istensor(stack[i]) && iszero(stack[i])) {
+				for (j = i + 2; j < tos; j++)
+					stack[j - 2] = stack[j]; // remove 2
+				tos -= 2;
 			} else {
-				s[i] = p1;
-				for (j = i + 1; j < n - 1; j++)
-					s[j] = s[j + 1];
-				n--;
+				for (j = i + 2; j < tos; j++)
+					stack[j - 1] = stack[j]; // remove 1
+				tos -= 1;
 			}
-			i--;
-			continue;
+			i--; // use same index again
 		}
-		if (isnum(p3) || isnum(p4))
-			continue;
-		p1 = one;
-		p2 = one;
-		t = 0;
-		if (car(p3) == symbol(MULTIPLY)) {
-			p3 = cdr(p3);
-			t = 1; /* p3 is now denormal */
-			if (isnum(car(p3))) {
-				p1 = car(p3);
-				p3 = cdr(p3);
-				if (cdr(p3) == symbol(NIL)) {
-					p3 = car(p3);
-					t = 0;
+	}
+	if (tos - h == 1 && !istensor(stack[h]) && iszero(stack[h]))
+		tos = h; // all terms canceled
+}
+
+#if 0 // brute force method
+void
+combine_terms(int h)
+{
+	int i, j, k;
+	for (i = h; i < tos - 1; i++) {
+		for (j = i + 1; j < tos; j++) {
+			if (combine_terms_nib(i, j)) {
+				for (k = j + 1; k < tos; k++)
+					stack[k - 1] = stack[k]; // remove jth element
+				j--; // use same index again
+				tos--;
+				if (!istensor(stack[i]) && iszero(stack[i])) {
+					for (k = i + 1; k < tos; k++)
+						stack[k - 1] = stack[k]; // remove ith element
+					j = i; // start over
+					tos--;
 				}
 			}
 		}
-		if (car(p4) == symbol(MULTIPLY)) {
-			p4 = cdr(p4);
-			if (isnum(car(p4))) {
-				p2 = car(p4);
-				p4 = cdr(p4);
-				if (cdr(p4) == symbol(NIL))
-					p4 = car(p4);
-			}
-		}
-		if (!equal(p3, p4))
-			continue;
+	}
+}
+#endif
+
+int
+combine_terms_nib(int i, int j)
+{
+	int denorm = 0;
+	p1 = stack[i];
+	p2 = stack[j];
+	if (istensor(p1) && istensor(p2)) {
 		push(p1);
 		push(p2);
+		add_tensors();
+		stack[i] = pop();
+		return 1;
+	}
+	if (istensor(p1) || istensor(p2))
+		stop("incompatible tensor arithmetic");
+	if (iszero(p2))
+		return 1;
+	if (iszero(p1)) {
+		stack[i] = p2;
+		return 1;
+	}
+	if (isnum(p1) && isnum(p2)) {
 		add_numbers();
-		p1 = pop();
-		if (iszero(p1)) {
-			for (j = i; j < n - 2; j++)
-				s[j] = s[j + 2];
-			n -= 2;
-			i--;
-			continue;
+		stack[i] = pop();
+		return 1;
+	}
+	if (isnum(p1) || isnum(p2))
+		return 0; // cannot add number and something else
+	p3 = p1;
+	p4 = p2;
+	p1 = one;
+	p2 = one;
+	if (car(p3) == symbol(MULTIPLY)) {
+		p3 = cdr(p3);
+		denorm = 1;
+		if (isnum(car(p3))) {
+			p1 = car(p3); // coeff
+			p3 = cdr(p3);
+			if (cdr(p3) == symbol(NIL)) {
+				p3 = car(p3);
+				denorm = 0;
+			}
 		}
-		push(p1);
-		if (t) {
-			push(symbol(MULTIPLY));
+	}
+	if (car(p4) == symbol(MULTIPLY)) {
+		p4 = cdr(p4);
+		if (isnum(car(p4))) {
+			p2 = car(p4); // coeff
+			p4 = cdr(p4);
+			if (cdr(p4) == symbol(NIL)) {
+				p4 = car(p4);
+			}
+		}
+	}
+	if (!equal(p3, p4))
+		return 0;
+	add_numbers(); // add p1 and p2
+	p4 = pop(); // new coeff
+	if (iszero(p4)) {
+		stack[i] = p4;
+		return 1;
+	}
+	if (isplusone(p4) && !isdouble(p4)) {
+		if (denorm) {
+			push_symbol(MULTIPLY);
 			push(p3);
 			cons();
 		} else
 			push(p3);
-		multiply();
-		s[i] = pop();
-		for (j = i + 1; j < n - 1; j++)
-			s[j] = s[j + 1];
-		n--;
-		i--;
+	} else {
+		if (denorm) {
+			push_symbol(MULTIPLY);
+			push(p4);
+			push(p3);
+			cons();
+			cons();
+		} else {
+			push_symbol(MULTIPLY);
+			push(p4);
+			push(p3);
+			list(3);
+		}
 	}
-	return n;
+	stack[i] = pop();
+	return 1;
 }
 
 void
-push_terms(U *p)
+sort_terms(int n)
 {
-	if (car(p) == symbol(ADD)) {
+	qsort(stack + tos - n, n, sizeof (struct atom *), sort_terms_func);
+}
+
+int
+sort_terms_func(const void *q1, const void *q2)
+{
+	return cmp_terms(*((struct atom **) q1), *((struct atom **) q2));
+}
+
+int
+cmp_terms(struct atom *p1, struct atom *p2)
+{
+	int a, b, c;
+	// 1st level: imaginary terms on the right
+	a = is_imaginary_term(p1);
+	b = is_imaginary_term(p2);
+	if (a == 0 && b == 1)
+		return -1; // ok
+	if (a == 1 && b == 0)
+		return 1; // out of order
+	// 2nd level: numericals on the right
+	if (isnum(p1) && isnum(p2))
+		return 0; // don't care about order, save time, don't compare
+	if (isnum(p1))
+		return 1; // out of order
+	if (isnum(p2))
+		return -1; // ok
+	// 3rd level: sort by factors
+	a = 0;
+	b = 0;
+	if (car(p1) == symbol(MULTIPLY)) {
+		p1 = cdr(p1);
+		a = 1; // p1 is a list of factors
+		if (isnum(car(p1))) {
+			// skip over coeff
+			p1 = cdr(p1);
+			if (cdr(p1) == symbol(NIL)) {
+				p1 = car(p1);
+				a = 0;
+			}
+		}
+	}
+	if (car(p2) == symbol(MULTIPLY)) {
+		p2 = cdr(p2);
+		b = 1; // p2 is a list of factors
+		if (isnum(car(p2))) {
+			// skip over coeff
+			p2 = cdr(p2);
+			if (cdr(p2) == symbol(NIL)) {
+				p2 = car(p2);
+				b = 0;
+			}
+		}
+	}
+	if (a == 0 && b == 0)
+		return cmp_factors(p1, p2);
+	if (a == 0 && b == 1) {
+		c = cmp_factors(p1, car(p2));
+		if (c == 0)
+			c = -1; // length(p1) < length(p2)
+		return c;
+	}
+	if (a == 1 && b == 0) {
+		c = cmp_factors(car(p1), p2);
+		if (c == 0)
+			c = 1; // length(p1) > length(p2)
+		return c;
+	}
+	while (iscons(p1) && iscons(p2)) {
+		c = cmp_factors(car(p1), car(p2));
+		if (c)
+			return c;
+		p1 = cdr(p1);
+		p2 = cdr(p2);
+	}
+	if (iscons(p1))
+		return 1; // length(p1) > length(p2)
+	if (iscons(p2))
+		return -1; // length(p1) < length(p2)
+	return 0;
+}
+
+int
+is_imaginary_term(struct atom *p)
+{
+	if (car(p) == symbol(POWER) && equaln(cadr(p), -1))
+		return 1;
+	if (iscons(p)) {
 		p = cdr(p);
 		while (iscons(p)) {
-			push(car(p));
+			if (caar(p) == symbol(POWER) && equaln(cadar(p), -1))
+				return 1;
 			p = cdr(p);
 		}
-	} else if (!iszero(p))
-		push(p);
-}
-
-/* add two expressions */
-
-void
-add(void)
-{
-	int h;
-	save();
-	p2 = pop();
-	p1 = pop();
-	h = tos;
-	push_terms(p1);
-	push_terms(p2);
-	add_terms(tos - h);
-	restore();
+	}
+	return 0;
 }
 
 void
-add_all(int k)
+add_numbers(void)
 {
-	int h, i;
-	U **s;
-	save();
-	s = stack + tos - k;
-	h = tos;
-	for (i = 0; i < k; i++)
-		push_terms(s[i]);
-	add_terms(tos - h);
-	p1 = pop();
-	tos -= k;
+	double d1, d2;
+	if (p1->k == RATIONAL && p2->k == RATIONAL) {
+		add_rationals();
+		return;
+	}
 	push(p1);
-	restore();
+	d1 = pop_double();
+	push(p2);
+	d2 = pop_double();
+	push_double(d1 + d2);
+}
+
+void
+add_rationals(void)
+{
+	int sign;
+	uint32_t *a, *ab, *b, *ba, *c;
+	if (iszero(p1)) {
+		push(p2);
+		return;
+	}
+	if (iszero(p2)) {
+		push(p1);
+		return;
+	}
+	if (isinteger(p1) && isinteger(p2)) {
+		add_integers();
+		return;
+	}
+	ab = mmul(p1->u.q.a, p2->u.q.b);
+	ba = mmul(p1->u.q.b, p2->u.q.a);
+	if (p1->sign == p2->sign) {
+		a = madd(ab, ba);
+		sign = p1->sign;
+	} else {
+		switch (mcmp(ab, ba)) {
+		case 1:
+			a = msub(ab, ba);
+			sign = p1->sign;
+			break;
+		case 0:
+			push_integer(0);
+			mfree(ab);
+			mfree(ba);
+			return;
+		case -1:
+			a = msub(ba, ab);
+			sign = p2->sign;
+			break;
+		}
+	}
+	mfree(ab);
+	mfree(ba);
+	b = mmul(p1->u.q.b, p2->u.q.b);
+	c = mgcd(a, b);
+	push_rational_number(sign, mdiv(a, c), mdiv(b, c));
+	mfree(a);
+	mfree(b);
+	mfree(c);
+}
+
+void
+add_integers(void)
+{
+	int sign;
+	uint32_t *a, *b, *c;
+	a = p1->u.q.a;
+	b = p2->u.q.a;
+	if (p1->sign == p2->sign) {
+		c = madd(a, b);
+		sign = p1->sign;
+	} else {
+		switch (mcmp(a, b)) {
+		case 1:
+			c = msub(a, b);
+			sign = p1->sign;
+			break;
+		case 0:
+			push_integer(0);
+			return;
+		case -1:
+			c = msub(b, a);
+			sign = p2->sign;
+			break;
+		}
+	}
+	push_rational_number(sign, c, mint(1));
 }
 
 void
@@ -1405,8 +1598,6 @@ subtract(void)
 	negate();
 	add();
 }
-
-// Adjunct of a matrix
 
 void
 eval_adj(void)
@@ -1419,220 +1610,50 @@ eval_adj(void)
 void
 adj(void)
 {
-	int i, j, n;
 	save();
+	adj_nib();
+	restore();
+}
+
+void
+adj_nib(void)
+{
+	int col, i, j, k, n, row;
 	p1 = pop();
-	if (istensor(p1) && p1->u.tensor->ndim == 2 && p1->u.tensor->dim[0] == p1->u.tensor->dim[1])
-		;
-	else
+	if (!istensor(p1) || p1->u.tensor->ndim != 2 || p1->u.tensor->dim[0] != p1->u.tensor->dim[1])
 		stop("adj: square matrix expected");
 	n = p1->u.tensor->dim[0];
-	p2 = alloc_tensor(n * n);
-	p2->u.tensor->ndim = 2;
-	p2->u.tensor->dim[0] = n;
-	p2->u.tensor->dim[1] = n;
-	for (i = 0; i < n; i++)
-		for (j = 0; j < n; j++) {
-			cofactor(p1, n, i, j);
-			p2->u.tensor->elem[n * j + i] = pop(); /* transpose */
-		}
-	push(p2);
-	restore();
-}
-
-#undef M
-#undef N
-
-#define M 1000		// maximum M blocks
-#define N 100000	// N atoms per block
-
-U *mem[M];
-int mcount;
-
-U *free_list;
-int free_count;
-
-U *
-alloc(void)
-{
-	U *p;
-	if (free_count == 0) {
-		if (mcount == 0)
-			alloc_mem();
-		else {
-			gc();
-			if (free_count < N * mcount / 2)
-				alloc_mem();
-		}
-		if (free_count == 0)
-			stop("atom space exhausted");
-	}
-	p = free_list;
-	free_list = free_list->u.cons.cdr;
-	free_count--;
-	return p;
-}
-
-U *
-alloc_tensor(int nelem)
-{
-	int i;
-	U *p;
-	p = alloc();
-	p->k = TENSOR;
-	p->u.tensor = (T *) malloc(sizeof (T) + nelem * sizeof (U *));
-	if (p->u.tensor == NULL)
-		out_of_memory();
-	p->u.tensor->nelem = nelem;
-	for (i = 0; i < nelem; i++)
-		p->u.tensor->elem[i] = zero;
-	return p;
-}
-
-// garbage collector
-
-void
-gc(void)
-{
-	int i, j;
-	U *p;
-	// tag everything
-	for (i = 0; i < mcount; i++) {
-		p = mem[i];
-		for (j = 0; j < N; j++)
-			p[j].tag = 1;
-	}
-	// untag what's used
-	untag(p0);
-	untag(p1);
-	untag(p2);
-	untag(p3);
-	untag(p4);
-	untag(p5);
-	untag(p6);
-	untag(p7);
-	untag(p8);
-	untag(p9);
-	for (i = 0; i < NSYM; i++) {
-		untag(binding[i]);
-		untag(arglist[i]);
-	}
-	for (i = 0; i < tos; i++)
-		untag(stack[i]);
-	for (i = (int) (frame - stack); i < TOS; i++)
-		untag(stack[i]);
-	// collect everything that's still tagged
-	free_count = 0;
-	for (i = 0; i < mcount; i++) {
-		p = mem[i];
-		for (j = 0; j < N; j++) {
-			if (p[j].tag == 0)
-				continue;
-			// still tagged so it's unused, put on free list
-			switch (p[j].k) {
-			case TENSOR:
-				free(p[j].u.tensor);
-				break;
-			case STR:
-				free(p[j].u.str);
-				break;
-			case NUM:
-				mfree(p[j].u.q.a);
-				mfree(p[j].u.q.b);
-				break;
-			}
-			p[j].k = CONS; // so no double free occurs above
-			p[j].u.cons.cdr = free_list;
-			free_list = p + j;
-			free_count++;
-		}
-	}
-}
-
-void
-untag(U *p)
-{
-	int i;
-	if (iscons(p)) {
-		do {
-			if (p->tag == 0)
-				return;
-			p->tag = 0;
-			untag(p->u.cons.car);
-			p = p->u.cons.cdr;
-		} while (iscons(p));
-		untag(p);
-		return;
-	}
-	if (p->tag) {
-		p->tag = 0;
-		if (istensor(p)) {
-			for (i = 0; i < p->u.tensor->nelem; i++)
-				untag(p->u.tensor->elem[i]);
-		}
-	}
-}
-
-// get memory for N atoms
-
-void
-alloc_mem(void)
-{
-	int i;
-	U *p;
-	if (mcount == M)
-		return;
-	p = (U *) malloc(N * sizeof (U));
-	if (p == NULL)
-		return;
-	mem[mcount++] = p;
-	for (i = 0; i < N; i++) {
-		p[i].k = CONS; // so no free in gc
-		p[i].u.cons.cdr = p + i + 1;
-	}
-	p[N - 1].u.cons.cdr = free_list;
-	free_list = p;
-	free_count += N;
-}
-
-void
-print_mem_info(void)
-{
-	char buf[100];
-	sprintf(buf, "%d blocks (%d bytes/block)\n", N * mcount, (int) sizeof (U));
-	printstr(buf);
-	sprintf(buf, "%d free\n", free_count);
-	printstr(buf);
-	sprintf(buf, "%d used\n", N * mcount - free_count);
-	printstr(buf);
-}
-
-// Append one list to another.
-
-void
-append(void)
-{
-	int h;
-	save();
-	p2 = pop();
-	p1 = pop();
-	h = tos;
-	if (iscons(p1))
-		while (iscons(p1)) {
-			push(car(p1));
-			p1 = cdr(p1);
-		}
-	else
-		push(p1);
-	if (iscons(p2))
-		while (iscons(p2)) {
-			push(car(p2));
-			p2 = cdr(p2);
-		}
-	else
+	// p2 is the adjunct matrix
+	p2 = alloc_matrix(n, n);
+	if (n == 2) {
+		p2->u.tensor->elem[0] = p1->u.tensor->elem[3];
+		push(p1->u.tensor->elem[1]);
+		negate();
+		p2->u.tensor->elem[1] = pop();
+		push(p1->u.tensor->elem[2]);
+		negate();
+		p2->u.tensor->elem[2] = pop();
+		p2->u.tensor->elem[3] = p1->u.tensor->elem[0];
 		push(p2);
-	list(tos - h);
-	restore();
+		return;
+	}
+	// p3 is for computing cofactors
+	p3 = alloc_matrix(n - 1, n - 1);
+	for (row = 0; row < n; row++) {
+		for (col = 0; col < n; col++) {
+			k = 0;
+			for (i = 0; i < n; i++)
+				for (j = 0; j < n; j++)
+					if (i != row && j != col)
+						p3->u.tensor->elem[k++] = p1->u.tensor->elem[n * i + j];
+			push(p3);
+			det();
+			if ((row + col) % 2)
+				negate();
+			p2->u.tensor->elem[n * col + row] = pop(); // transpose
+		}
+	}
+	push(p2);
 }
 
 void
@@ -1646,22 +1667,35 @@ eval_arccos(void)
 void
 arccos(void)
 {
-	int n;
-	double d;
 	save();
+	arccos_nib();
+	restore();
+}
+
+void
+arccos_nib(void)
+{
+	int n;
 	p1 = pop();
-	if (car(p1) == symbol(COS)) {
-		push(cadr(p1));
-		restore();
+	if (isdouble(p1)) {
+		push_double(acos(p1->u.d));
 		return;
 	}
-	if (isdouble(p1)) {
-		errno = 0;
-		d = acos(p1->u.d);
-		if (errno)
-			stop("arccos function argument is not in the interval [-1,1]");
-		push_double(d);
-		restore();
+	// arccos(z) = -i log(z + sqrt(z^2 - 1))
+	if (isdoublez(p1)) {
+		push(imaginaryunit);
+		negate();
+		push(p1);
+		push(p1);
+		push(p1);
+		multiply();
+		push_double(-1.0);
+		add();
+		push_rational(1, 2);
+		power();
+		add();
+		logarithm();
+		multiply();
 		return;
 	}
 	// if p1 == 1/sqrt(2) then return 1/4*pi (45 degrees)
@@ -1669,7 +1703,6 @@ arccos(void)
 		push_rational(1, 4);
 		push_symbol(PI);
 		multiply();
-		restore();
 		return;
 	}
 	// if p1 == -1/sqrt(2) then return 3/4*pi (135 degrees)
@@ -1677,14 +1710,12 @@ arccos(void)
 		push_rational(3, 4);
 		push_symbol(PI);
 		multiply();
-		restore();
 		return;
 	}
 	if (!isrational(p1)) {
 		push_symbol(ARCCOS);
 		push(p1);
 		list(2);
-		restore();
 		return;
 	}
 	push(p1);
@@ -1711,7 +1742,7 @@ arccos(void)
 		multiply();
 		break;
 	case 2:
-		push(zero);
+		push_integer(0);
 		break;
 	default:
 		push_symbol(ARCCOS);
@@ -1719,7 +1750,6 @@ arccos(void)
 		list(2);
 		break;
 	}
-	restore();
 }
 
 void
@@ -1733,32 +1763,44 @@ eval_arccosh(void)
 void
 arccosh(void)
 {
-	double d;
 	save();
+	arccosh_nib();
+	restore();
+}
+
+void
+arccosh_nib(void)
+{
 	p1 = pop();
+	if (isdouble(p1) && p1->u.d >= 1.0) {
+		push_double(acosh(p1->u.d));
+		return;
+	}
+	// arccosh(z) = log(z + (z^2 - 1)^(1/2))
+	if (isdouble(p1) || isdoublez(p1)) {
+		push(p1);
+		push(p1);
+		multiply();
+		push_double(-1.0);
+		add();
+		push_rational(1, 2);
+		power();
+		push(p1);
+		add();
+		logarithm();
+		return;
+	}
+	if (equaln(p1, 1)) {
+		push_integer(0);
+		return;
+	}
 	if (car(p1) == symbol(COSH)) {
 		push(cadr(p1));
-		restore();
-		return;
-	}
-	if (isdouble(p1)) {
-		d = p1->u.d;
-		if (d < 1.0)
-			stop("arccosh function argument is less than 1.0");
-		d = log(d + sqrt(d * d - 1.0));
-		push_double(d);
-		restore();
-		return;
-	}
-	if (isplusone(p1)) {
-		push(zero);
-		restore();
 		return;
 	}
 	push_symbol(ARCCOSH);
 	push(p1);
 	list(2);
-	restore();
 }
 
 void
@@ -1772,22 +1814,37 @@ eval_arcsin(void)
 void
 arcsin(void)
 {
-	int n;
-	double d;
 	save();
+	arcsin_nib();
+	restore();
+}
+
+void
+arcsin_nib(void)
+{
+	int n;
 	p1 = pop();
-	if (car(p1) == symbol(SIN)) {
-		push(cadr(p1));
-		restore();
+	if (isdouble(p1)) {
+		push_double(asin(p1->u.d));
 		return;
 	}
-	if (isdouble(p1)) {
-		errno = 0;
-		d = asin(p1->u.d);
-		if (errno)
-			stop("arcsin function argument is not in the interval [-1,1]");
-		push_double(d);
-		restore();
+	// arcsin(z) = -i log(i z + (1 - z^2)^(1/2))
+	if (isdoublez(p1)) {
+		push(imaginaryunit);
+		negate();
+		push(imaginaryunit);
+		push(p1);
+		multiply();
+		push_double(1.0);
+		push(p1);
+		push(p1);
+		multiply();
+		subtract();
+		push_rational(1, 2);
+		power();
+		add();
+		logarithm();
+		multiply();
 		return;
 	}
 	// if p1 == 1/sqrt(2) then return 1/4*pi (45 degrees)
@@ -1795,7 +1852,6 @@ arcsin(void)
 		push_rational(1, 4);
 		push_symbol(PI);
 		multiply();
-		restore();
 		return;
 	}
 	// if p1 == -1/sqrt(2) then return -1/4*pi (-45 degrees)
@@ -1803,14 +1859,12 @@ arcsin(void)
 		push_rational(-1, 4);
 		push_symbol(PI);
 		multiply();
-		restore();
 		return;
 	}
 	if (!isrational(p1)) {
 		push_symbol(ARCSIN);
 		push(p1);
 		list(2);
-		restore();
 		return;
 	}
 	push(p1);
@@ -1829,7 +1883,7 @@ arcsin(void)
 		multiply();
 		break;
 	case 0:
-		push(zero);
+		push_integer(0);
 		break;
 	case 1:
 		push_rational(1, 6);
@@ -1847,7 +1901,6 @@ arcsin(void)
 		list(2);
 		break;
 	}
-	restore();
 }
 
 void
@@ -1861,30 +1914,52 @@ eval_arcsinh(void)
 void
 arcsinh(void)
 {
-	double d;
 	save();
+	arcsinh_nib();
+	restore();
+}
+
+void
+arcsinh_nib(void)
+{
 	p1 = pop();
-	if (car(p1) == symbol(SINH)) {
-		push(cadr(p1));
-		restore();
+	if (isdouble(p1)) {
+		push_double(asinh(p1->u.d));
 		return;
 	}
-	if (isdouble(p1)) {
-		d = p1->u.d;
-		d = log(d + sqrt(d * d + 1.0));
-		push_double(d);
-		restore();
+	// arcsinh(z) = log(z + (z^2 + 1)^(1/2))
+	if (isdoublez(p1)) {
+		push(p1);
+		push(p1);
+		multiply();
+		push_double(1.0);
+		add();
+		push_rational(1, 2);
+		power();
+		push(p1);
+		add();
+		logarithm();
 		return;
 	}
 	if (iszero(p1)) {
-		push(zero);
-		restore();
+		push(p1);
+		return;
+	}
+	// arcsinh(-x) = -arcsinh(x)
+	if (isnegative(p1)) {
+		push(p1);
+		negate();
+		arcsinh();
+		negate();
+		return;
+	}
+	if (car(p1) == symbol(SINH)) {
+		push(cadr(p1));
 		return;
 	}
 	push_symbol(ARCSINH);
 	push(p1);
 	list(2);
-	restore();
 }
 
 void
@@ -1892,84 +1967,148 @@ eval_arctan(void)
 {
 	push(cadr(p1));
 	eval();
+	if (caddr(p1) == symbol(NIL))
+		push_integer(1);
+	else {
+		push(caddr(p1));
+		eval();
+	}
 	arctan();
 }
+
+#undef T
+#undef X
+#undef Y
+#undef Z
+
+#define T p1
+#define X p2
+#define Y p3
+#define Z p4
 
 void
 arctan(void)
 {
-	double d;
 	save();
-	p1 = pop();
-	if (car(p1) == symbol(TAN)) {
-		push(cadr(p1));
-		restore();
+	arctan_nib();
+	restore();
+}
+
+void
+arctan_nib(void)
+{
+	X = pop();
+	Y = pop();
+	if (isnum(X) && isnum(Y)) {
+		arctan_numerical_args();
 		return;
 	}
-	if (isdouble(p1)) {
-		errno = 0;
-		d = atan(p1->u.d);
-		if (errno)
-			stop("arctan function error");
-		push_double(d);
-		restore();
-		return;
-	}
-	if (iszero(p1)) {
-		push(zero);
-		restore();
-		return;
-	}
-	if (isnegative(p1)) {
-		push(p1);
-		negate();
-		arctan();
-		negate();
-		restore();
-		return;
-	}
-	// arctan(sin(a) / cos(a)) ?
-	if (find(p1, symbol(SIN)) && find(p1, symbol(COS))) {
-		push(p1);
-		numerator();
-		p2 = pop();
-		push(p1);
-		denominator();
-		p3 = pop();
-		if (car(p2) == symbol(SIN) && car(p3) == symbol(COS) && equal(cadr(p2), cadr(p3))) {
-			push(cadr(p2));
-			restore();
-			return;
-		}
-	}
-	// arctan(1/sqrt(3)) -> pi/6
-	if (car(p1) == symbol(POWER) && equaln(cadr(p1), 3) && equalq(caddr(p1), -1, 2)) {
-		push_rational(1, 6);
-		push_symbol(PI);
+	// arctan(z) = 1/2 i log((i + z) / (i - z))
+	if (!iszero(X) && (isdoublez(X) || isdoublez(Y))) {
+		push(Y);
+		push(X);
+		divide();
+		Z = pop();
+		push_double(0.5);
+		push(imaginaryunit);
 		multiply();
-		restore();
+		push(imaginaryunit);
+		push(Z);
+		add();
+		push(imaginaryunit);
+		push(Z);
+		subtract();
+		divide();
+		logarithm();
+		multiply();
 		return;
 	}
-	// arctan(1) -> pi/4
-	if (equaln(p1, 1)) {
-		push_rational(1, 4);
-		push_symbol(PI);
-		multiply();
-		restore();
-		return;
-	}
-	// arctan(sqrt(3)) -> pi/3
-	if (car(p1) == symbol(POWER) && equaln(cadr(p1), 3) && equalq(caddr(p1), 1, 2)) {
-		push_rational(1, 3);
-		push_symbol(PI);
-		multiply();
-		restore();
+	if (car(Y) == symbol(TAN) && isplusone(X)) {
+		push(cadr(Y)); // x of tan(x)
 		return;
 	}
 	push_symbol(ARCTAN);
-	push(p1);
-	list(2);
-	restore();
+	push(Y);
+	push(X);
+	list(3);
+}
+
+void
+arctan_numerical_args(void)
+{
+	double x, y;
+	if (iszero(X) && iszero(Y)) {
+		push_symbol(ARCTAN);
+		push_integer(0);
+		push_integer(0);
+		list(3);
+		return;
+	}
+	if (isnum(X) && isnum(Y) && (isdouble(X) || isdouble(Y))) {
+		push(X);
+		x = pop_double();
+		push(Y);
+		y = pop_double();
+		push_double(atan2(y, x));
+		return;
+	}
+	// X and Y are rational numbers
+	if (iszero(Y)) {
+		if (X->sign == MPLUS)
+			push_integer(0);
+		else
+			push_integer(-1);
+		push_symbol(PI);
+		multiply();
+		return;
+	}
+	if (iszero(X)) {
+		if (Y->sign == MPLUS)
+			push_rational(1, 2);
+		else
+			push_rational(-1, 2);
+		push_symbol(PI);
+		multiply();
+		return;
+	}
+	// convert fractions to integers
+	push(Y);
+	push(X);
+	divide();
+	absval();
+	T = pop();
+	push(T);
+	numerator();
+	if (Y->sign == MMINUS)
+		negate();
+	Y = pop();
+	push(T);
+	denominator();
+	if (X->sign == MMINUS)
+		negate();
+	X = pop();
+	// compare numerators and denominators, ignore signs
+	if (mcmp(X->u.q.a, Y->u.q.a) || mcmp(X->u.q.b, Y->u.q.b)) {
+		// not equal
+		push_symbol(ARCTAN);
+		push(Y);
+		push(X);
+		list(3);
+		return;
+	}
+	// X = Y modulo sign
+	if (X->sign == MPLUS)
+		if (Y->sign == MPLUS)
+			push_rational(1, 4);
+		else
+			push_rational(-1, 4);
+	else
+		if (Y->sign == MPLUS)
+			push_rational(3, 4);
+		else
+			push_rational(-3, 4);
+	push_symbol(PI);
+	multiply();
 }
 
 void
@@ -1983,74 +2122,60 @@ eval_arctanh(void)
 void
 arctanh(void)
 {
-	double d;
 	save();
+	arctanh_nib();
+	restore();
+}
+
+void
+arctanh_nib(void)
+{
 	p1 = pop();
-	if (car(p1) == symbol(TANH)) {
-		push(cadr(p1));
-		restore();
+	if (equaln(p1, 1) || equaln(p1, -1)) {
+		push_symbol(ARCTANH);
+		push(p1);
+		list(2);
 		return;
 	}
 	if (isdouble(p1)) {
-		d = p1->u.d;
-		if (d < -1.0 || d > 1.0)
-			stop("arctanh function argument is not in the interval [-1,1]");
-		d = log((1.0 + d) / (1.0 - d)) / 2.0;
-		push_double(d);
-		restore();
+		push_double(atanh(p1->u.d));
+		return;
+	}
+	// arctanh(z) = 1/2 (log(1 + z) - log(1 - z))
+	if (isdoublez(p1)) {
+		push_double(1.0);
+		push(p1);
+		add();
+		logarithm();
+		push_double(1.0);
+		push(p1);
+		subtract();
+		logarithm();
+		subtract();
+		push_double(0.5);
+		multiply();
 		return;
 	}
 	if (iszero(p1)) {
-		push(zero);
-		restore();
+		push_integer(0);
+		return;
+	}
+	// arctanh(-x) = -arctanh(x)
+	if (isnegative(p1)) {
+		push(p1);
+		negate();
+		arctanh();
+		negate();
+		return;
+	}
+	if (car(p1) == symbol(TANH)) {
+		push(cadr(p1));
 		return;
 	}
 	push_symbol(ARCTANH);
 	push(p1);
 	list(2);
-	restore();
 }
-
-/* Argument (angle) of complex z
-
-	z		arg(z)
-	-		------
-
-	a		0
-
-	-a		-pi			See note 3 below
-
-	(-1)^a		a pi
-
-	exp(a + i b)	b
-
-	a b		arg(a) + arg(b)
-
-	a + i b		arctan(b/a)
-
-Result by quadrant
-
-	z		arg(z)
-	-		------
-
-	1 + i		1/4 pi
-
-	1 - i		-1/4 pi
-
-	-1 + i		3/4 pi
-
-	-1 - i		-3/4 pi
-
-Notes
-
-	1. Handles mixed polar and rectangular forms, e.g. 1 + exp(i pi/3)
-
-	2. Symbols in z are assumed to be positive and real.
-
-	3. Negative direction adds -pi to angle.
-
-	Example: z = (-1)^(1/3), mag(z) = 1/3 pi, mag(-z) = -2/3 pi
-*/
 
 void
 eval_arg(void)
@@ -2060,6 +2185,8 @@ eval_arg(void)
 	arg();
 }
 
+// use numerator and denominator to handle (a+i*b)/(c+i*d)
+
 void
 arg(void)
 {
@@ -2067,10 +2194,14 @@ arg(void)
 	p1 = pop();
 	push(p1);
 	numerator();
-	yyarg();
+	save();
+	arg_nib();
+	restore();
 	push(p1);
 	denominator();
-	yyarg();
+	save();
+	arg_nib();
+	restore();
 	subtract();
 	restore();
 }
@@ -2082,36 +2213,53 @@ arg(void)
 #define IM p3
 
 void
-yyarg(void)
+arg_nib(void)
 {
-	save();
+	int h;
 	p1 = pop();
-	if (isnegativenumber(p1)) {
-		push(symbol(PI));
-		negate();
-	} else if (car(p1) == symbol(POWER) && equaln(cadr(p1), -1)) {
-		// -1 to a power
+	if (isrational(p1)) {
+		if (p1->sign == MPLUS)
+			push_integer(0);
+		else {
+			push_symbol(PI);
+			negate();
+		}
+		return;
+	}
+	if (isdouble(p1)) {
+		if (p1->u.d >= 0.0)
+			push_double(0.0);
+		else
+			push_double(-M_PI);
+		return;
+	}
+	// (-1) ^ expr
+	if (car(p1) == symbol(POWER) && equaln(cadr(p1), -1)) {
 		push(symbol(PI));
 		push(caddr(p1));
 		multiply();
-	} else if (car(p1) == symbol(POWER) && cadr(p1) == symbol(EXP1)) {
-		// exponential
+		return;
+	}
+	// e ^ expr
+	if (car(p1) == symbol(POWER) && cadr(p1) == symbol(EXP1)) {
 		push(caddr(p1));
 		imag();
-	} else if (car(p1) == symbol(MULTIPLY)) {
-		// product of factors
-		push_integer(0);
+		return;
+	}
+	if (car(p1) == symbol(MULTIPLY)) {
+		h = tos;
 		p1 = cdr(p1);
 		while (iscons(p1)) {
 			push(car(p1));
 			arg();
-			add();
 			p1 = cdr(p1);
 		}
-	} else if (car(p1) == symbol(ADD)) {
-		// sum of terms
+		add_terms(tos - h);
+		return;
+	}
+	if (car(p1) == symbol(ADD)) {
 		push(p1);
-		rect();
+		rect(); // convert polar and clock forms
 		p1 = pop();
 		push(p1);
 		real();
@@ -2119,27 +2267,12 @@ yyarg(void)
 		push(p1);
 		imag();
 		IM = pop();
-		if (iszero(RE)) {
-			push(symbol(PI));
-			if (isnegative(IM))
-				negate();
-		} else {
-			push(IM);
-			push(RE);
-			divide();
-			arctan();
-			if (isnegative(RE)) {
-				push_symbol(PI);
-				if (isnegative(IM))
-					subtract();	// quadrant 1 -> 3
-				else
-					add();		// quadrant 4 -> 2
-			}
-		}
-	} else
-		// pure real
-		push_integer(0);
-	restore();
+		push(IM);
+		push(RE);
+		arctan();
+		return;
+	}
+	push_integer(0);
 }
 
 void
@@ -2172,155 +2305,6 @@ atomize(void)
 		p1 = cdr(p1);
 	}
 	push(p2);
-}
-
-// pretty print
-
-void
-bake(void)
-{
-	int h, s, t, x, y, z;
-	expanding++;
-	save();
-	p1 = pop();
-	if (length(p1) > 102) { // too slow for large polynomials
-		push(p1);
-		restore();
-		return;
-	}
-	s = ispoly(p1, symbol(SYMBOL_S));
-	t = ispoly(p1, symbol(SYMBOL_T));
-	x = ispoly(p1, symbol(SYMBOL_X));
-	y = ispoly(p1, symbol(SYMBOL_Y));
-	z = ispoly(p1, symbol(SYMBOL_Z));
-	if (s == 1 && t == 0 && x == 0 && y == 0 && z == 0) {
-		p2 = symbol(SYMBOL_S);
-		bake_poly();
-	} else if (s == 0 && t == 1 && x == 0 && y == 0 && z == 0) {
-		p2 = symbol(SYMBOL_T);
-		bake_poly();
-	} else if (s == 0 && t == 0 && x == 1 && y == 0 && z == 0) {
-		p2 = symbol(SYMBOL_X);
-		bake_poly();
-	} else if (s == 0 && t == 0 && x == 0 && y == 1 && z == 0) {
-		p2 = symbol(SYMBOL_Y);
-		bake_poly();
-	} else if (s == 0 && t == 0 && x == 0 && y == 0 && z == 1) {
-		p2 = symbol(SYMBOL_Z);
-		bake_poly();
-	} else if (iscons(p1)) {
-		h = tos;
-		push(car(p1));
-		p1 = cdr(p1);
-		while (iscons(p1)) {
-			push(car(p1));
-			bake();
-			p1 = cdr(p1);
-		}
-		list(tos - h);
-	} else
-		push(p1);
-	restore();
-	expanding--;
-}
-
-void
-polyform(void)
-{
-	int h;
-	save();
-	p2 = pop();
-	p1 = pop();
-	if (ispoly(p1, p2))
-		bake_poly();
-	else if (iscons(p1)) {
-		h = tos;
-		push(car(p1));
-		p1 = cdr(p1);
-		while (iscons(p1)) {
-			push(car(p1));
-			push(p2);
-			polyform();
-			p1 = cdr(p1);
-		}
-		list(tos - h);
-	} else
-		push(p1);
-	restore();
-}
-
-void
-bake_poly(void)
-{
-	int h, i, k, n;
-	U **a;
-	a = stack + tos;
-	push(p1);		// p(x)
-	push(p2);		// x
-	k = coeff();
-	h = tos;
-	for (i = k - 1; i >= 0; i--) {
-		p1 = a[i];
-		bake_poly_term(i);
-	}
-	n = tos - h;
-	if (n > 1) {
-		list(n);
-		push(symbol(ADD));
-		swap();
-		cons();
-	}
-	p1 = pop();
-	tos -= k;
-	push(p1);
-}
-
-// p1 points to coefficient of p2 ^ k
-
-void
-bake_poly_term(int k)
-{
-	int h, n;
-	if (iszero(p1))
-		return;
-	// constant term?
-	if (k == 0) {
-		if (car(p1) == symbol(ADD)) {
-			p1 = cdr(p1);
-			while (iscons(p1)) {
-				push(car(p1));
-				p1 = cdr(p1);
-			}
-		} else
-			push(p1);
-		return;
-	}
-	h = tos;
-	// coefficient
-	if (car(p1) == symbol(MULTIPLY)) {
-		p1 = cdr(p1);
-		while (iscons(p1)) {
-			push(car(p1));
-			p1 = cdr(p1);
-		}
-	} else if (!equaln(p1, 1))
-		push(p1);
-	// x ^ k
-	if (k == 1)
-		push(p2);
-	else {
-		push(symbol(POWER));
-		push(p2);
-		push_integer(k);
-		list(3);
-	}
-	n = tos - h;
-	if (n > 1) {
-		list(n);
-		push(symbol(MULTIPLY));
-		swap();
-		cons();
-	}
 }
 
 /* Bessel J function
@@ -2366,7 +2350,7 @@ void
 besselj(void)
 {
 	save();
-	yybesselj();
+	besselj_nib();
 	restore();
 }
 
@@ -2379,7 +2363,7 @@ besselj(void)
 #define SIGN p3
 
 void
-yybesselj(void)
+besselj_nib(void)
 {
 	double d;
 	int n;
@@ -2388,7 +2372,7 @@ yybesselj(void)
 	push(N);
 	n = pop_integer();
 	// numerical result
-	if (isdouble(X) && n != (int) 0x80000000) {
+	if (isdouble(X) && n != ERR) {
 		d = jn(n, X->u.d);
 		push_double(d);
 		return;
@@ -2399,14 +2383,14 @@ yybesselj(void)
 		return;
 	}
 	// besselj(0,n) = 0
-	if (iszero(X) && n != (int) 0x80000000) {
+	if (iszero(X) && n != ERR) {
 		push_integer(0);
 		return;
 	}
 	// half arguments
-	if (N->k == NUM && MEQUAL(N->u.q.b, 2)) {
+	if (N->k == RATIONAL && MEQUAL(N->u.q.b, 2)) {
 		// n = 1/2
-		if (MEQUAL(N->u.q.a, 1)) {
+		if (N->sign == MPLUS && MEQUAL(N->u.q.a, 1)) {
 			push_integer(2);
 			push_symbol(PI);
 			divide();
@@ -2415,12 +2399,12 @@ yybesselj(void)
 			push_rational(1, 2);
 			power();
 			push(X);
-			sine();
+			ssin();
 			multiply();
 			return;
 		}
 		// n = -1/2
-		if (MEQUAL(N->u.q.a, -1)) {
+		if (N->sign == MMINUS && MEQUAL(N->u.q.a, 1)) {
 			push_integer(2);
 			push_symbol(PI);
 			divide();
@@ -2429,12 +2413,15 @@ yybesselj(void)
 			push_rational(1, 2);
 			power();
 			push(X);
-			cosine();
+			scos();
 			multiply();
 			return;
 		}
 		// besselj(x,n) = (2/x) (n-sgn(n)) besselj(x,n-sgn(n)) - besselj(x,n-2*sgn(n))
-		push_integer(MSIGN(N->u.q.a));
+		if (N->sign == MPLUS)
+			push_integer(1);
+		else
+			push_integer(-1);
 		SIGN = pop();
 		push_integer(2);
 		push(X);
@@ -2459,55 +2446,11 @@ yybesselj(void)
 		subtract();
 		return;
 	}
-#if 0 // test cases needed
-	if (isnegativeterm(X)) {
-		push(X);
-		negate();
-		push(N);
-		power();
-		push(X);
-		push(N);
-		negate();
-		power();
-		multiply();
-		push_symbol(BESSELJ);
-		push(X);
-		negate();
-		push(N);
-		list(3);
-		multiply();
-		return;
-	}
-	if (isnegativeterm(N)) {
-		push_integer(-1);
-		push(N);
-		power();
-		push_symbol(BESSELJ);
-		push(X);
-		push(N);
-		negate();
-		list(3);
-		multiply();
-		return;
-	}
-#endif
-	push(symbol(BESSELJ));
+	push_symbol(BESSELJ);
 	push(X);
 	push(N);
 	list(3);
 }
-
-//-----------------------------------------------------------------------------
-//
-//	Bessel Y function
-//
-//	Input:		tos-2		x	(can be a symbol or expr)
-//
-//			tos-1		n
-//
-//	Output:		Result on stack
-//
-//-----------------------------------------------------------------------------
 
 void
 eval_bessely(void)
@@ -2523,7 +2466,7 @@ void
 bessely(void)
 {
 	save();
-	yybessely();
+	bessely_nib();
 	restore();
 }
 
@@ -2534,7 +2477,7 @@ bessely(void)
 #define N p2
 
 void
-yybessely(void)
+bessely_nib(void)
 {
 	double d;
 	int n;
@@ -2542,8 +2485,8 @@ yybessely(void)
 	X = pop();
 	push(N);
 	n = pop_integer();
-	if (isdouble(X) && n != (int) 0x80000000) {
-		d = yn(n, X->u.d);
+	if (isdouble(X) && n != ERR) {
+		d = yn(n, X->u.d); // math.h
 		push_double(d);
 		return;
 	}
@@ -2563,594 +2506,320 @@ yybessely(void)
 	push(X);
 	push(N);
 	list(3);
-	return;
-}
-
-#define MP_MIN_SIZE 2
-#define MP_MAX_FREE 1000
-
-int mtotal, mfreecount;
-unsigned int *free_stack[MP_MAX_FREE];
-
-unsigned int *
-mnew(int n)
-{
-	unsigned int *p;
-	if (n < MP_MIN_SIZE)
-		n = MP_MIN_SIZE;
-	if (n == MP_MIN_SIZE && mfreecount)
-		p = free_stack[--mfreecount];
-	else {
-		p = (unsigned int *) malloc((n + 3) * sizeof (int));
-		if (p == 0)
-			stop("malloc failure");
-	}
-	p[0] = n;
-	mtotal += n;
-	return p + 3;
 }
 
 void
-mfree(unsigned int *p)
+init_bignums(void)
 {
-	p -= 3;
-	mtotal -= p[0];
-	if (p[0] == MP_MIN_SIZE && mfreecount < MP_MAX_FREE)
-		free_stack[mfreecount++] = p;
-	else
-		free(p);
-}
-
-// convert int to bignum
-
-unsigned int *
-mint(int n)
-{
-	unsigned int *p = mnew(1);
-	if (n < 0)
-		MSIGN(p) = -1;
-	else
-		MSIGN(p) = 1;
-	MLENGTH(p) = 1;
-	p[0] = abs(n);
-	return p;
-}
-
-// copy bignum
-
-unsigned int *
-mcopy(unsigned int *a)
-{
-	int i;
-	unsigned int *b;
-	b = mnew(MLENGTH(a));
-	MSIGN(b) = MSIGN(a);
-	MLENGTH(b) = MLENGTH(a);
-	for (i = 0; i < MLENGTH(a); i++)
-		b[i] = a[i];
-	return b;
-}
-
-// a >= b ?
-
-int
-ge(unsigned int *a, unsigned int *b, int len)
-{
-	int i;
-	for (i = len - 1; i > 0; i--)
-		if (a[i] == b[i])
-			continue;
-		else
-			break;
-	if (a[i] >= b[i])
-		return 1;
-	else
-		return 0;
-}
-
-void
-add_numbers(void)
-{
-	double a, b;
-	if (isrational(stack[tos - 1]) && isrational(stack[tos - 2])) {
-		qadd();
-		return;
-	}
-	save();
-	p2 = pop();
-	p1 = pop();
-	if (isdouble(p1))
-		a = p1->u.d;
-	else
-		a = convert_rational_to_double(p1);
-	if (isdouble(p2))
-		b = p2->u.d;
-	else
-		b = convert_rational_to_double(p2);
-	push_double(a + b);
-	restore();
-}
-
-void
-subtract_numbers(void)
-{
-	double a, b;
-	if (isrational(stack[tos - 1]) && isrational(stack[tos - 2])) {
-		qsub();
-		return;
-	}
-	save();
-	p2 = pop();
-	p1 = pop();
-	if (isdouble(p1))
-		a = p1->u.d;
-	else
-		a = convert_rational_to_double(p1);
-	if (isdouble(p2))
-		b = p2->u.d;
-	else
-		b = convert_rational_to_double(p2);
-	push_double(a - b);
-	restore();
-}
-
-void
-multiply_numbers(void)
-{
-	double a, b;
-	if (isrational(stack[tos - 1]) && isrational(stack[tos - 2])) {
-		qmul();
-		return;
-	}
-	save();
-	p2 = pop();
-	p1 = pop();
-	if (isdouble(p1))
-		a = p1->u.d;
-	else
-		a = convert_rational_to_double(p1);
-	if (isdouble(p2))
-		b = p2->u.d;
-	else
-		b = convert_rational_to_double(p2);
-	push_double(a * b);
-	restore();
-}
-
-void
-divide_numbers(void)
-{
-	double a, b;
-	if (isrational(stack[tos - 1]) && isrational(stack[tos - 2])) {
-		qdiv();
-		return;
-	}
-	save();
-	p2 = pop();
-	p1 = pop();
-	if (iszero(p2))
-		stop("divide by zero");
-	if (isdouble(p1))
-		a = p1->u.d;
-	else
-		a = convert_rational_to_double(p1);
-	if (isdouble(p2))
-		b = p2->u.d;
-	else
-		b = convert_rational_to_double(p2);
-	push_double(a / b);
-	restore();
-}
-
-void
-invert_number(void)
-{
-	unsigned int *a, *b;
-	save();
-	p1 = pop();
-	if (iszero(p1))
-		stop("divide by zero");
-	if (isdouble(p1)) {
-		push_double(1 / p1->u.d);
-		restore();
-		return;
-	}
-	a = mcopy(p1->u.q.a);
-	b = mcopy(p1->u.q.b);
-	MSIGN(b) = MSIGN(a);
-	MSIGN(a) = 1;
-	p1 = alloc();
-	p1->k = NUM;
-	p1->u.q.a = b;
-	p1->u.q.b = a;
-	push(p1);
-	restore();
-}
-
-int
-compare_rationals(U *a, U *b)
-{
-	int t;
-	unsigned int *ab, *ba;
-	ab = mmul(a->u.q.a, b->u.q.b);
-	ba = mmul(a->u.q.b, b->u.q.a);
-	t = mcmp(ab, ba);
-	mfree(ab);
-	mfree(ba);
-	return t;
-}
-
-int
-compare_numbers(U *a, U *b)
-{
-	double x, y;
-	if (isrational(a) && isrational(b))
-		return compare_rationals(a, b);
-	if (isdouble(a))
-		x = a->u.d;
-	else
-		x = convert_rational_to_double(a);
-	if (isdouble(b))
-		y = b->u.d;
-	else
-		y = convert_rational_to_double(b);
-	if (x < y)
-		return -1;
-	if (x > y)
-		return 1;
-	return 0;
-}
-
-void
-negate_number(void)
-{
-	save();
-	p1 = pop();
-	if (iszero(p1)) {
-		push(p1);
-		restore();
-		return;
-	}
-	switch (p1->k) {
-	case NUM:
-		p2 = alloc();
-		p2->k = NUM;
-		p2->u.q.a = mcopy(p1->u.q.a);
-		p2->u.q.b = mcopy(p1->u.q.b);
-		MSIGN(p2->u.q.a) *= -1;
-		push(p2);
-		break;
-	case DOUBLE:
-		push_double(-p1->u.d);
-		break;
-	default:
-		stop("bug caught in mp_negate_number");
-		break;
-	}
-	restore();
-}
-
-void
-bignum_truncate(void)
-{
-	unsigned int *a;
-	save();
-	p1 = pop();
-	a = mdiv(p1->u.q.a, p1->u.q.b);
-	p1 = alloc();
-	p1->k = NUM;
-	p1->u.q.a = a;
-	p1->u.q.b = mint(1);
-	push(p1);
-	restore();
-}
-
-void
-mp_numerator(void)
-{
-	save();
-	p1 = pop();
-	if (p1->k != NUM) {
-		push(one);
-		restore();
-		return;
-	}
-	p2 = alloc();
-	p2->k = NUM;
-	p2->u.q.a = mcopy(p1->u.q.a);
-	p2->u.q.b = mint(1);
-	push(p2);
-	restore();
-}
-
-void
-mp_denominator(void)
-{
-	save();
-	p1 = pop();
-	if (p1->k != NUM) {
-		push(one);
-		restore();
-		return;
-	}
-	p2 = alloc();
-	p2->k = NUM;
-	p2->u.q.a = mcopy(p1->u.q.b);
-	p2->u.q.b = mint(1);
-	push(p2);
-	restore();
-}
-
-void
-bignum_power_number(int expo)
-{
-	unsigned int *a, *b, *t;
-	save();
-	p1 = pop();
-	a = mpow(p1->u.q.a, abs(expo));
-	b = mpow(p1->u.q.b, abs(expo));
-	if (expo < 0) {
-		t = a;
-		a = b;
-		b = t;
-		MSIGN(a) = MSIGN(b);
-		MSIGN(b) = 1;
-	}
-	p1 = alloc();
-	p1->k = NUM;
-	p1->u.q.a = a;
-	p1->u.q.b = b;
-	push(p1);
-	restore();
-}
-
-double
-convert_bignum_to_double(unsigned int *p)
-{
-	int i;
-	double d = 0.0;
-	for (i = MLENGTH(p) - 1; i >= 0; i--)
-		d = 4294967296.0 * d + p[i];
-	if (MSIGN(p) == -1)
-		d = -d;
-	return d;
-}
-
-double
-convert_rational_to_double(U *p)
-{
-	int i, n, na, nb;
-	double a = 0.0, b = 0.0;
-	na = MLENGTH(p->u.q.a);
-	nb = MLENGTH(p->u.q.b);
-	if (na < nb)
-		n = na;
-	else
-		n = nb;
-	for (i = 0; i < n; i++) {
-		a = a / 4294967296.0 + p->u.q.a[i];
-		b = b / 4294967296.0 + p->u.q.b[i];
-	}
-	if (na > nb)
-		for (i = nb; i < na; i++) {
-			a = a / 4294967296.0 + p->u.q.a[i];
-			b = b / 4294967296.0;
-		}
-	if (na < nb)
-		for (i = na; i < nb; i++) {
-			a = a / 4294967296.0;
-			b = b / 4294967296.0 + p->u.q.b[i];
-		}
-	if (MSIGN(p->u.q.a) == -1)
-		a = -a;
-	return a / b;
+	push_rational_number(MPLUS, mint(0), mint(1));
+	zero = pop();
+	push_rational_number(MPLUS, mint(1), mint(1));
+	one = pop();
+	push_rational_number(MMINUS, mint(1), mint(1));
+	minusone = pop();
 }
 
 void
 push_integer(int n)
 {
-	save();
-	p1 = alloc();
-	p1->k = NUM;
-	p1->u.q.a = mint(n);
-	p1->u.q.b = mint(1);
-	push(p1);
-	restore();
-}
-
-void
-push_double(double d)
-{
-	save();
-	p1 = alloc();
-	p1->k = DOUBLE;
-	p1->u.d = d;
-	push(p1);
-	restore();
+	switch (n) {
+	case 0:
+		push(zero);
+		break;
+	case 1:
+		push(one);
+		break;
+	case -1:
+		push(minusone);
+		break;
+	default:
+		if (n < 0)
+			push_rational_number(MMINUS, mint(-n), mint(1));
+		else
+			push_rational_number(MPLUS, mint(n), mint(1));
+		break;
+	}
 }
 
 void
 push_rational(int a, int b)
 {
-	save();
-	p1 = alloc();
-	p1->k = NUM;
-	p1->u.q.a = mint(a);
-	p1->u.q.b = mint(b);
-	/* FIXME -- normalize */
-	push(p1);
-	restore();
+	if (a < 0)
+		push_rational_number(MMINUS, mint(-a), mint(b));
+	else
+		push_rational_number(MPLUS, mint(a), mint(b));
+}
+
+void
+push_rational_number(int sign, uint32_t *a, uint32_t *b)
+{
+	struct atom *p;
+	if (MZERO(a)) {
+		sign = MPLUS;
+		if (!MEQUAL(b, 1)) {
+			mfree(b);
+			b = mint(1);
+		}
+	}
+	p = alloc();
+	p->k = RATIONAL;
+	p->sign = sign;
+	p->u.q.a = a;
+	p->u.q.b = b;
+	push(p);
 }
 
 int
 pop_integer(void)
 {
-	int n;
-	save();
-	p1 = pop();
-	switch (p1->k) {
-	case NUM:
-		if (isinteger(p1) && MLENGTH(p1->u.q.a) == 1) {
-			n = p1->u.q.a[0];
-			if (n & 0x80000000)
-				n = 0x80000000;
-			else
-				n *= MSIGN(p1->u.q.a);
-		} else
-			n = 0x80000000;
-		break;
-	case DOUBLE:
-		n = (int) p1->u.d;
-		if ((double) n != p1->u.d)
-			n = 0x80000000;
-		break;
-	default:
-		n = 0x80000000;
-		break;
+	int n = ERR;
+	struct atom *p; // ok, no gc
+	p = pop();
+	if (isinteger(p) && MLENGTH(p->u.q.a) == 1 && p->u.q.a[0] < 0x80000000) {
+		n = p->u.q.a[0];
+		if (p->sign == MMINUS)
+			n = -n;
+	} else if (isdouble(p)) {
+		n = (int) p->u.d;
+		if ((double) n != p->u.d)
+			n = ERR;
 	}
-	restore();
 	return n;
 }
 
 void
-print_double(U *p, int flag)
+push_double(double d)
 {
-	static char buf[80];
-	sprintf(buf, "%g", p->u.d);
-	if (flag == 1 && *buf == '-')
-		print_str(buf + 1);
-	else
-		print_str(buf);
-}
-
-void
-bignum_scan_integer(char *s)
-{
-	unsigned int *a;
-	char sign;
-	save();
-	sign = *s;
-	if (sign == '+' || sign == '-')
-		s++;
-	a = mscan(s);
-	p1 = alloc();
-	p1->k = NUM;
-	p1->u.q.a = a;
-	p1->u.q.b = mint(1);
-	push(p1);
-	if (sign == '-')
-		negate();
-	restore();
-}
-
-void
-bignum_scan_float(char *s)
-{
-	push_double(atof(s));
-}
-
-// print as unsigned
-
-void
-print_number(U *p)
-{
-	char *s;
-	static char buf[100];
-	switch (p->k) {
-	case NUM:
-		s = mstr(p->u.q.a);
-		if (*s == '+' || *s == '-')
-			s++;
-		print_str(s);
-		if (isfraction(p)) {
-			print_str("/");
-			s = mstr(p->u.q.b);
-			print_str(s);
-		}
-		break;
-	case DOUBLE:
-		sprintf(buf, "%g", p->u.d);
-		if (*buf == '+' || *buf == '-')
-			print_str(buf + 1);
-		else
-			print_str(buf);
-		break;
-	default:
-		break;
-	}
-}
-
-void
-gcd_numbers(void)
-{
-	save();
-	p2 = pop();
-	p1 = pop();
-//	if (!isinteger(p1) || !isinteger(p2))
-//		stop("integer args expected for gcd");
-	p3 = alloc();
-	p3->k = NUM;
-	p3->u.q.a = mgcd(p1->u.q.a, p2->u.q.a);
-	p3->u.q.b = mgcd(p1->u.q.b, p2->u.q.b);
-	MSIGN(p3->u.q.a) = 1;
-	push(p3);
-	restore();
+	struct atom *p;
+	p = alloc();
+	p->k = DOUBLE;
+	p->u.d = d;
+	push(p);
 }
 
 double
 pop_double(void)
 {
-	double d;
-	save();
-	p1 = pop();
-	switch (p1->k) {
-	case NUM:
-		d = convert_rational_to_double(p1);
-		break;
-	case DOUBLE:
-		d = p1->u.d;
-		break;
-	default:
-		d = 0.0;
-		break;
+	struct atom *p;
+	p = pop();
+	if (isrational(p))
+		return convert_rational_to_double(p);
+	else if (isdouble(p))
+		return p->u.d;
+	else
+		return 0.0;
+}
+
+int
+equaln(struct atom *p, int n)
+{
+	if (isrational(p))
+		return p->sign == (n < 0 ? MMINUS : MPLUS) && MEQUAL(p->u.q.a, abs(n)) && MEQUAL(p->u.q.b, 1);
+	else if (isdouble(p))
+		return p->u.d == (double) n;
+	else
+		return 0;
+}
+
+int
+equalq(struct atom *p, int a, int b)
+{
+	if (isrational(p))
+		return p->sign == (a < 0 ? MMINUS : MPLUS) && MEQUAL(p->u.q.a, abs(a)) && MEQUAL(p->u.q.b, b);
+	else if (isdouble(p))
+		return p->u.d == (double) a / b;
+	else
+		return 0;
+}
+
+int
+compare_numbers(struct atom *a, struct atom *b)
+{
+	double aa, bb;
+	if (isrational(a) && isrational(b))
+		return compare_rationals(a, b);
+	if (isdouble(a))
+		aa = a->u.d;
+	else
+		aa = convert_rational_to_double(a);
+	if (isdouble(b))
+		bb = b->u.d;
+	else
+		bb = convert_rational_to_double(b);
+	if (aa < bb)
+		return -1;
+	if (aa > bb)
+		return 1;
+	return 0;
+}
+
+int
+compare_rationals(struct atom *a, struct atom *b)
+{
+	int t;
+	uint32_t *ab, *ba;
+	if (a->sign == MMINUS && b->sign == MPLUS)
+		return -1;
+	if (a->sign == MPLUS && b->sign == MMINUS)
+		return 1;
+	if (isinteger(a) && isinteger(b)) {
+		if (a->sign == MMINUS)
+			return mcmp(b->u.q.a, a->u.q.a);
+		else
+			return mcmp(a->u.q.a, b->u.q.a);
 	}
-	restore();
-	return d;
+	ab = mmul(a->u.q.a, b->u.q.b);
+	ba = mmul(a->u.q.b, b->u.q.a);
+	if (a->sign == MMINUS)
+		t = mcmp(ba, ab);
+	else
+		t = mcmp(ab, ba);
+	mfree(ab);
+	mfree(ba);
+	return t;
+}
+
+double
+convert_rational_to_double(struct atom *p)
+{
+	int i, n;
+	double a = 0.0, b = 0.0;
+	if (iszero(p))
+		return 0.0;
+	// numerator
+	n = MLENGTH(p->u.q.a);
+	for (i = 0; i < n; i++)
+		a += scalbn((double) p->u.q.a[i], 32 * i);
+	// denominator
+	n = MLENGTH(p->u.q.b);
+	for (i = 0; i < n; i++)
+		b += scalbn((double) p->u.q.b[i], 32 * i);
+	if (p->sign == MMINUS)
+		a = -a;
+	return a / b;
+}
+
+void
+convert_double_to_rational(double d)
+{
+	int n;
+	double x, y;
+	uint32_t *a;
+	uint64_t u;
+	// do this first, 0.0 fails isnormal()
+	if (d == 0.0) {
+		push_integer(0);
+		return;
+	}
+	if (!isnormal(d))
+		stop("floating point value is nan or inf, cannot convert to rational number");
+	x = fabs(d);
+	// integer?
+	if (floor(x) == x) {
+		x = frexp(x, &n);
+		u = (uint64_t) scalbn(x, 64);
+		a = mnew(2);
+		a[0] = (uint32_t) u;
+		a[1] = (uint32_t) (u >> 32);
+		push_rational_number(d < 0.0 ? MMINUS : MPLUS, a, mint(1));
+		push_integer(2);
+		push_integer(n - 64);
+		power();
+		multiply();
+		return;
+	}
+	// not integer
+	y = floor(log10(x)) + 1.0;
+	x = x / pow(10.0, y); // scale x to (0,1)
+	best_rational_approximation(x);
+	push_integer(10);
+	push_integer((int) y);
+	power();
+	multiply();
+	if (d < 0.0)
+		negate();
+}
+
+#undef N
+#define N 1000
+
+void
+best_rational_approximation(double x)
+{
+	int a = 0, b = 1, c = 1, d = 1;
+	double m;
+	for (;;) {
+		m = (double) (a + c) / (double) (b + d);
+		if (m == x)
+			break;
+		if (x < m) {
+			c += a;
+			d += b;
+			if (d > N) {
+				push_rational(a, b);
+				return;
+			}
+		} else {
+			a += c;
+			b += d;
+			if (b > N) {
+				push_rational(c, d);
+				return;
+			}
+		}
+	}
+	if (b + d <= N)
+		push_rational(a + c, b + d);
+	else if (d > b)
+		push_rational(c, d); // largest denominator is most accurate
+	else
+		push_rational(a, b);
+}
+
+void
+bignum_scan_integer(char *s)
+{
+	int sign;
+	uint32_t *a;
+	if (*s == '-')
+		sign = MMINUS;
+	else
+		sign = MPLUS;
+	if (*s == '+' || *s == '-')
+		s++;
+	a = mscan(s);
+	if (a == NULL)
+		stop("parse error");
+	push_rational_number(sign, a, mint(1));
 }
 
 void
 bignum_float(void)
 {
 	double d;
-	d = convert_rational_to_double(pop());
+	struct atom *p; // ok, no gc
+	p = pop();
+	d = convert_rational_to_double(p);
 	push_double(d);
 }
 
 void
 bignum_factorial(int n)
 {
-	save();
-	p1 = alloc();
-	p1->k = NUM;
-	p1->u.q.a = bignum_factorial_nib(n);
-	p1->u.q.b = mint(1);
-	push(p1);
-	restore();
+	push_rational_number(MPLUS, bignum_factorial_nib(n), mint(1));
 }
 
-unsigned int *
+uint32_t *
 bignum_factorial_nib(int n)
 {
 	int i;
-	unsigned int *a, *b, *t;
-	if (n == 0 || n == 1) {
-		a = mint(1);
-		return a;
-	}
+	uint32_t *a, *b, *t;
+	if (n == 0 || n == 1)
+		return mint(1);
 	a = mint(2);
 	b = mint(0);
 	for (i = 3; i <= n; i++) {
-		b[0] = (unsigned int) i;
+		b[0] = (uint32_t) i;
 		t = mmul(a, b);
 		mfree(a);
 		a = t;
@@ -3159,55 +2828,20 @@ bignum_factorial_nib(int n)
 	return a;
 }
 
-unsigned int mask[32] = {
-	0x00000001,
-	0x00000002,
-	0x00000004,
-	0x00000008,
-	0x00000010,
-	0x00000020,
-	0x00000040,
-	0x00000080,
-	0x00000100,
-	0x00000200,
-	0x00000400,
-	0x00000800,
-	0x00001000,
-	0x00002000,
-	0x00004000,
-	0x00008000,
-	0x00010000,
-	0x00020000,
-	0x00040000,
-	0x00080000,
-	0x00100000,
-	0x00200000,
-	0x00400000,
-	0x00800000,
-	0x01000000,
-	0x02000000,
-	0x04000000,
-	0x08000000,
-	0x10000000,
-	0x20000000,
-	0x40000000,
-	0x80000000,
-};
-
 void
-mp_set_bit(unsigned int *x, unsigned int k)
+msetbit(uint32_t *x, uint32_t k)
 {
-	x[k / 32] |= mask[k % 32];
+	x[k / 32] |= 1 << (k % 32);
 }
 
 void
-mp_clr_bit(unsigned int *x, unsigned int k)
+mclrbit(uint32_t *x, uint32_t k)
 {
-	x[k / 32] &= ~mask[k % 32];
+	x[k / 32] &= ~(1 << (k % 32));
 }
 
 void
-mshiftright(unsigned int *a)
+mshiftright(uint32_t *a)
 {
 	int c, i, n;
 	n = MLENGTH(a);
@@ -3224,27 +2858,700 @@ mshiftright(unsigned int *a)
 		MLENGTH(a) = n - 1;
 }
 
-//	Binomial coefficient
+uint32_t *
+mscan(char *s)
+{
+	uint32_t *a, *b, *t;
+	a = mint(0);
+	t = mint(0);
+	while (*s) {
+		if (*s < '0' || *s > '9') {
+			mfree(a);
+			a = NULL;
+			break;
+		}
+		t[0] = 10;
+		b = mmul(a, t);
+		mfree(a);
+		t[0] = *s - '0';
+		a = madd(b, t);
+		mfree(b);
+		s++;
+	}
+	mfree(t);
+	return a;
+}
+
+// convert bignum to string (returned value points to static buffer)
+
+char *
+mstr(uint32_t *u)
+{
+	int i, k, n, r;
+	static char *buf;
+	static int len;
+	n = 10 * MLENGTH(u) + 9; // estimate string length (+8 for leading zeroes, +1 for terminator)
+	if (n > len) {
+		if (buf)
+			free(buf);
+		buf = (char *) malloc(n);
+		if (buf == NULL)
+			malloc_kaput();
+		len = n;
+	}
+	k = len - 1;
+	buf[k] = 0;
+	u = mcopy(u);
+	for (;;) {
+		r = mdivby1billion(u);
+		for (i = 0; i < 9; i++) {
+			buf[--k] = r % 10 + '0';
+			r /= 10;
+		}
+		if (MZERO(u))
+			break;
+	}
+	mfree(u);
+	while (k < len - 2 && buf[k] == '0') // remove leading zeroes
+		k++;
+	return buf + k;
+}
+
+// returns remainder as function value, quotient returned in a
+
+int
+mdivby1billion(uint32_t *u)
+{
+	int i;
+	uint64_t r = 0;
+	for (i = MLENGTH(u) - 1; i >= 0; i--) {
+		r = r << 32 | u[i];
+		u[i] = (uint32_t) (r / 1000000000); // compiler warns w/o cast
+		r -= (uint64_t) 1000000000 * u[i];
+	}
+	mnorm(u);
+	return (int) r; // compiler warns w/o cast
+}
+
+// returns u + v
+
+uint32_t *
+madd(uint32_t *u, uint32_t *v)
+{
+	int i, nu, nv, nw;
+	uint64_t t;
+	uint32_t *w;
+	nu = MLENGTH(u);
+	nv = MLENGTH(v);
+	if (nu > nv)
+		nw = nu + 1;
+	else
+		nw = nv + 1;
+	w = mnew(nw);
+	for (i = 0; i < nu; i++)
+		w[i] = u[i];
+	for (i = nu; i < nw; i++)
+		w[i] = 0;
+	t = 0;
+	for (i = 0; i < nv; i++) {
+		t += (uint64_t) w[i] + v[i];
+		w[i] = (uint32_t) t;
+		t >>= 32;
+	}
+	for (i = nv; i < nw; i++) {
+		t += w[i];
+		w[i] = (uint32_t) t;
+		t >>= 32;
+	}
+	mnorm(w);
+	return w;
+}
+
+// returns u - v
+
+uint32_t *
+msub(uint32_t *u, uint32_t *v)
+{
+	int i, nu, nv, nw;
+	uint64_t t;
+	uint32_t *w;
+	nu = MLENGTH(u);
+	nv = MLENGTH(v);
+	if (nu > nv)
+		nw = nu;
+	else
+		nw = nv;
+	w = mnew(nw);
+	for (i = 0; i < nu; i++)
+		w[i] = u[i];
+	for (i = nu; i < nw; i++)
+		w[i] = 0;
+	t = 0;
+	for (i = 0; i < nv; i++) {
+		t += (uint64_t) w[i] - v[i];
+		w[i] = (uint32_t) t;
+		t = (int64_t) t >> 32; // cast to extend sign
+	}
+	for (i = nv; i < nw; i++) {
+		t += w[i];
+		w[i] = (uint32_t) t;
+		t = (int64_t) t >> 32; // cast to extend sign
+	}
+	mnorm(w);
+	return w;
+}
+
+// returns u * v
+
+uint32_t *
+mmul(uint32_t *u, uint32_t *v)
+{
+	int i, j, nu, nv, nw;
+	uint64_t t;
+	uint32_t *w;
+	nu = MLENGTH(u);
+	nv = MLENGTH(v);
+	nw = nu + nv;
+	w = mnew(nw);
+	for (i = 0; i < nu; i++)
+		w[i] = 0;
+	for (j = 0; j < nv; j++) {
+		t = 0;
+		for (i = 0; i < nu; i++) {
+			t += (uint64_t) u[i] * v[j] + w[i + j];
+			w[i + j] = (uint32_t) t;
+			t >>= 32;
+		}
+		w[i + j] = (uint32_t) t;
+	}
+	mnorm(w);
+	return w;
+}
+
+// returns floor(u / v)
+
+uint32_t *
+mdiv(uint32_t *u, uint32_t *v)
+{
+	int i, k, nu, nv;
+	uint32_t *q, qhat, *w;
+	uint64_t a, b, t;
+	mnorm(u);
+	mnorm(v);
+	if (MLENGTH(v) == 1 && v[0] == 0)
+		stop("divide by zero"); // v = 0
+	nu = MLENGTH(u);
+	nv = MLENGTH(v);
+	k = nu - nv;
+	if (k < 0) {
+		q = mnew(1);
+		q[0] = 0;
+		return q; // u < v, return zero
+	}
+	u = mcopy(u);
+	q = mnew(k + 1);
+	w = mnew(nv + 1);
+	b = v[nv - 1];
+	do {
+		q[k] = 0;
+		while (nu >= nv + k) {
+			// estimate 32-bit partial quotient
+			a = u[nu - 1];
+			if (nu > nv + k)
+				a = a << 32 | u[nu - 2];
+			if (a < b)
+				break;
+			qhat = (uint32_t) (a / (b + 1));
+			if (qhat == 0)
+				qhat = 1;
+			// w = qhat * v
+			t = 0;
+			for (i = 0; i < nv; i++) {
+				t += (uint64_t) qhat * v[i];
+				w[i] = (uint32_t) t;
+				t >>= 32;
+			}
+			w[nv] = (uint32_t) t;
+			// u = u - w
+			t = 0;
+			for (i = k; i < nu; i++) {
+				t += (uint64_t) u[i] - w[i - k];
+				u[i] = (uint32_t) t;
+				t = (int64_t) t >> 32; // cast to extend sign
+			}
+			if (t) {
+				// u is negative, restore u
+				t = 0;
+				for (i = k; i < nu; i++) {
+					t += (uint64_t) u[i] + w[i - k];
+					u[i] = (uint32_t) t;
+					t >>= 32;
+				}
+				break;
+			}
+			q[k] += qhat;
+			mnorm(u);
+			nu = MLENGTH(u);
+		}
+	} while (--k >= 0);
+	mnorm(q);
+	mfree(u);
+	mfree(w);
+	return q;
+}
+
+// returns u mod v
+
+uint32_t *
+mmod(uint32_t *u, uint32_t *v)
+{
+	int i, k, nu, nv;
+	uint32_t qhat, *w;
+	uint64_t a, b, t;
+	mnorm(u);
+	mnorm(v);
+	if (MLENGTH(v) == 1 && v[0] == 0)
+		stop("divide by zero"); // v = 0
+	u = mcopy(u);
+	nu = MLENGTH(u);
+	nv = MLENGTH(v);
+	k = nu - nv;
+	if (k < 0)
+		return u; // u < v
+	w = mnew(nv + 1);
+	b = v[nv - 1];
+	do {
+		while (nu >= nv + k) {
+			// estimate 32-bit partial quotient
+			a = u[nu - 1];
+			if (nu > nv + k)
+				a = a << 32 | u[nu - 2];
+			if (a < b)
+				break;
+			qhat = (uint32_t) (a / (b + 1));
+			if (qhat == 0)
+				qhat = 1;
+			// w = qhat * v
+			t = 0;
+			for (i = 0; i < nv; i++) {
+				t += (uint64_t) qhat * v[i];
+				w[i] = (uint32_t) t;
+				t >>= 32;
+			}
+			w[nv] = (uint32_t) t;
+			// u = u - w
+			t = 0;
+			for (i = k; i < nu; i++) {
+				t += (uint64_t) u[i] - w[i - k];
+				u[i] = (uint32_t) t;
+				t = (int64_t) t >> 32; // cast to extend sign
+			}
+			if (t) {
+				// u is negative, restore u
+				t = 0;
+				for (i = k; i < nu; i++) {
+					t += (uint64_t) u[i] + w[i - k];
+					u[i] = (uint32_t) t;
+					t >>= 32;
+				}
+				break;
+			}
+			mnorm(u);
+			nu = MLENGTH(u);
+		}
+	} while (--k >= 0);
+	mfree(w);
+	return u;
+}
+
+// returns u ** v
+
+uint32_t *
+mpow(uint32_t *u, uint32_t *v)
+{
+	uint32_t *t, *w;
+	u = mcopy(u);
+	v = mcopy(v);
+	// w = 1
+	w = mnew(1);
+	w[0] = 1;
+	for (;;) {
+		if (v[0] & 1) {
+			// w = w * u
+			t = mmul(w, u);
+			mfree(w);
+			w = t;
+		}
+		// v = v >> 1
+		mshr(v);
+		// v = 0?
+		if (MLENGTH(v) == 1 && v[0] == 0)
+			break;
+		// u = u * u
+		t = mmul(u, u);
+		mfree(u);
+		u = t;
+	}
+	mfree(u);
+	mfree(v);
+	return w;
+}
+
+// u = u >> 1
+
+void
+mshr(uint32_t *u)
+{
+	int i;
+	for (i = 0; i < MLENGTH(u) - 1; i++) {
+		u[i] >>= 1;
+		if (u[i + 1] & 1)
+			u[i] |= 0x80000000;
+	}
+	u[i] >>= 1;
+	mnorm(u);
+}
+
+// compare u and v
+
+int
+mcmp(uint32_t *u, uint32_t *v)
+{
+	int i;
+	mnorm(u);
+	mnorm(v);
+	if (MLENGTH(u) < MLENGTH(v))
+		return -1;
+	if (MLENGTH(u) > MLENGTH(v))
+		return 1;
+	for (i = MLENGTH(u) - 1; i >= 0; i--) {
+		if (u[i] < v[i])
+			return -1;
+		if (u[i] > v[i])
+			return 1;
+	}
+	return 0; // u = v
+}
+
+int
+meq(uint32_t *u, uint32_t *v)
+{
+	int i;
+	if (MLENGTH(u) != MLENGTH(v))
+		return 0;
+	for (i = 0; i < MLENGTH(u); i++)
+		if (u[i] != v[i])
+			return 0;
+	return 1;
+}
+
+// convert unsigned to bignum
+
+uint32_t *
+mint(uint32_t n)
+{
+	uint32_t *p;
+	p = mnew(1);
+	p[0] = n;
+	return p;
+}
+
+uint32_t *
+mnew(int n)
+{
+	uint32_t *u;
+	u = (uint32_t *) malloc((n + 1) * sizeof (uint32_t));
+	if (u == NULL)
+		malloc_kaput();
+	bignum_count++;
+	*u = n;
+	return u + 1;
+}
+
+void
+mfree(uint32_t *u)
+{
+	free(u - 1);
+	bignum_count--;
+}
+
+uint32_t *
+mcopy(uint32_t *u)
+{
+	int i;
+	uint32_t *v;
+	v = mnew(MLENGTH(u));
+	for (i = 0; i < MLENGTH(u); i++)
+		v[i] = u[i];
+	return v;
+}
+
+// remove leading zeroes
+
+void
+mnorm(uint32_t *u)
+{
+	while (MLENGTH(u) > 1 && u[MLENGTH(u) - 1] == 0)
+		MLENGTH(u)--;
+}
+
+// Bignum GCD
+// Uses the binary GCD algorithm.
+// See "The Art of Computer Programming" p. 338.
+// mgcd always returns a positive value
+// mgcd(0, 0) = 0
+// mgcd(u, 0) = |u|
+// mgcd(0, v) = |v|
+
+uint32_t *
+mgcd(uint32_t *u, uint32_t *v)
+{
+	int i, k, n, sign;
+	uint32_t *t;
+	if (MZERO(u)) {
+		t = mcopy(v);
+		return t;
+	}
+	if (MZERO(v)) {
+		t = mcopy(u);
+		return t;
+	}
+	u = mcopy(u);
+	v = mcopy(v);
+	k = 0;
+	while ((u[0] & 1) == 0 && (v[0] & 1) == 0) {
+		mshiftright(u);
+		mshiftright(v);
+		k++;
+	}
+	if (u[0] & 1) {
+		t = mcopy(v);
+		sign = -1;
+	} else {
+		t = mcopy(u);
+		sign = 1;
+	}
+	while (1) {
+		while ((t[0] & 1) == 0)
+			mshiftright(t);
+		if (sign == 1) {
+			mfree(u);
+			u = mcopy(t);
+		} else {
+			mfree(v);
+			v = mcopy(t);
+		}
+		mfree(t);
+		if (mcmp(u, v) < 0) {
+			t = msub(v, u);
+			sign = -1;
+		} else {
+			t = msub(u, v);
+			sign = 1;
+		}
+		if (MZERO(t)) {
+			mfree(t);
+			mfree(v);
+			n = (k / 32) + 1;
+			v = mnew(n);
+			for (i = 0; i < n; i++)
+				v[i] = 0;
+			msetbit(v, k);
+			t = mmul(u, v);
+			mfree(u);
+			mfree(v);
+			return t;
+		}
+	}
+}
+
+// returns x^n mod m
+
+uint32_t *
+mmodpow(uint32_t *x, uint32_t *n, uint32_t *m)
+{
+	uint32_t *y, *z;
+	x = mcopy(x);
+	n = mcopy(n);
+	y = mint(1);
+	while (1) {
+		if (n[0] & 1) {
+			z = mmul(y, x);
+			mfree(y);
+			y = mmod(z, m);
+			mfree(z);
+		}
+		mshiftright(n);
+		if (MZERO(n))
+			break;
+		z = mmul(x, x);
+		mfree(x);
+		x = mmod(z, m);
+		mfree(z);
+	}
+	mfree(x);
+	mfree(n);
+	return y;
+}
+
+// returns NULL if not perfect root, otherwise returns a^(1/n)
+
+uint32_t *
+mroot(uint32_t *a, uint32_t *n)
+{
+	int i, j, k;
+	uint32_t *b, *c, m;
+	if (MLENGTH(n) > 1 || n[0] == 0)
+		return NULL;
+	// k is bit length of a
+	k = 32 * (MLENGTH(a) - 1);
+	m = a[MLENGTH(a) - 1];
+	while (m) {
+		m >>= 1;
+		k++;
+	}
+	if (k == 0)
+		return mint(0);
+	// initial guess of index of ms bit in result
+	k = (k - 1) / n[0];
+	j = k / 32 + 1; // k is bit index, not number of bits
+	b = mnew(j);
+	for (i = 0; i < j; i++)
+		b[i] = 0;
+	while (k >= 0) {
+		msetbit(b, k);
+		mnorm(b);
+		c = mpow(b, n);
+		switch (mcmp(c, a)) {
+		case -1:
+			break;
+		case 0:
+			mfree(c);
+			return b;
+		case 1:
+			mclrbit(b, k);
+			break;
+		}
+		mfree(c);
+		k--;
+	}
+	mfree(b);
+	return NULL;
+}
+
+// Bignum prime test (returns 1 if prime, 0 if not)
+// Uses Algorithm P (probabilistic primality test) from p. 395 of
+// "The Art of Computer Programming, Volume 2" by Donald E. Knuth.
+
+int
+mprime(uint32_t *n)
+{
+	int i, k;
+	uint32_t *q;
+	// 1?
+	if (MLENGTH(n) == 1 && n[0] == 1)
+		return 0;
+	// 2?
+	if (MLENGTH(n) == 1 && n[0] == 2)
+		return 1;
+	// even?
+	if ((n[0] & 1) == 0)
+		return 0;
+	// n = 1 + (2 ^ k) q
+	q = mcopy(n);
+	k = 0;
+	do {
+		mshiftright(q);
+		k++;
+	} while ((q[0] & 1) == 0);
+	// try 25 times
+	for (i = 0; i < 25; i++)
+		if (mprimef(n, q, k) == 0)
+			break;
+	mfree(q);
+	if (i < 25)
+		return 0;
+	else
+		return 1;
+}
+
+//	This is the actual implementation of Algorithm P.
 //
-//	Input:		tos-2		n
+//	Input:		n		The number in question.
 //
-//			tos-1		k
+//			q		n = 1 + (2 ^ k) q
 //
-//	Output:		Binomial coefficient on stack
+//			k
 //
-//	binomial(n, k) = n! / k! / (n - k)!
+//	Output:		1		when n is probably prime
 //
-//	The binomial coefficient vanishes for k < 0 or k > n. (A=B, p. 19)
+//			0		when n is definitely not prime
+
+int
+mprimef(uint32_t *n, uint32_t *q, int k)
+{
+	int i, j;
+	uint32_t *t, *x, *y;
+	// generate x
+	t = mcopy(n);
+	while (1) {
+		for (i = 0; i < MLENGTH(t); i++)
+			t[i] = rand();
+		x = mmod(t, n);
+		if (!MZERO(x) && !MEQUAL(x, 1))
+			break;
+		mfree(x);
+	}
+	mfree(t);
+	// exponentiate
+	y = mmodpow(x, q, n);
+	// done?
+	if (MEQUAL(y, 1)) {
+		mfree(x);
+		mfree(y);
+		return 1;
+	}
+	j = 0;
+	while (1) {
+		// y = n - 1?
+		t = msub(n, y);
+		if (MEQUAL(t, 1)) {
+			mfree(t);
+			mfree(x);
+			mfree(y);
+			return 1;
+		}
+		mfree(t);
+		if (++j == k) {
+			mfree(x);
+			mfree(y);
+			return 0;
+		}
+		// y = (y ^ 2) mod n
+		t = mmul(y, y);
+		mfree(y);
+		y = mmod(t, n);
+		mfree(t);
+		// y = 1?
+		if (MEQUAL(y, 1)) {
+			mfree(x);
+			mfree(y);
+			return 0;
+		}
+	}
+}
 
 void
 eval_binomial(void)
 {
-	push(cadr(p1));
+	push(cadr(p1)); // n
 	eval();
-	push(caddr(p1));
+	push(caddr(p1)); // k
 	eval();
 	binomial();
 }
+
+// Result vanishes for k < 0 or k > n. (A=B, p. 19)
 
 void
 binomial(void)
@@ -3266,7 +3573,7 @@ binomial_nib(void)
 	K = pop();
 	N = pop();
 	if (binomial_check_args() == 0) {
-		push(zero);
+		push_integer(0);
 		return;
 	}
 	push(N);
@@ -3284,9 +3591,9 @@ binomial_nib(void)
 int
 binomial_check_args(void)
 {
-	if (isnum(N) && lessp(N, zero))
+	if (isnegativenumber(N))
 		return 0;
-	else if (isnum(K) && lessp(K, zero))
+	else if (isnegativenumber(K))
 		return 0;
 	else if (isnum(N) && isnum(K) && lessp(N, K))
 		return 0;
@@ -3299,19 +3606,11 @@ eval_ceiling(void)
 {
 	push(cadr(p1));
 	eval();
-	ceiling();
+	ceiling_nib();
 }
 
 void
-ceiling(void)
-{
-	save();
-	yyceiling();
-	restore();
-}
-
-void
-yyceiling(void)
+ceiling_nib(void)
 {
 	double d;
 	p1 = pop();
@@ -3330,36 +3629,32 @@ yyceiling(void)
 		push(p1);
 		return;
 	}
-	p3 = alloc();
-	p3->k = NUM;
-	p3->u.q.a = mdiv(p1->u.q.a, p1->u.q.b);
-	p3->u.q.b = mint(1);
-	push(p3);
-	if (isnegativenumber(p1))
-		;
-	else {
+	push_rational_number(p1->sign, mdiv(p1->u.q.a, p1->u.q.b), mint(1));
+	if (p1->sign == MPLUS) {
 		push_integer(1);
 		add();
 	}
 }
 
-// For example, the number of five card hands is choose(52,5)
-//
-//                          n!
-//      choose(n,k) = -------------
-//                     k! (n - k)!
-
 void
 eval_choose(void)
 {
-	push(cadr(p1));
+	push(cadr(p1)); // n
 	eval();
-	push(caddr(p1));
+	push(caddr(p1)); // k
 	eval();
 	choose();
 }
 
 // Result vanishes for k < 0 or k > n. (A=B, p. 19)
+
+void
+choose(void)
+{
+	save();
+	choose_nib();
+	restore();
+}
 
 #undef N
 #undef K
@@ -3368,14 +3663,12 @@ eval_choose(void)
 #define K p2
 
 void
-choose(void)
+choose_nib(void)
 {
-	save();
 	K = pop();
 	N = pop();
 	if (choose_check_args() == 0) {
 		push_integer(0);
-		restore();
 		return;
 	}
 	push(N);
@@ -3388,15 +3681,14 @@ choose(void)
 	subtract();
 	factorial();
 	divide();
-	restore();
 }
 
 int
 choose_check_args(void)
 {
-	if (isnum(N) && lessp(N, zero))
+	if (isnegativenumber(N))
 		return 0;
-	else if (isnum(K) && lessp(K, zero))
+	else if (isnegativenumber(K))
 		return 0;
 	else if (isnum(N) && isnum(K) && lessp(N, K))
 		return 0;
@@ -3404,7 +3696,7 @@ choose_check_args(void)
 		return 1;
 }
 
-// Change circular functions to exponentials
+// change circular functions to exponentials
 
 void
 eval_circexp(void)
@@ -3412,171 +3704,202 @@ eval_circexp(void)
 	push(cadr(p1));
 	eval();
 	circexp();
-	// normalize
-	eval();
 }
 
 void
 circexp(void)
 {
-	int i, h;
+	circexp_subst();
+	eval();
+}
+
+void
+circexp_subst(void)
+{
 	save();
+	circexp_subst_nib();
+	restore();
+}
+
+void
+circexp_subst_nib(void)
+{
+	int i, h, n;
 	p1 = pop();
+	if (istensor(p1)) {
+		push(p1);
+		copy_tensor();
+		p1 = pop();
+		n = p1->u.tensor->nelem;
+		for (i = 0; i < n; i++) {
+			push(p1->u.tensor->elem[i]);
+			circexp_subst();
+			p1->u.tensor->elem[i] = pop();
+		}
+		push(p1);
+		return;
+	}
 	if (car(p1) == symbol(COS)) {
+		push_symbol(EXPCOS);
 		push(cadr(p1));
-		expcos();
-		restore();
+		circexp_subst();
+		list(2);
 		return;
 	}
 	if (car(p1) == symbol(SIN)) {
+		push_symbol(EXPSIN);
 		push(cadr(p1));
-		expsin();
-		restore();
+		circexp_subst();
+		list(2);
 		return;
 	}
 	if (car(p1) == symbol(TAN)) {
-		p1 = cadr(p1);
-		push(imaginaryunit);
-		push(p1);
-		multiply();
-		exponential();
-		p2 = pop();
-		push(imaginaryunit);
-		push(p1);
-		multiply();
-		negate();
-		exponential();
-		p3 = pop();
-		push(p3);
-		push(p2);
-		subtract();
-		push(imaginaryunit);
-		multiply();
-		push(p2);
-		push(p3);
-		add();
-		divide();
-		restore();
+		push_symbol(EXPTAN);
+		push(cadr(p1));
+		circexp_subst();
+		list(2);
 		return;
 	}
 	if (car(p1) == symbol(COSH)) {
-		p1 = cadr(p1);
-		push(p1);
-		exponential();
-		push(p1);
-		negate();
-		exponential();
-		add();
-		push_rational(1, 2);
-		multiply();
-		restore();
+		push_symbol(EXPCOSH);
+		push(cadr(p1));
+		circexp_subst();
+		list(2);
 		return;
 	}
 	if (car(p1) == symbol(SINH)) {
-		p1 = cadr(p1);
-		push(p1);
-		exponential();
-		push(p1);
-		negate();
-		exponential();
-		subtract();
-		push_rational(1, 2);
-		multiply();
-		restore();
+		push_symbol(EXPSINH);
+		push(cadr(p1));
+		circexp_subst();
+		list(2);
 		return;
 	}
 	if (car(p1) == symbol(TANH)) {
-		p1 = cadr(p1);
-		push(p1);
-		push_integer(2);
-		multiply();
-		exponential();
-		p1 = pop();
-		push(p1);
-		push_integer(1);
-		subtract();
-		push(p1);
-		push_integer(1);
-		add();
-		divide();
-		restore();
+		push_symbol(EXPTANH);
+		push(cadr(p1));
+		circexp_subst();
+		list(2);
 		return;
 	}
 	if (iscons(p1)) {
 		h = tos;
+		push(car(p1));
+		p1 = cdr(p1);
 		while (iscons(p1)) {
 			push(car(p1));
-			circexp();
+			circexp_subst();
 			p1 = cdr(p1);
 		}
 		list(tos - h);
-		restore();
-		return;
-	}
-	if (p1->k == TENSOR) {
-		push(p1);
-		copy_tensor();
-		p1 = pop();
-		for (i = 0; i < p1->u.tensor->nelem; i++) {
-			push(p1->u.tensor->elem[i]);
-			circexp();
-			p1->u.tensor->elem[i] = pop();
-		}
-		push(p1);
-		restore();
 		return;
 	}
 	push(p1);
+}
+
+// tan(z) = (i - i * exp(2*i*z)) / (exp(2*i*z) + 1)
+
+void
+eval_exptan(void)
+{
+	push(cadr(p1));
+	eval();
+	exptan();
+}
+
+void
+exptan(void)
+{
+	save();
+	push_integer(2);
+	push(imaginaryunit);
+	multiply_factors(3);
+	exponential();
+	p1 = pop();
+	push(imaginaryunit);
+	push(imaginaryunit);
+	push(p1);
+	multiply();
+	subtract();
+	push(p1);
+	push_integer(1);
+	add();
+	divide();
 	restore();
 }
 
-char *script =
-"e=exp(1)\n"
-"i=sqrt(-1)\n"
-"autoexpand=1\n"
-"bake=1\n"
-"trange=(-pi,pi)\n"
-"xrange=(-10,10)\n"
-"yrange=(-10,10)\n"
-"last=0\n"
-"trace=0\n"
-"tty=0\n"
-"cross(u,v)=(u[2]*v[3]-u[3]*v[2],u[3]*v[1]-u[1]*v[3],u[1]*v[2]-u[2]*v[1])\n"
-"curl(v)=(d(v[3],y)-d(v[2],z),d(v[1],z)-d(v[3],x),d(v[2],x)-d(v[1],y))\n"
-"div(v)=d(v[1],x)+d(v[2],y)+d(v[3],z)\n"
-"ln(x)=log(x)\n";
-
 void
-clear(void)
+eval_expcosh(void)
 {
-	int i;
-	// reset bindings
-	for (i = MARK2 + 1; i < NSYM; i++) {
-		binding[i] = symtab + i;
-		arglist[i] = symbol(NIL);
-	}
-	// free user-defined symbol names
-	for (i = MARK3 + 1; i < NSYM; i++) {
-		if (symtab[i].u.printname == NULL)
-			break;
-		free(symtab[i].u.printname);
-		symtab[i].u.printname = NULL;
-	}
-	run(script);
-	gc();
-	clear_display();
+	push(cadr(p1));
+	eval();
+	expcosh();
 }
 
-/* Convert complex z to clock form
+void
+expcosh(void)
+{
+	save();
+	p1 = pop();
+	push(p1);
+	exponential();
+	push(p1);
+	negate();
+	exponential();
+	add();
+	push_rational(1, 2);
+	multiply();
+	restore();
+}
 
-	Input:		push	z
+void
+eval_expsinh(void)
+{
+	push(cadr(p1));
+	eval();
+	expsinh();
+}
 
-	Output:		Result on stack
+void
+expsinh(void)
+{
+	save();
+	p1 = pop();
+	push(p1);
+	exponential();
+	push(p1);
+	negate();
+	exponential();
+	subtract();
+	push_rational(1, 2);
+	multiply();
+	restore();
+}
 
-	clock(z) = mag(z) * (-1) ^ (arg(z) / pi)
+void
+eval_exptanh(void)
+{
+	push(cadr(p1));
+	eval();
+	exptanh();
+}
 
-	For example, clock(exp(i pi/3)) gives the result (-1)^(1/3)
-*/
+void
+exptanh(void)
+{
+	save();
+	push_integer(2);
+	multiply();
+	exponential();
+	p1 = pop();
+	push(p1);
+	push_integer(1);
+	subtract();
+	push(p1);
+	push_integer(1);
+	add();
+	divide();
+	restore();
+}
 
 void
 eval_clock(void)
@@ -3590,7 +3913,6 @@ void
 clockform(void)
 {
 	save();
-#if 1
 	p1 = pop();
 	push(p1);
 	mag();
@@ -3601,18 +3923,6 @@ clockform(void)
 	divide();
 	power();
 	multiply();
-#else
-	p1 = pop();
-	push(p1);
-	mag();
-	push_symbol(E);
-	push(p1);
-	arg();
-	push(imaginaryunit);
-	multiply();
-	power();
-	multiply();
-#endif
 	restore();
 }
 
@@ -3651,8 +3961,6 @@ eval_coeff(void)
 	filter();
 }
 
-//-----------------------------------------------------------------------------
-//
 //	Put polynomial coefficients on the stack
 //
 //	Input:		tos-2		p(x)
@@ -3664,8 +3972,6 @@ eval_coeff(void)
 //			tos-n		Coefficient of x^0
 //
 //			tos-1		Coefficient of x^(n-1)
-//
-//-----------------------------------------------------------------------------
 
 int
 coeff(void)
@@ -3678,7 +3984,7 @@ coeff(void)
 	for (;;) {
 		push(p1);
 		push(p2);
-		push(zero);
+		push_integer(0);
 		subst();
 		eval();
 		p3 = pop();
@@ -3687,7 +3993,7 @@ coeff(void)
 		push(p3);
 		subtract();
 		p1 = pop();
-		if (equal(p1, zero)) {
+		if (iszero(p1)) {
 			n = tos - h;
 			restore();
 			return n;
@@ -3699,128 +4005,413 @@ coeff(void)
 	}
 }
 
-// Cofactor of a matrix component.
-
 void
 eval_cofactor(void)
 {
-	int i, j, n;
+	int col, i, j, k, n, row;
 	push(cadr(p1));
 	eval();
 	p2 = pop();
-	if (istensor(p2) && p2->u.tensor->ndim == 2 && p2->u.tensor->dim[0] == p2->u.tensor->dim[1])
-		;
-	else
-		stop("cofactor: 1st arg: square matrix expected");
+	if (!istensor(p2) || p2->u.tensor->ndim != 2 || p2->u.tensor->dim[0] != p2->u.tensor->dim[1])
+		stop("cofactor: square matrix expected");
 	n = p2->u.tensor->dim[0];
 	push(caddr(p1));
 	eval();
-	i = pop_integer();
-	if (i < 1 || i > n)
-		stop("cofactor: 2nd arg: row index expected");
+	row = pop_integer();
 	push(cadddr(p1));
 	eval();
-	j = pop_integer();
-	if (j < 1 || j > n)
-		stop("cofactor: 3rd arg: column index expected");
-	cofactor(p2, n, i - 1, j - 1);
-}
-
-void
-cofactor(U *p, int n, int row, int col)
-{
-	int i, j;
+	col = pop_integer();
+	if (row < 1 || row > n || col < 1 || col > n)
+		stop("cofactor: index range error");
+	row--; // make zero based
+	col--;
+	if (n == 2) {
+		switch (2 * row + col) {
+		case 0:
+			push(p2->u.tensor->elem[3]);
+			break;
+		case 1:
+			push(p2->u.tensor->elem[2]);
+			negate();
+			break;
+		case 2:
+			push(p2->u.tensor->elem[1]);
+			negate();
+			break;
+		case 3:
+			push(p2->u.tensor->elem[0]);
+			break;
+		}
+		return;
+	}
+	p3 = alloc_matrix(n - 1, n - 1);
+	k = 0;
 	for (i = 0; i < n; i++)
 		for (j = 0; j < n; j++)
 			if (i != row && j != col)
-				push(p->u.tensor->elem[n * i + j]);
-	determinant(n - 1);
+				p3->u.tensor->elem[k++] = p2->u.tensor->elem[n * i + j];
+	push(p3);
+	det();
 	if ((row + col) % 2)
 		negate();
 }
-
-// Condense an expression by factoring common terms.
-
-void
-eval_condense(void)
-{
-	push(cadr(p1));
-	eval();
-	Condense();
-}
-
-void
-Condense(void)
-{
-	int tmp;
-	tmp = expanding;
-	save();
-	yycondense();
-	restore();
-	expanding = tmp;
-}
-
-void
-yycondense(void)
-{
-	expanding = 0;
-	p1 = pop();
-	if (car(p1) != symbol(ADD)) {
-		push(p1);
-		return;
-	}
-	// get gcd of all terms
-	p3 = cdr(p1);
-	push(car(p3));
-	p3 = cdr(p3);
-	while (iscons(p3)) {
-		push(car(p3));
-		gcd();
-		p3 = cdr(p3);
-	}
-//printf("condense: this is the gcd of all the terms:\n");
-//print(stdout, stack[tos - 1]);
-	// divide each term by gcd
-	inverse();
-	p2 = pop();
-	push(zero);
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		push(p2);
-		push(car(p3));
-		multiply();
-		add();
-		p3 = cdr(p3);
-	}
-	// We multiplied above w/o expanding so sum factors cancelled.
-	// Now we expand which which normalizes the result and, in some cases,
-	// simplifies it too (see test case H).
-	yyexpand();
-	// multiply result by gcd
-	push(p2);
-	divide();
-}
-
-// Complex conjugate
 
 void
 eval_conj(void)
 {
 	push(cadr(p1));
 	eval();
-	p1 = pop();
-	push(p1);
 	conjugate();
 }
 
 void
 conjugate(void)
 {
-	push(imaginaryunit);
-	push(imaginaryunit);
-	negate();
-	subst();
+	conjugate_subst();
 	eval();
+}
+
+void
+conjugate_subst(void)
+{
+	save();
+	conjugate_subst_nib();
+	restore();
+}
+
+void
+conjugate_subst_nib(void)
+{
+	int h, i, n;
+	p1 = pop();
+	if (istensor(p1)) {
+		push(p1);
+		copy_tensor();
+		p1 = pop();
+		n = p1->u.tensor->nelem;
+		for (i = 0; i < n; i++) {
+			push(p1->u.tensor->elem[i]);
+			conjugate_subst();
+			p1->u.tensor->elem[i] = pop();
+		}
+		push(p1);
+		return;
+	}
+	// (-1) ^ expr
+	if (car(p1) == symbol(POWER) && isminusone(cadr(p1))) {
+		push_symbol(POWER);
+		push_integer(-1);
+		push(caddr(p1));
+		negate();
+		list(3);
+		return;
+	}
+	if (iscons(p1)) {
+		h = tos;
+		push(car(p1));
+		p1 = cdr(p1);
+		while (iscons(p1)) {
+			push(car(p1));
+			conjugate_subst();
+			p1 = cdr(p1);
+		}
+		list(tos - h);
+		return;
+	}
+	push(p1);
+}
+
+void
+eval_contract(void)
+{
+	push(cadr(p1));
+	eval();
+	p1 = cddr(p1);
+	if (!iscons(p1)) {
+		push_integer(1);
+		push_integer(2);
+		contract();
+		return;
+	}
+	while (iscons(p1)) {
+		push(car(p1));
+		eval();
+		push(cadr(p1));
+		eval();
+		contract();
+		p1 = cddr(p1);
+	}
+}
+
+void
+contract(void)
+{
+	save();
+	contract_nib();
+	restore();
+}
+
+void
+contract_nib(void)
+{
+	int h, i, j, k, m, n, ncol, ndim, nelem, nrow;
+	int index[MAXDIM];
+	struct atom **a, **b;
+	p3 = pop();
+	p2 = pop();
+	p1 = pop();
+	if (!istensor(p1)) {
+		push(p1);
+		return;
+	}
+	ndim = p1->u.tensor->ndim;
+	push(p2);
+	n = pop_integer();
+	push(p3);
+	m = pop_integer();
+	if (n < 1 || n > ndim || m < 1 || m > ndim || n == m)
+		stop("contract: index error");
+	n--; // make zero based
+	m--;
+	ncol = p1->u.tensor->dim[n];
+	nrow = p1->u.tensor->dim[m];
+	if (ncol != nrow)
+		stop("contract: unequal tensor dimensions");
+	// nelem is the number of elements in result
+	nelem = p1->u.tensor->nelem / ncol / nrow;
+	p2 = alloc_tensor(nelem);
+	a = p1->u.tensor->elem;
+	b = p2->u.tensor->elem;
+	for (i = 0; i < ndim; i++)
+		index[i] = 0;
+	for (i = 0; i < nelem; i++) {
+		for (j = 0; j < ncol; j++) {
+			index[n] = j;
+			index[m] = j;
+			k = index[0];
+			for (h = 1; h < ndim; h++)
+				k = k * p1->u.tensor->dim[h] + index[h];
+			push(a[k]);
+		}
+		add_terms(ncol);
+		b[i] = pop();
+		// increment index
+		for (j = ndim - 1; j >= 0; j--) {
+			if (j == n || j == m)
+				continue;
+			if (++index[j] < p1->u.tensor->dim[j])
+				break;
+			index[j] = 0;
+		}
+	}
+	if (nelem == 1) {
+		push(b[0]);
+		return;
+	}
+	// add dim info
+	p2->u.tensor->ndim = ndim - 2;
+	k = 0;
+	for (i = 0; i < ndim; i++)
+		if (i != n && i != m)
+			p2->u.tensor->dim[k++] = p1->u.tensor->dim[i];
+	push(p2);
+}
+
+struct atom *
+alloc(void)
+{
+	struct atom *p;
+	if (block_count == 0)
+		alloc_block();
+	if (free_count == 0) {
+		gc();
+		if (free_count < BLOCKSIZE)
+			alloc_block();
+		if (free_count == 0)
+			stop("out of memory");
+	}
+	p = free_list;
+	free_list = free_list->u.cons.cdr;
+	free_count--;
+	return p;
+}
+
+struct atom *
+alloc_matrix(int nrow, int ncol)
+{
+	struct atom *p = alloc_tensor(nrow * ncol);
+	p->u.tensor->ndim = 2;
+	p->u.tensor->dim[0] = nrow;
+	p->u.tensor->dim[1] = ncol;
+	return p;
+}
+
+struct atom *
+alloc_tensor(int nelem)
+{
+	int i;
+	struct atom *p; // ok, no gc before return
+	p = alloc();
+	p->k = TENSOR;
+	p->u.tensor = (struct tensor *) malloc(sizeof (struct tensor) + nelem * sizeof (struct atom *));
+	if (p->u.tensor == NULL)
+		malloc_kaput();
+	p->u.tensor->nelem = nelem;
+	for (i = 0; i < nelem; i++)
+		p->u.tensor->elem[i] = zero;
+	tensor_count++;
+	return p;
+}
+
+// garbage collector
+
+void
+gc(void)
+{
+	int i, j, k;
+	struct atom *p;
+	gc_count++;
+	// tag everything
+	for (i = 0; i < block_count; i++) {
+		p = mem[i];
+		for (j = 0; j < BLOCKSIZE; j++)
+			p[j].tag = 1;
+	}
+	// untag what's used
+	untag(p0);
+	untag(p1);
+	untag(p2);
+	untag(p3);
+	untag(p4);
+	untag(p5);
+	untag(p6);
+	untag(p7);
+	untag(p8);
+	untag(p9);
+	untag(zero);
+	untag(one);
+	untag(minusone);
+	untag(imaginaryunit);
+	// symbol table
+	for (i = 0; i < 27; i++) {
+		for (j = 0; j < NSYM; j++) {
+			k = NSYM * i + j;
+			if (symtab[k] == NULL)
+				break;
+			untag(symtab[k]);
+			untag(binding[k]);
+			untag(arglist[k]);
+		}
+	}
+	for (i = 0; i < tos; i++)
+		untag(stack[i]);
+	for (i = 0; i < tof; i++)
+		untag(frame[i]);
+	// collect everything that's still tagged
+	free_count = 0;
+	for (i = 0; i < block_count; i++) {
+		p = mem[i];
+		for (j = 0; j < BLOCKSIZE; j++) {
+			if (p[j].tag == 0)
+				continue;
+			// still tagged so it's unused, put on free list
+			switch (p[j].k) {
+			case KSYM:
+				free(p[j].u.ksym.name);
+				ksym_count--;
+				break;
+			case USYM:
+				free(p[j].u.usym.name);
+				usym_count--;
+				break;
+			case RATIONAL:
+				mfree(p[j].u.q.a);
+				mfree(p[j].u.q.b);
+				break;
+			case STR:
+				free(p[j].u.str);
+				string_count--;
+				break;
+			case TENSOR:
+				free(p[j].u.tensor);
+				tensor_count--;
+				break;
+			}
+			p[j].k = CONS; // so no double free occurs above
+			p[j].u.cons.cdr = free_list;
+			free_list = p + j;
+			free_count++;
+		}
+	}
+}
+
+void
+untag(struct atom *p)
+{
+	int i;
+	if (p == NULL)
+		return; // in case gc is called before everything is initialized
+	while (iscons(p)) {
+		if (p->tag == 0)
+			return;
+		p->tag = 0;
+		untag(p->u.cons.car);
+		p = p->u.cons.cdr;
+	}
+	if (p->tag == 0)
+		return;
+	p->tag = 0;
+	if (istensor(p))
+		for (i = 0; i < p->u.tensor->nelem; i++)
+			untag(p->u.tensor->elem[i]);
+}
+
+void
+alloc_block(void)
+{
+	int i;
+	struct atom *p;
+	if (block_count == MAXBLOCKS)
+		return;
+	p = (struct atom *) malloc(BLOCKSIZE * sizeof (struct atom));
+	if (p == NULL)
+		return;
+	mem[block_count++] = p;
+	for (i = 0; i < BLOCKSIZE; i++) {
+		p[i].k = CONS; // so no free in gc
+		p[i].u.cons.cdr = p + i + 1;
+	}
+	p[BLOCKSIZE - 1].u.cons.cdr = free_list;
+	free_list = p;
+	free_count += BLOCKSIZE;
+}
+
+// Append one list to another.
+
+void
+append(void)
+{
+	int h;
+	save();
+	p2 = pop();
+	p1 = pop();
+	h = tos;
+	if (iscons(p1))
+		while (iscons(p1)) {
+			push(car(p1));
+			p1 = cdr(p1);
+		}
+	else
+		push(p1);
+	if (iscons(p2))
+		while (iscons(p2)) {
+			push(car(p2));
+			p2 = cdr(p2);
+		}
+	else
+		push(p2);
+	list(tos - h);
+	restore();
 }
 
 // Cons two things on the stack.
@@ -3828,8 +4419,7 @@ conjugate(void)
 void
 cons(void)
 {
-	// auto var ok, no opportunity for garbage collection after p = alloc()
-	U *p;
+	struct atom *p; // ok, no gc before push
 	p = alloc();
 	p->k = CONS;
 	p->u.cons.cdr = pop();
@@ -3837,100 +4427,260 @@ cons(void)
 	push(p);
 }
 
-// Contract across tensor indices
+// returns 1 if expr p contains expr q, otherweise returns 0
 
-void
-eval_contract(void)
+int
+find(struct atom *p, struct atom *q)
 {
-	push(cadr(p1));
-	eval();
-	if (cddr(p1) == symbol(NIL)) {
-		push_integer(1);
-		push_integer(2);
-	} else {
-		push(caddr(p1));
-		eval();
-		push(cadddr(p1));
-		eval();
+	int i;
+	if (equal(p, q))
+		return 1;
+	if (istensor(p)) {
+		for (i = 0; i < p->u.tensor->nelem; i++)
+			if (find(p->u.tensor->elem[i], q))
+				return 1;
+		return 0;
 	}
-	contract();
+	while (iscons(p)) {
+		if (find(car(p), q))
+			return 1;
+		p = cdr(p);
+	}
+	return 0;
 }
 
+// Create a list from n things on the stack.
+
 void
-contract(void)
+list(int n)
 {
+	int i;
+	push_symbol(NIL);
+	for (i = 0; i < n; i++)
+		cons();
+}
+
+// Substitute new expr for old expr in expr.
+//
+// Input:	push	expr
+//
+//		push	old expr
+//
+//		push	new expr
+//
+// Output:	Result on stack
+
+void
+subst(void)
+{
+	int i;
 	save();
-	yycontract();
+	p3 = pop(); // new expr
+	p2 = pop(); // old expr
+	if (p2 == symbol(NIL) || p3 == symbol(NIL)) {
+		restore();
+		return;
+	}
+	p1 = pop(); // expr
+	if (istensor(p1)) {
+		p4 = alloc_tensor(p1->u.tensor->nelem);
+		p4->u.tensor->ndim = p1->u.tensor->ndim;
+		for (i = 0; i < p1->u.tensor->ndim; i++)
+			p4->u.tensor->dim[i] = p1->u.tensor->dim[i];
+		for (i = 0; i < p1->u.tensor->nelem; i++) {
+			push(p1->u.tensor->elem[i]);
+			push(p2);
+			push(p3);
+			subst();
+			p4->u.tensor->elem[i] = pop();
+		}
+		push(p4);
+	} else if (equal(p1, p2))
+		push(p3);
+	else if (iscons(p1)) {
+		push(car(p1));
+		push(p2);
+		push(p3);
+		subst();
+		push(cdr(p1));
+		push(p2);
+		push(p3);
+		subst();
+		cons();
+	} else
+		push(p1);
 	restore();
 }
 
-void
-yycontract(void)
+int
+length(struct atom *p)
 {
-	int h, i, j, k, l, m, n, ndim, nelem;
-	int ai[MAXDIM], an[MAXDIM];
-	U **a, **b;
-	p3 = pop();
-	p2 = pop();
-	p1 = pop();
-	if (!istensor(p1)) {
-		if (!iszero(p1))
-			stop("contract: tensor expected, 1st arg is not a tensor");
-		push(zero);
-		return;
+	int n = 0;
+	while (iscons(p)) {
+		n++;
+		p = cdr(p);
 	}
-	push(p2);
-	l = pop_integer();
-	push(p3);
-	m = pop_integer();
-	ndim = p1->u.tensor->ndim;
-	if (l < 1 || l > ndim || m < 1 || m > ndim || l == m
-	|| p1->u.tensor->dim[l - 1] != p1->u.tensor->dim[m - 1])
-		stop("contract: index out of range");
-	l--;
-	m--;
-	n = p1->u.tensor->dim[l];
-	// nelem is the number of elements in "b"
-	nelem = 1;
-	for (i = 0; i < ndim; i++)
-		if (i != l && i != m)
-			nelem *= p1->u.tensor->dim[i];
-	p2 = alloc_tensor(nelem);
-	p2->u.tensor->ndim = ndim - 2;
-	j = 0;
-	for (i = 0; i < ndim; i++)
-		if (i != l && i != m)
-			p2->u.tensor->dim[j++] = p1->u.tensor->dim[i];
-	a = p1->u.tensor->elem;
-	b = p2->u.tensor->elem;
-	for (i = 0; i < ndim; i++) {
-		ai[i] = 0;
-		an[i] = p1->u.tensor->dim[i];
+	return n;
+}
+
+int
+complexity(struct atom *p)
+{
+	int n = 1;
+	while (iscons(p)) {
+		n += complexity(car(p));
+		p = cdr(p);
 	}
-	for (i = 0; i < nelem; i++) {
-		push(zero);
-		for (j = 0; j < n; j++) {
-			ai[l] = j;
-			ai[m] = j;
-			h = 0;
-			for (k = 0; k < ndim; k++)
-				h = (h * an[k]) + ai[k];
-			push(a[h]);
-			add();
-		}
-		b[i] = pop();
-		for (j = ndim - 1; j >= 0; j--) {
-			if (j == l || j == m)
-				continue;
-			if (++ai[j] < an[j])
-				break;
-			ai[j] = 0;
-		}
+	return n;
+}
+
+int
+equal(struct atom *p1, struct atom *p2)
+{
+	double d;
+	if (p1 == p2)
+		return 1;
+	if (isrational(p1) && isdouble(p2)) {
+		push(p1);
+		d = pop_double();
+		if (d == p2->u.d)
+			return 1;
+		else
+			return 0;
 	}
-	if (nelem == 1)
-		push(b[0]);
-	else
+	if (isdouble(p1) && isrational(p2)) {
 		push(p2);
+		d = pop_double();
+		if (p1->u.d == d)
+			return 1;
+		else
+			return 0;
+	}
+	if (p1->k != p2->k)
+		return 0;
+	switch (p1->k) {
+	case CONS:
+		while (iscons(p1) && iscons(p2)) {
+			if (!equal(car(p1), car(p2)))
+				return 0;
+			p1 = cdr(p1);
+			p2 = cdr(p2);
+		}
+		if (p1 == symbol(NIL) && p2 == symbol(NIL))
+			return 1;
+		else
+			return 0;
+	case KSYM:
+		if (strcmp(p1->u.ksym.name, p2->u.ksym.name) == 0)
+			return 1;
+		else
+			return 0;
+	case USYM:
+		if (strcmp(p1->u.usym.name, p2->u.usym.name) == 0)
+			return 1;
+		else
+			return 0;
+	case RATIONAL:
+		if (p1->sign != p2->sign)
+			return 0;
+		if (!meq(p1->u.q.a, p2->u.q.a))
+			return 0;
+		if (!meq(p1->u.q.b, p2->u.q.b))
+			return 0;
+		return 1;
+	case DOUBLE:
+		if (p1->u.d == p2->u.d)
+			return 1;
+		else
+			return 0;
+	case STR:
+		if (strcmp(p1->u.str, p2->u.str) == 0)
+			return 1;
+		else
+			return 0;
+	case TENSOR:
+		return 0; // no need to sort tensors
+	}
+	return 0; // stop compiler warning
+}
+
+int
+lessp(struct atom *p1, struct atom *p2)
+{
+	if (cmp_expr(p1, p2) < 0)
+		return 1;
+	else
+		return 0;
+}
+
+void
+sort(int n)
+{
+	qsort(stack + tos - n, n, sizeof (struct atom *), sort_func);
+}
+
+int
+sort_func(const void *q1, const void *q2)
+{
+	return cmp_expr(*((struct atom **) q1), *((struct atom **) q2));
+}
+
+int
+cmp_expr(struct atom *p1, struct atom *p2)
+{
+	int n;
+	if (p1 == p2)
+		return 0;
+	if (p1 == symbol(NIL))
+		return -1;
+	if (p2 == symbol(NIL))
+		return 1;
+	if (isnum(p1) && isnum(p2))
+		return compare_numbers(p1, p2);
+	if (isnum(p1))
+		return -1;
+	if (isnum(p2))
+		return 1;
+	if (isstr(p1) && isstr(p2))
+		return sign(strcmp(p1->u.str, p2->u.str));
+	if (isstr(p1))
+		return -1;
+	if (isstr(p2))
+		return 1;
+	if (issymbol(p1) && issymbol(p2))
+		return sign(strcmp(printname(p1), printname(p2)));
+	if (issymbol(p1))
+		return -1;
+	if (issymbol(p2))
+		return 1;
+	if (istensor(p1) && istensor(p2))
+		return compare_tensors(p1, p2);
+	if (istensor(p1))
+		return -1;
+	if (istensor(p2))
+		return 1;
+	while (iscons(p1) && iscons(p2)) {
+		n = cmp_expr(car(p1), car(p2));
+		if (n != 0)
+			return n;
+		p1 = cdr(p1);
+		p2 = cdr(p2);
+	}
+	if (iscons(p2))
+		return -1;
+	if (iscons(p1))
+		return 1;
+	return 0;
+}
+
+int
+sign(int n)
+{
+	if (n < 0)
+		return -1;
+	if (n > 0)
+		return 1;
+	return 0;
 }
 
 void
@@ -3938,101 +4688,85 @@ eval_cos(void)
 {
 	push(cadr(p1));
 	eval();
-	cosine();
+	scos();
 }
 
 void
-cosine(void)
+scos(void)
 {
 	save();
-	p1 = pop();
-	if (car(p1) == symbol(ADD))
-		cosine_of_angle_sum();
-	else
-		cosine_of_angle();
+	scos_nib();
 	restore();
 }
 
-// Use angle sum formula for special angles.
+#undef X
+#undef Y
 
-#undef A
-#undef B
-
-#define A p3
-#define B p4
+#define X p5
+#define Y p6
 
 void
-cosine_of_angle_sum(void)
-{
-	p2 = cdr(p1);
-	while (iscons(p2)) {
-		B = car(p2);
-		if (isnpi(B)) {
-			push(p1);
-			push(B);
-			subtract();
-			A = pop();
-			push(A);
-			cosine();
-			push(B);
-			cosine();
-			multiply();
-			push(A);
-			sine();
-			push(B);
-			sine();
-			multiply();
-			subtract();
-			return;
-		}
-		p2 = cdr(p2);
-	}
-	cosine_of_angle();
-}
-
-void
-cosine_of_angle(void)
+scos_nib(void)
 {
 	int n;
-	double d;
-	if (car(p1) == symbol(ARCCOS)) {
-		push(cadr(p1));
-		return;
-	}
+	p1 = pop();
 	if (isdouble(p1)) {
-		d = cos(p1->u.d);
-		if (fabs(d) < 1e-10)
-			d = 0.0;
-		push_double(d);
+		push_double(cos(p1->u.d));
 		return;
 	}
-	// cosine function is symmetric, cos(-x) = cos(x)
+	// cos(z) = 1/2 (exp(i z) + exp(-i z))
+	if (isdoublez(p1)) {
+		push_double(0.5);
+		push(imaginaryunit);
+		push(p1);
+		multiply();
+		exponential();
+		push(imaginaryunit);
+		negate();
+		push(p1);
+		multiply();
+		exponential();
+		add();
+		multiply();
+		return;
+	}
+	// cos(-x) = cos(x)
 	if (isnegative(p1)) {
 		push(p1);
 		negate();
-		p1 = pop();
+		scos();
+		return;
 	}
-	// cos(arctan(x)) = 1 / sqrt(1 + x^2)
-	// see p. 173 of the CRC Handbook of Mathematical Sciences
+	if (car(p1) == symbol(ADD)) {
+		scos_of_sum();
+		return;
+	}
+	// cos(arctan(y,x)) = x (x^2 + y^2)^(-1/2)
 	if (car(p1) == symbol(ARCTAN)) {
-		push_integer(1);
-		push(cadr(p1));
-		push_integer(2);
-		power();
+		X = caddr(p1);
+		Y = cadr(p1);
+		push(X);
+		push(X);
+		push(X);
+		multiply();
+		push(Y);
+		push(Y);
+		multiply();
 		add();
 		push_rational(-1, 2);
 		power();
+		multiply();
 		return;
 	}
 	// multiply by 180/pi
-	push(p1);
+	push(p1); // nonnegative by code above
 	push_integer(180);
 	multiply();
 	push_symbol(PI);
 	divide();
 	n = pop_integer();
-	if (n < 0) {
-		push(symbol(COS));
+	if (n == ERR) {
+		push_symbol(COS);
 		push(p1);
 		list(2);
 		return;
@@ -4089,233 +4823,103 @@ cosine_of_angle(void)
 		push_integer(-1);
 		break;
 	default:
-		push(symbol(COS));
+		push_symbol(COS);
 		push(p1);
 		list(2);
 		break;
 	}
 }
 
-//	          exp(x) + exp(-x)
-//	cosh(x) = ----------------
-//	                 2
+// cos(x + n/2 pi) = cos(x) cos(n/2 pi) - sin(x) sin(n/2 pi)
+
+void
+scos_of_sum(void)
+{
+	int n;
+	p2 = cdr(p1);
+	while (iscons(p2)) {
+		push_integer(2);
+		push(car(p2));
+		multiply();
+		push_symbol(PI);
+		divide();
+		n = pop_integer();
+		if (n != ERR) {
+			push(p1);
+			push(car(p2));
+			subtract();
+			p3 = pop();
+			push(p3);
+			scos();
+			push(car(p2));
+			scos();
+			multiply();
+			push(p3);
+			ssin();
+			push(car(p2));
+			ssin();
+			multiply();
+			subtract();
+			return;
+		}
+		p2 = cdr(p2);
+	}
+	push_symbol(COS);
+	push(p1);
+	list(2);
+}
 
 void
 eval_cosh(void)
 {
 	push(cadr(p1));
 	eval();
-	ycosh();
+	scosh();
 }
 
 void
-ycosh(void)
+scosh(void)
 {
 	save();
-	yycosh();
+	scosh_nib();
 	restore();
 }
 
 void
-yycosh(void)
+scosh_nib(void)
 {
-	double d;
 	p1 = pop();
-	if (car(p1) == symbol(ARCCOSH)) {
-		push(cadr(p1));
-		return;
-	}
-	if (isdouble(p1)) {
-		d = cosh(p1->u.d);
-		if (fabs(d) < 1e-10)
-			d = 0.0;
-		push_double(d);
+	// cosh(z) = 1/2 (exp(z) + exp(-z))
+	if (isdouble(p1) || isdoublez(p1)) {
+		push_rational(1, 2);
+		push(p1);
+		exponential();
+		push(p1);
+		negate();
+		exponential();
+		add();
+		multiply();
 		return;
 	}
 	if (iszero(p1)) {
-		push(one);
+		push_integer(1);
+		return;
+	}
+	// cosh(-x) = cosh(x)
+	if (isnegative(p1)) {
+		push(p1);
+		negate();
+		scosh();
+		return;
+	}
+	if (car(p1) == symbol(ARCCOSH)) {
+		push(cadr(p1));
 		return;
 	}
 	push_symbol(COSH);
 	push(p1);
 	list(2);
 }
-
-void
-eval_decomp(void)
-{
-	int h = tos;
-	push(symbol(NIL));
-	push(cadr(p1));
-	eval();
-	push(caddr(p1));
-	eval();
-	p1 = pop();
-	if (p1 == symbol(NIL))
-		guess();
-	else
-		push(p1);
-	decomp_nib();
-	list(tos - h);
-}
-
-// returns constant expresions on the stack
-
-void
-decomp_nib(void)
-{
-	save();
-	p2 = pop();
-	p1 = pop();
-	// is the entire expression constant?
-	if (find(p1, p2) == 0) {
-		push(p1);
-		//push(p1);	// may need later for pushing both +a, -a
-		//negate();
-		restore();
-		return;
-	}
-	// sum?
-	if (isadd(p1)) {
-		decomp_sum();
-		restore();
-		return;
-	}
-	// product?
-	if (car(p1) == symbol(MULTIPLY)) {
-		decomp_product();
-		restore();
-		return;
-	}
-	// naive decomp if not sum or product
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		push(car(p3));
-		push(p2);
-		decomp_nib();
-		p3 = cdr(p3);
-	}
-	restore();
-}
-
-void
-decomp_sum(void)
-{
-	int h;
-	// decomp terms involving x
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		if (find(car(p3), p2)) {
-			push(car(p3));
-			push(p2);
-			decomp_nib();
-		}
-		p3 = cdr(p3);
-	}
-	// add together all constant terms
-	h = tos;
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		if (find(car(p3), p2) == 0)
-			push(car(p3));
-		p3 = cdr(p3);
-	}
-	if (tos - h) {
-		add_all(tos - h);
-		p3 = pop();
-		push(p3);
-		push(p3);
-		negate();	// need both +a, -a for some integrals
-	}
-}
-
-void
-decomp_product(void)
-{
-	int h;
-	// decomp factors involving x
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		if (find(car(p3), p2)) {
-			push(car(p3));
-			push(p2);
-			decomp_nib();
-		}
-		p3 = cdr(p3);
-	}
-	// multiply together all constant factors
-	h = tos;
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		if (find(car(p3), p2) == 0)
-			push(car(p3));
-		p3 = cdr(p3);
-	}
-	if (tos - h) {
-		multiply_all(tos - h);
-		//p3 = pop();	// may need later for pushing both +a, -a
-		//push(p3);
-		//push(p3);
-		//negate();
-	}
-}
-
-// Store a function definition
-//
-// Example:
-//
-//      f(x,y)=x^y
-//
-// For this definition, p1 points to the following structure.
-//
-//     p1
-//      |
-//   ___v__    ______                        ______
-//  |CONS  |->|CONS  |--------------------->|CONS  |
-//  |______|  |______|                      |______|
-//      |         |                             |
-//   ___v__    ___v__    ______    ______    ___v__    ______    ______
-//  |SETQ  |  |CONS  |->|CONS  |->|CONS  |  |CONS  |->|CONS  |->|CONS  |
-//  |______|  |______|  |______|  |______|  |______|  |______|  |______|
-//                |         |         |         |         |         |
-//             ___v__    ___v__    ___v__    ___v__    ___v__    ___v__
-//            |SYM f |  |SYM x |  |SYM y |  |POWER |  |SYM x |  |SYM y |
-//            |______|  |______|  |______|  |______|  |______|  |______|
-//
-// We have
-//
-//	caadr(p1) points to f
-//	cdadr(p1) points to the list (x y)
-//	caddr(p1) points to (power x y)
-
-#undef F
-#undef A
-#undef B
-
-#define F p3 // F points to the function name
-#define A p4 // A points to the argument list
-#define B p5 // B points to the function body
-
-void
-define_user_function(void)
-{
-	F = caadr(p1);
-	A = cdadr(p1);
-	B = caddr(p1);
-	if (!issymbol(F))
-		stop("function name?");
-	// evaluate function body (maybe)
-	if (car(B) == symbol(EVAL)) {
-		push(cadr(B));
-		eval();
-		B = pop();
-	}
-	set_binding_and_arglist(F, B, A);
-	// return value is nil
-	push(symbol(NIL));
-}
-
-// definite integral
 
 #undef F
 #undef X
@@ -4330,11 +4934,14 @@ define_user_function(void)
 void
 eval_defint(void)
 {
+	expanding++; // in case integral is in denominator
 	push(cadr(p1));
 	eval();
 	F = pop();
 	p1 = cddr(p1);
-	while (iscons(p1)) {
+	do {
+		if (length(p1) < 3)
+			stop("defint: missing argument");
 		push(car(p1));
 		p1 = cdr(p1);
 		eval();
@@ -4363,8 +4970,9 @@ eval_defint(void)
 		eval();
 		subtract();
 		F = pop();
-	}
+	} while (iscons(p1));
 	push(F);
+	expanding--;
 }
 
 void
@@ -4382,8 +4990,6 @@ eval_degree(void)
 	degree();
 }
 
-//-----------------------------------------------------------------------------
-//
 //	Find the degree of a polynomial
 //
 //	Input:		tos-2		p(x)
@@ -4394,8 +5000,6 @@ eval_degree(void)
 //
 //	Note: Finds the largest numerical power of x. Does not check for
 //	weirdness in p(x).
-//
-//-----------------------------------------------------------------------------
 
 #undef POLY
 #undef X
@@ -4412,13 +5016,13 @@ degree(void)
 	X = pop();
 	POLY = pop();
 	YDEGREE = zero;
-	yydegree(POLY);
+	degree_nib(POLY);
 	push(YDEGREE);
 	restore();
 }
 
 void
-yydegree(U *p)
+degree_nib(struct atom *p)
 {
 	if (equal(p, X)) {
 		if (iszero(YDEGREE))
@@ -4429,7 +5033,7 @@ yydegree(U *p)
 	} else if (iscons(p)) {
 		p = cdr(p);
 		while (iscons(p)) {
-			yydegree(car(p));
+			degree_nib(car(p));
 			p = cdr(p);
 		}
 	}
@@ -4446,138 +5050,97 @@ eval_denominator(void)
 void
 denominator(void)
 {
-	int h;
 	save();
-	p1 = pop();
-	if (car(p1) == symbol(ADD)) {
-		push(p1);
-		rationalize();
-		p1 = pop();
-	}
-	if (car(p1) == symbol(MULTIPLY)) {
-		h = tos;
-		p1 = cdr(p1);
-		while (iscons(p1)) {
-			push(car(p1));
-			denominator();
-			p1 = cdr(p1);
-		}
-		multiply_all(tos - h);
-	} else if (isrational(p1)) {
-		push(p1);
-		mp_denominator();
-	} else if (car(p1) == symbol(POWER) && isnegativeterm(caddr(p1))) {
-		push(p1);
-		reciprocate();
-	} else
-		push(one);
+	denominator_nib();
 	restore();
 }
 
-#undef F
-#undef X
-#undef N
+void
+denominator_nib(void)
+{
+	p1 = pop();
+	if (isrational(p1)) {
+		push_rational_number(MPLUS, mcopy(p1->u.q.b), mint(1));
+		return;
+	}
+	p2 = one; // denominator
+	while (cross_expr(p1)) {
+		p0 = pop(); // p0 is a denominator
+		push(p0); // cancel in orig expr
+		push(p1);
+		cancel_factor();
+		p1 = pop();
+		push(p0); // update denominator
+		push(p2);
+		cancel_factor();
+		p2 = pop();
+	}
+	push(p2);
+}
 
-#define F p3
+#undef X
+#undef Y
+
 #define X p4
-#define N p5
+#define Y p5
 
 void
 eval_derivative(void)
 {
-	int i, n;
-	// evaluate 1st arg to get function F
-	p1 = cdr(p1);
-	push(car(p1));
+	int flag, i, n;
+	push(cadr(p1));
 	eval();
-	// evaluate 2nd arg and then...
-	// example	result of 2nd arg	what to do
-	//
-	// d(f)		nil			guess X, N = nil
-	// d(f,2)	2			guess X, N = 2
-	// d(f,x)	x			X = x, N = nil
-	// d(f,x,2)	x			X = x, N = 2
-	// d(f,x,y)	x			X = x, N = y
-	p1 = cdr(p1);
-	push(car(p1));
-	eval();
-	p2 = pop();
-	if (p2 == symbol(NIL)) {
+	p1 = cddr(p1);
+	if (!iscons(p1)) {
 		guess();
-		push(symbol(NIL));
-	} else if (isnum(p2)) {
-		guess();
-		push(p2);
-	} else {
-		push(p2);
-		p1 = cdr(p1);
-		push(car(p1));
-		eval();
+		derivative();
+		return;
 	}
-	N = pop();
-	X = pop();
-	F = pop();
-	while (1) {
-		// N might be a symbol instead of a number
-		if (isnum(N)) {
-			push(N);
+	flag = 0;
+	while (iscons(p1) || flag) {
+		if (flag) {
+			X = Y;
+			flag = 0;
+		} else {
+			push(car(p1));
+			eval();
+			X = pop();
+			p1 = cdr(p1);
+		}
+		if (isnum(X)) {
+			push(X);
 			n = pop_integer();
-			if (n == (int) 0x80000000)
-				stop("nth derivative: check n");
-		} else
-			n = 1;
-		push(F);
-		if (n >= 0) {
+			if (n == ERR)
+				stop("derivative: integer expected");
+			guess();
+			X = pop();
 			for (i = 0; i < n; i++) {
 				push(X);
 				derivative();
 			}
-		} else {
-			n = -n;
-			for (i = 0; i < n; i++) {
-				push(X);
-				integral();
-			}
+			continue;
 		}
-		F = pop();
-		// if N is nil then arglist is exhausted
-		if (N == symbol(NIL))
-			break;
-		// otherwise...
-		// N		arg1		what to do
-		//
-		// number	nil		break
-		// number	number		N = arg1, continue
-		// number	symbol		X = arg1, N = arg2, continue
-		//
-		// symbol	nil		X = N, N = nil, continue
-		// symbol	number		X = N, N = arg1, continue
-		// symbol	symbol		X = N, N = arg1, continue
-		if (isnum(N)) {
-			p1 = cdr(p1);
+		if (iscons(p1)) {
 			push(car(p1));
 			eval();
-			N = pop();
-			if (N == symbol(NIL))
-				break;		// arglist exhausted
-			if (isnum(N))
-				;		// N = arg1
-			else {
-				X = N;		// X = arg1
-				p1 = cdr(p1);
-				push(car(p1));
-				eval();
-				N = pop();	// N = arg2
-			}
-		} else {
-			X = N;			// X = N
+			Y = pop();
 			p1 = cdr(p1);
-			push(car(p1));
-			eval();
-			N = pop();		// N = arg1
+			if (isnum(Y)) {
+				push(Y);
+				n = pop_integer();
+				if (n == ERR)
+					stop("derivative: integer expected");
+				for (i = 0; i < n; i++) {
+					push(X);
+					derivative();
+				}
+				continue;
+			}
+			flag = 1;
 		}
+		push(X);
+		derivative();
 	}
-	push(F); // final result
 }
 
 void
@@ -4626,15 +5189,15 @@ d_scalar_scalar_1(void)
 {
 	// d(x,x)?
 	if (equal(p1, p2)) {
-		push(one);
+		push_integer(1);
 		return;
 	}
 	// d(a,x)?
 	if (!iscons(p1)) {
-		push(zero);
+		push_integer(0);
 		return;
 	}
-	if (isadd(p1)) {
+	if (car(p1) == symbol(ADD)) {
 		dsum();
 		return;
 	}
@@ -4706,10 +5269,6 @@ d_scalar_scalar_1(void)
 		dabs();
 		return;
 	}
-	if (car(p1) == symbol(HERMITE)) {
-		dhermite();
-		return;
-	}
 	if (car(p1) == symbol(ERF)) {
 		derf();
 		return;
@@ -4750,7 +5309,7 @@ dsum(void)
 		derivative();
 		p1 = cdr(p1);
 	}
-	add_all(tos - h);
+	add_terms(tos - h);
 }
 
 void
@@ -4768,13 +5327,11 @@ dproduct(void)
 			}
 			p3 = cdr(p3);
 		}
-		multiply_all(n);
+		multiply_factors(n);
 	}
-	add_all(n);
+	add_terms(n);
 }
 
-//-----------------------------------------------------------------------------
-//
 //	     v
 //	y = u
 //
@@ -4787,12 +5344,14 @@ dproduct(void)
 //	dy    v  v du           dv
 //	-- = u  (- -- + (log u) --)
 //	dx       u dx           dx
-//
-//-----------------------------------------------------------------------------
 
 void
 dpower(void)
 {
+	if (isnum(cadr(p1)) && isnum(caddr(p1))) {
+		push_integer(0); // irr or imag
+		return;
+	}
 	push(caddr(p1));	// v/u
 	push(cadr(p1));
 	divide();
@@ -4875,7 +5434,7 @@ dfunction(void)
 		push(p2);
 		list(3);
 	} else
-		push(zero);
+		push_integer(0);
 }
 
 void
@@ -4885,7 +5444,7 @@ dsin(void)
 	push(p2);
 	derivative();
 	push(cadr(p1));
-	cosine();
+	scos();
 	multiply();
 }
 
@@ -4896,7 +5455,7 @@ dcos(void)
 	push(p2);
 	derivative();
 	push(cadr(p1));
-	sine();
+	ssin();
 	multiply();
 	negate();
 }
@@ -4908,7 +5467,7 @@ dtan(void)
 	push(p2);
 	derivative();
 	push(cadr(p1));
-	cosine();
+	scos();
 	push_integer(-2);
 	power();
 	multiply();
@@ -4947,12 +5506,6 @@ darccos(void)
 	negate();
 }
 
-//				Without simplify	With simplify
-//
-//	d(arctan(y/x),x)	-y/(x^2*(y^2/x^2+1))	-y/(x^2+y^2)
-//
-//	d(arctan(y/x),y)	1/(x*(y^2/x^2+1))	x/(x^2+y^2)
-
 void
 darctan(void)
 {
@@ -4964,9 +5517,8 @@ darctan(void)
 	push_integer(2);
 	power();
 	add();
-	inverse();
+	reciprocate();
 	multiply();
-	simplify();
 }
 
 void
@@ -4976,7 +5528,7 @@ dsinh(void)
 	push(p2);
 	derivative();
 	push(cadr(p1));
-	ycosh();
+	scosh();
 	multiply();
 }
 
@@ -4987,7 +5539,7 @@ dcosh(void)
 	push(p2);
 	derivative();
 	push(cadr(p1));
-	ysinh();
+	ssinh();
 	multiply();
 }
 
@@ -4998,7 +5550,7 @@ dtanh(void)
 	push(p2);
 	derivative();
 	push(cadr(p1));
-	ycosh();
+	scosh();
 	push_integer(-2);
 	power();
 	multiply();
@@ -5047,7 +5599,7 @@ darctanh(void)
 	push_integer(2);
 	power();
 	subtract();
-	inverse();
+	reciprocate();
 	multiply();
 }
 
@@ -5063,24 +5615,6 @@ dabs(void)
 }
 
 void
-dhermite(void)
-{
-	push(cadr(p1));
-	push(p2);
-	derivative();
-	push_integer(2);
-	push(caddr(p1));
-	multiply();
-	multiply();
-	push(cadr(p1));
-	push(caddr(p1));
-	push_integer(-1);
-	add();
-	hermite();
-	multiply();
-}
-
-void
 derf(void)
 {
 	push(cadr(p1));
@@ -5090,7 +5624,7 @@ derf(void)
 	multiply();
 	exponential();
 	push_symbol(PI);
-	push_rational(-1,2);
+	push_rational(-1, 2);
 	power();
 	multiply();
 	push_integer(2);
@@ -5204,1638 +5738,1258 @@ derivative_of_integral(void)
 	push(cadr(p1));
 }
 
-//-----------------------------------------------------------------------------
-//
-//	Input:		Matrix on stack
-//
-//	Output:		Determinant on stack
-//
-//	Example:
-//
-//	> det(((1,2),(3,4)))
-//	-2
-//
-//	Note:
-//
-//	Uses Gaussian elimination for numerical matrices.
-//
-//-----------------------------------------------------------------------------
-
-int
-det_check_arg(void)
+void
+eval_det(void)
 {
-	if (!istensor(p1))
-		return 0;
-	else if (p1->u.tensor->ndim != 2)
-		return 0;
-	else if (p1->u.tensor->dim[0] != p1->u.tensor->dim[1])
-		return 0;
-	else
-		return 1;
+	push(cadr(p1));
+	eval();
+	det();
 }
 
 void
 det(void)
 {
-	int i, n;
-	U **a;
 	save();
-	p1 = pop();
-	if (det_check_arg() == 0) {
-		push_symbol(DET);
-		push(p1);
-		list(2);
-		restore();
-		return;
-	}
-	n = p1->u.tensor->nelem;
-	a = p1->u.tensor->elem;
-	for (i = 0; i < n; i++)
-		if (!isnum(a[i]))
-			break;
-	if (i == n)
-		yydetg();
-	else {
-		for (i = 0; i < p1->u.tensor->nelem; i++)
-			push(p1->u.tensor->elem[i]);
-		determinant(p1->u.tensor->dim[0]);
-	}
-	restore();
-}
-
-// determinant of n * n matrix elements on the stack
-
-void
-determinant(int n)
-{
-	int h, i, j, k, q, s, sign, t;
-	int *a, *c, *d;
-	h = tos - n * n;
-	a = (int *) malloc(3 * n * sizeof (int));
-	if (a == NULL)
-		out_of_memory();
-	c = a + n;
-	d = c + n;
-	for (i = 0; i < n; i++) {
-		a[i] = i;
-		c[i] = 0;
-		d[i] = 1;
-	}
-	sign = 1;
-	push(zero);
-	for (;;) {
-		if (sign == 1)
-			push_integer(1);
-		else
-			push_integer(-1);
-		for (i = 0; i < n; i++) {
-			k = n * a[i] + i;
-			push(stack[h + k]);
-			multiply(); // FIXME -- problem here
-		}
-		add();
-		/* next permutation (Knuth's algorithm P) */
-		j = n - 1;
-		s = 0;
-	P4:	q = c[j] + d[j];
-		if (q < 0) {
-			d[j] = -d[j];
-			j--;
-			goto P4;
-		}
-		if (q == j + 1) {
-			if (j == 0)
-				break;
-			s++;
-			d[j] = -d[j];
-			j--;
-			goto P4;
-		}
-		t = a[j - c[j] + s];
-		a[j - c[j] + s] = a[j - q + s];
-		a[j - q + s] = t;
-		c[j] = q;
-		sign = -sign;
-	}
-	free(a);
-	stack[h] = stack[tos - 1];
-	tos = h + 1;
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Input:		Matrix on stack
-//
-//	Output:		Determinant on stack
-//
-//	Note:
-//
-//	Uses Gaussian elimination which is faster for numerical matrices.
-//
-//	Gaussian Elimination works by walking down the diagonal and clearing
-//	out the columns below it.
-//
-//-----------------------------------------------------------------------------
-
-void
-detg(void)
-{
-	save();
-	p1 = pop();
-	if (det_check_arg() == 0) {
-		push_symbol(DET);
-		push(p1);
-		list(2);
-		restore();
-		return;
-	}
-	yydetg();
+	det_nib();
 	restore();
 }
 
 void
-yydetg(void)
+det_nib(void)
 {
-	int i, n;
+	int h, i, j, k, m, n;
+	p1 = pop();
+	if (!istensor(p1) || p1->u.tensor->ndim != 2 || p1->u.tensor->dim[0] != p1->u.tensor->dim[1])
+		stop("det: square matrix expected");
 	n = p1->u.tensor->dim[0];
-	for (i = 0; i < n * n; i++)
-		push(p1->u.tensor->elem[i]);
-	lu_decomp(n);
-	tos -= n * n;
-	push(p1);
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Input:		n * n matrix elements on stack
-//
-//	Output:		p1	determinant
-//
-//			p2	mangled
-//
-//			upper diagonal matrix on stack
-//
-//-----------------------------------------------------------------------------
-
-#undef M
-
-#define M(i, j) stack[h + n * (i) + (j)]
-
-void
-lu_decomp(int n)
-{
-	int d, h, i, j;
-	h = tos - n * n;
-	p1 = one;
-	for (d = 0; d < n - 1; d++) {
-		// diagonal element zero?
-		if (equal(M(d, d), zero)) {
-			// find a new row
-			for (i = d + 1; i < n; i++)
-				if (!equal(M(i, d), zero))
-					break;
-			if (i == n) {
-				p1 = zero;
-				break;
-			}
-			// exchange rows
-			for (j = d; j < n; j++) {
-				p2 = M(d, j);
-				M(d, j) = M(i, j);
-				M(i, j) = p2;
-			}
-			// negate det
-			push(p1);
-			negate();
-			p1 = pop();
-		}
-		// update det
-		push(p1);
-		push(M(d, d));
+	switch (n) {
+	case 1:
+		push(p1->u.tensor->elem[0]);
+		return;
+	case 2:
+		push(p1->u.tensor->elem[0]);
+		push(p1->u.tensor->elem[3]);
 		multiply();
-		p1 = pop();
-		// update lower diagonal matrix
-		for (i = d + 1; i < n; i++) {
-			// multiplier
-			push(M(i, d));
-			push(M(d, d));
-			divide();
-			negate();
-			p2 = pop();
-			// update one row
-			M(i, d) = zero; // clear column below pivot d
-			for (j = d + 1; j < n; j++) {
-				push(M(d, j));
-				push(p2);
-				multiply();
-				push(M(i, j));
-				add();
-				M(i, j) = pop();
-			}
-		}
+		push_integer(-1);
+		push(p1->u.tensor->elem[1]);
+		push(p1->u.tensor->elem[2]);
+		multiply_factors(3);
+		add();
+		return;
+	case 3:
+		push(p1->u.tensor->elem[0]);
+		push(p1->u.tensor->elem[4]);
+		push(p1->u.tensor->elem[8]);
+		multiply_factors(3);
+		push(p1->u.tensor->elem[1]);
+		push(p1->u.tensor->elem[5]);
+		push(p1->u.tensor->elem[6]);
+		multiply_factors(3);
+		push(p1->u.tensor->elem[2]);
+		push(p1->u.tensor->elem[3]);
+		push(p1->u.tensor->elem[7]);
+		multiply_factors(3);
+		push_integer(-1);
+		push(p1->u.tensor->elem[2]);
+		push(p1->u.tensor->elem[4]);
+		push(p1->u.tensor->elem[6]);
+		multiply_factors(4);
+		push_integer(-1);
+		push(p1->u.tensor->elem[1]);
+		push(p1->u.tensor->elem[3]);
+		push(p1->u.tensor->elem[8]);
+		multiply_factors(4);
+		push_integer(-1);
+		push(p1->u.tensor->elem[0]);
+		push(p1->u.tensor->elem[5]);
+		push(p1->u.tensor->elem[7]);
+		multiply_factors(4);
+		add_terms(6);
+		return;
 	}
-	// last diagonal element
-	push(p1);
-	push(M(n - 1, n - 1));
-	multiply();
-	p1 = pop();
+	p2 = alloc_matrix(n - 1, n - 1);
+	h = tos;
+	for (m = 0; m < n; m++) {
+		if (iszero(p1->u.tensor->elem[m]))
+			continue;
+		k = 0;
+		for (i = 1; i < n; i++)
+			for (j = 0; j < n; j++)
+				if (j != m)
+					p2->u.tensor->elem[k++] = p1->u.tensor->elem[n * i + j];
+		push(p2);
+		det();
+		push(p1->u.tensor->elem[m]);
+		multiply();
+		if (m % 2)
+			negate();
+	}
+	if (h == tos)
+		push_integer(0);
+	else
+		add_terms(tos - h);
 }
 
-//-----------------------------------------------------------------------------
-//
-//	Examples:
-//
-//	   012345678
-//	-2 .........
-//	-1 .........
-//	 0 ..hello..	x=2, y=0, h=1, w=5
-//	 1 .........
-//	 2 .........
-//
-//	   012345678
-//	-2 .........
-//	-1 ..355....
-//	 0 ..---....	x=2, y=-1, h=3, w=3
-//	 1 ..113....
-//	 2 .........
-//
-//-----------------------------------------------------------------------------
+#define CLIP 120 // max width of display
 
-#undef YMAX
-#define YMAX 10000
+#define TABLE_HSPACE 3
+#define TABLE_VSPACE 1
 
-struct glyph {
-	int c, x, y;
-} chartab[YMAX];
+#define EMIT_SPACE 1
+#define EMIT_CHAR 2
+#define EMIT_LIST 3
+#define EMIT_SUPERSCRIPT 4
+#define EMIT_SUBSCRIPT 5
+#define EMIT_SUBEXPR 6
+#define EMIT_FRACTION 7
+#define EMIT_TABLE 8
 
-int yindex, level, emit_x;
-int expr_level;
-int display_flag;
+#define OPCODE(p) ((int) car(p)->u.d)
+#define HEIGHT(p) ((int) cadr(p)->u.d)
+#define DEPTH(p) ((int) caddr(p)->u.d)
+#define WIDTH(p) ((int) cadddr(p)->u.d)
+
+#define VAL1(p) ((int) car(p)->u.d)
+#define VAL2(p) ((int) cadr(p)->u.d)
+
+#define PLUS_SIGN '+'
+#define MINUS_SIGN 0xe28892
+#define MULTIPLY_SIGN 0xc397
+#define GREATEREQUAL 0xe289a5
+#define LESSEQUAL 0xe289a4
+
+#define BDLL 0xe295b4 // BOX DRAW LIGHT LEFT
+#define BDLR 0xe295b6 // BOX DRAW LIGHT RIGHT
+
+#define BDLH 0xe29480 // BOX DRAW LIGHT HORIZONTAL
+#define BDLV 0xe29482 // BOX DRAW LIGHT VERTICAL
+
+#define BDLDAR 0xe2948c // BOX DRAW LIGHT DOWN AND RIGHT
+#define BDLDAL 0xe29490 // BOX DRAW LIGHT DOWN AND LEFT
+#define BDLUAR 0xe29494 // BOX DRAW LIGHT UP AND RIGHT
+#define BDLUAL 0xe29498 // BOX DRAW LIGHT UP AND LEFT
+
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
+
+int fmt_level;
+int fmt_nrow;
+int fmt_ncol;
+int *fmt_buf;
 
 void
 display(void)
 {
+	int c, d, h, i, j, n, w;
 	save();
+	fmt_level = 0;
 	p1 = pop();
-	yindex = 0;
-	level = 0;
-	emit_x = 0;
-	emit_top_expr(p1);
-	print_it();
+	fmt_list(p1);
+	p1 = pop();
+	h = HEIGHT(p1);
+	d = DEPTH(p1);
+	w = WIDTH(p1);
+	fmt_nrow = h + d;
+	fmt_ncol = MIN(CLIP, w);
+	n = fmt_nrow * fmt_ncol * sizeof (int); // number of bytes
+	fmt_buf = malloc(n);
+	if (fmt_buf == NULL)
+		malloc_kaput();
+	memset(fmt_buf, 0, n);
+	fmt_draw(0, h - 1, p1);
+	for (i = 0; i < fmt_nrow; i++) {
+		for (j = 0; j < fmt_ncol; j++) {
+			c = fmt_buf[i * fmt_ncol + j];
+			if (c == 0)
+				putchar(' ');
+			else if (c < 256)
+				putchar(c);
+			else if (c < 65536) {
+				putchar(c >> 8);
+				putchar(c & 0xff);
+			} else {
+				putchar(c >> 16);
+				putchar(c >> 8 & 0xff);
+				putchar(c & 0xff);
+			}
+		}
+		putchar('\n');
+	}
+	free(fmt_buf);
 	restore();
 }
 
 void
-emit_top_expr(U *p)
+fmt_args(struct atom *p)
 {
-	if (car(p) == symbol(SETQ)) {
-		emit_expr(cadr(p));
-		emit_str(" = ");
-		emit_expr(caddr(p));
+	int t;
+	p = cdr(p);
+	if (!iscons(p)) {
+		fmt_roman_char('(');
+		fmt_roman_char(')');
 		return;
 	}
-	if (istensor(p))
-		emit_tensor(p);
-	else
-		emit_expr(p);
-}
-
-int
-will_be_displayed_as_fraction(U *p)
-{
-	if (level > 0)
-		return 0;
-	if (isfraction(p))
-		return 1;
-	if (car(p) != symbol(MULTIPLY))
-		return 0;
-	if (isfraction(cadr(p)))
-		return 1;
-	while (iscons(p)) {
-		if (isdenominator(car(p)))
-			return 1;
-		p = cdr(p);
-	}
-	return 0;
-}
-
-void
-emit_expr(U *p)
-{
-//	if (level > 0) {
-//		printexpr(p);
-//		return;
-//	}
-	expr_level++;
-	if (car(p) == symbol(ADD)) {
-		p = cdr(p);
-		if (is_negative(car(p))) {
-			emit_char('-');
-			if (will_be_displayed_as_fraction(car(p)))
-				emit_char(' ');
-		}
-		emit_term(car(p));
-		p = cdr(p);
-		while (iscons(p)) {
-			if (is_negative(car(p))) {
-				emit_char(' ');
-				emit_char('-');
-				emit_char(' ');
-			} else {
-				emit_char(' ');
-				emit_char('+');
-				emit_char(' ');
-			}
-			emit_term(car(p));
-			p = cdr(p);
-		}
-	} else {
-		if (is_negative(p)) {
-			emit_char('-');
-			if (will_be_displayed_as_fraction(p))
-				emit_char(' ');
-		}
-		emit_term(p);
-	}
-	expr_level--;
-}
-
-void
-emit_unsigned_expr(U *p)
-{
-	if (car(p) == symbol(ADD)) {
-		p = cdr(p);
-//		if (is_negative(car(p)))
-//			emit_char('-');
-		emit_term(car(p));
-		p = cdr(p);
-		while (iscons(p)) {
-			if (is_negative(car(p))) {
-				emit_char(' ');
-				emit_char('-');
-				emit_char(' ');
-			} else {
-				emit_char(' ');
-				emit_char('+');
-				emit_char(' ');
-			}
-			emit_term(car(p));
-			p = cdr(p);
-		}
-	} else {
-//		if (is_negative(p))
-//			emit_char('-');
-		emit_term(p);
-	}
-}
-
-int
-is_negative(U *p)
-{
-	if (isnegativenumber(p))
-		return 1;
-	if (car(p) == symbol(MULTIPLY) && isnegativenumber(cadr(p)))
-		return 1;
-	return 0;
-}
-
-void
-emit_term(U *p)
-{
-	int n;
-	if (car(p) == symbol(MULTIPLY)) {
-		n = count_denominators(p);
-		if (n && level == 0)
-			emit_fraction(p, n);
-		else
-			emit_multiply(p, n);
-	} else
-		emit_factor(p);
-}
-
-int
-isdenominator(U *p)
-{
-	if (car(p) == symbol(POWER) && cadr(p) != symbol(EXP1) && is_negative(caddr(p)))
-		return 1;
-	else
-		return 0;
-}
-
-int
-count_denominators(U *p)
-{
-	int count = 0;
-	U *q;
+	t = tos;
+	fmt_expr(car(p));
 	p = cdr(p);
-//	if (isfraction(car(p))) {
-//		count++;
-//		p = cdr(p);
-//	}
+	while (iscons(p)) {
+		fmt_roman_char(',');
+		fmt_expr(car(p));
+		p = cdr(p);
+	}
+	fmt_update_list(t);
+	fmt_update_subexpr();
+}
+
+void
+fmt_base(struct atom *p)
+{
+	if (isnegativenumber(p) || isfraction(p) || isdouble(p) || car(p) == symbol(ADD) || car(p) == symbol(MULTIPLY) || car(p) == symbol(POWER))
+		fmt_subexpr(p);
+	else
+		fmt_expr(p);
+}
+
+void
+fmt_denominators(struct atom *p)
+{
+	int n, t;
+	char *s;
+	struct atom *q;
+	t = tos;
+	n = count_denominators(p);
+	p = cdr(p);
+	q = car(p);
+	if (isrational(q)) {
+		if (!MEQUAL(q->u.q.b, 1)) {
+			s = mstr(q->u.q.b);
+			fmt_roman_string(s);
+			n++;
+		}
+		p = cdr(p);
+	}
 	while (iscons(p)) {
 		q = car(p);
-		if (isdenominator(q))
-			count++;
 		p = cdr(p);
-	}
-	return count;
-}
-
-// n is the number of denominators, not counting a fraction like 1/2
-
-void
-emit_multiply(U *p, int n)
-{
-	if (n == 0) {
-		p = cdr(p);
-		if (isplusone(car(p)) || isminusone(car(p)))
-			p = cdr(p);
-		emit_factor(car(p));
-		p = cdr(p);
-		while (iscons(p)) {
-			emit_char(' ');
-			emit_factor(car(p));
-			p = cdr(p);
-		}
-	} else {
-		emit_numerators(p);
-		emit_char('/');
-		// need grouping if more than one denominator
-		if (n > 1 || isfraction(cadr(p))) {
-			emit_char('(');
-			emit_denominators(p);
-			emit_char(')');
-		} else
-			emit_denominators(p);
-	}
-}
-
-#undef A
-#undef B
-
-#define A p3
-#define B p4
-
-// sign of term has already been emitted
-
-void
-emit_fraction(U *p, int d)
-{
-	int count, k1, k2, n, x;
-	save();
-	A = one;
-	B = one;
-	// handle numerical coefficient
-	if (isrational(cadr(p))) {
-		push(cadr(p));
-		mp_numerator();
-		absval();
-		A = pop();
-		push(cadr(p));
-		mp_denominator();
-		B = pop();
-	}
-	if (isdouble(cadr(p))) {
-		push(cadr(p));
-		absval();
-		A = pop();
-	}
-	// count numerators
-	if (isplusone(A))
-		n = 0;
-	else
-		n = 1;
-	p1 = cdr(p);
-	if (isnum(car(p1)))
-		p1 = cdr(p1);
-	while (iscons(p1)) {
-		p2 = car(p1);
-		if (isdenominator(p2))
-			;
-		else
-			n++;
-		p1 = cdr(p1);
-	}
-	// emit numerators
-	x = emit_x;
-	k1 = yindex;
-	count = 0;
-	// emit numerical coefficient
-	if (!isplusone(A)) {
-		emit_number(A, 0);
-		count++;
-	}
-	// skip over "multiply"
-	p1 = cdr(p);
-	// skip over numerical coefficient, already handled
-	if (isnum(car(p1)))
-		p1 = cdr(p1);
-	while (iscons(p1)) {
-		p2 = car(p1);
-		if (isdenominator(p2))
-			;
-		else {
-			if (count > 0)
-				emit_char(' ');
-			if (n == 1)
-				emit_expr(p2);
+		if (!isdenominator(q))
+			continue;
+		if (tos > t)
+			fmt_space();
+		if (isminusone(caddr(q))) {
+			q = cadr(q);
+			if (car(q) == symbol(ADD) && n == 1)
+				fmt_expr(q); // parens not needed
 			else
-				emit_factor(p2);
-			count++;
+				fmt_factor(q);
+		} else {
+			fmt_base(cadr(q));
+			fmt_numeric_exponent(caddr(q)); // sign is not emitted
 		}
-		p1 = cdr(p1);
 	}
-	if (count == 0)
-		emit_char('1');
-	// emit denominators
-	k2 = yindex;
-	count = 0;
-	if (!isplusone(B)) {
-		emit_number(B, 0);
-		count++;
-		d++;
-	}
-	p1 = cdr(p);
-	if (isrational(car(p1)))
-		p1 = cdr(p1);
-	while (iscons(p1)) {
-		p2 = car(p1);
-		if (isdenominator(p2)) {
-			if (count > 0)
-				emit_char(' ');
-			emit_denominator(p2, d);
-			count++;
-		}
-		p1 = cdr(p1);
-	}
-	fixup_fraction(x, k1, k2);
-	restore();
+	fmt_update_list(t);
 }
 
-// p points to a multiply
+void
+fmt_double(struct atom *p)
+{
+	int i, j, k, t;
+	if (p->u.d == 0.0) {
+		fmt_roman_char('0');
+		return;
+	}
+	sprintf(tbuf, "%g", fabs(p->u.d));
+	k = 0;
+	while (isdigit(tbuf[k]) || tbuf[k] == '.')
+		k++;
+	// handle trailing zeroes
+	j = k;
+	if (strchr(tbuf, '.'))
+		while (tbuf[j - 1] == '0' && tbuf[j - 2] != '.')
+			j--;
+	for (i = 0; i < j; i++)
+		fmt_roman_char(tbuf[i]);
+	if (tbuf[k] != 'E' && tbuf[k] != 'e')
+		return;
+	k++;
+	fmt_roman_char(MULTIPLY_SIGN);
+	fmt_roman_string("10");
+	// superscripted exponent
+	fmt_level++;
+	t = tos;
+	// sign of exponent
+	if (tbuf[k] == '+')
+		k++;
+	else if (tbuf[k] == '-') {
+		fmt_roman_char(MINUS_SIGN);
+		k++;
+	}
+	// skip leading zeroes in exponent
+	while (tbuf[k] == '0')
+		k++;
+	fmt_roman_string(tbuf + k);
+	fmt_update_list(t);
+	fmt_level--;
+	fmt_update_superscript();
+}
 
 void
-emit_numerators(U *p)
+fmt_exponent(struct atom *p)
 {
-	int n;
-	save();
-	p1 = one;
+	if (isnum(p) && !isnegativenumber(p)) {
+		fmt_numeric_exponent(p); // sign is not emitted
+		return;
+	}
+	fmt_level++;
+	fmt_list(p);
+	fmt_level--;
+	fmt_update_superscript();
+}
+
+void
+fmt_expr(struct atom *p)
+{
+	if (isnegativeterm(p) || (car(p) == symbol(ADD) && isnegativeterm(cadr(p))))
+		fmt_roman_char(MINUS_SIGN);
+	if (car(p) == symbol(ADD))
+		fmt_expr_nib(p);
+	else
+		fmt_term(p);
+}
+
+void
+fmt_expr_nib(struct atom *p)
+{
 	p = cdr(p);
-	if (isrational(car(p))) {
-		push(car(p));
-		mp_numerator();
-		absval();
-		p1 = pop();
-		p = cdr(p);
-	} else if (isdouble(car(p))) {
-		push(car(p));
-		absval();
-		p1 = pop();
-		p = cdr(p);
-	}
-	n = 0;
-	if (!isplusone(p1)) {
-		emit_number(p1, 0);
-		n++;
-	}
-	while (iscons(p)) {
-		if (isdenominator(car(p)))
-			;
-		else {
-			if (n > 0)
-				emit_char(' ');
-			emit_factor(car(p));
-			n++;
-		}
-		p = cdr(p);
-	}
-	if (n == 0)
-		emit_char('1');
-	restore();
-}
-
-// p points to a multiply
-
-void
-emit_denominators(U *p)
-{
-	int n;
-	save();
-	n = 0;
+	fmt_term(car(p));
 	p = cdr(p);
-	if (isfraction(car(p))) {
-		push(car(p));
-		mp_denominator();
-		p1 = pop();
-		emit_number(p1, 0);
-		n++;
-		p = cdr(p);
-	}
 	while (iscons(p)) {
-		if (isdenominator(car(p))) {
-			if (n > 0)
-				emit_char(' ');
-			emit_denominator(car(p), 0);
-			n++;
-		}
-		p = cdr(p);
-	}
-	restore();
-}
-
-void
-emit_factor(U *p)
-{
-	if (istensor(p)) {
-		if (level == 0)
-			//emit_tensor(p);
-			emit_flat_tensor(p);
+		if (isnegativeterm(car(p)))
+			fmt_infix_operator(MINUS_SIGN);
 		else
-			emit_flat_tensor(p);
+			fmt_infix_operator(PLUS_SIGN);
+		fmt_term(car(p));
+		p = cdr(p);
+	}
+}
+
+void
+fmt_factor(struct atom *p)
+{
+	if (isrational(p)) {
+		fmt_rational(p);
 		return;
 	}
 	if (isdouble(p)) {
-		emit_number(p, 0);
-		return;
-	}
-	if (car(p) == symbol(ADD) || car(p) == symbol(MULTIPLY)) {
-		emit_subexpr(p);
-		return;
-	}
-	if (car(p) == symbol(POWER)) {
-		emit_power(p);
-		return;
-	}
-	if (iscons(p)) {
-		//if (car(p) == symbol(FORMAL) && cadr(p)->k == SYM)
-		//	emit_symbol(cadr(p));
-		//else
-			emit_function(p);
-		return;
-	}
-	if (isnum(p)) {
-		if (level == 0)
-			emit_numerical_fraction(p);
-		else
-			emit_number(p, 0);
+		fmt_double(p);
 		return;
 	}
 	if (issymbol(p)) {
-		emit_symbol(p);
+		fmt_symbol(p);
 		return;
 	}
 	if (isstr(p)) {
-		emit_string(p);
+		fmt_string(p);
 		return;
 	}
-}
-
-void
-emit_numerical_fraction(U *p)
-{
-	int k1, k2, x;
-	save();
-	push(p);
-	mp_numerator();
-	absval();
-	A = pop();
-	push(p);
-	mp_denominator();
-	B = pop();
-	if (isplusone(B)) {
-		emit_number(A, 0);
-		restore();
+	if (istensor(p)) {
+		fmt_tensor(p);
 		return;
 	}
-	x = emit_x;
-	k1 = yindex;
-	emit_number(A, 0);
-	k2 = yindex;
-	emit_number(B, 0);
-	fixup_fraction(x, k1, k2);
-	restore();
-}
-
-// if it's a factor then it doesn't need parens around it, i.e. 1/sin(theta)^2
-
-int
-isfactor(U *p)
-{
-	if (iscons(p) && car(p) != symbol(ADD) && car(p) != symbol(MULTIPLY) && car(p) != symbol(POWER))
-		return 1;
-	if (issymbol(p))
-		return 1;
-	if (isfraction(p))
-		return 0;
-	if (isnegativenumber(p))
-		return 0;
-	if (isnum(p))
-		return 1;
-	return 0;
-}
-
-void
-emit_power(U *p)
-{
-	int k1, k2, x;
-	if (cadr(p) == symbol(EXP1)) {
-		emit_str("exp(");
-		emit_expr(caddr(p));
-		emit_char(')');
-		return;
-	}
-	if (level > 0) {
-		if (isminusone(caddr(p))) {
-			emit_char('1');
-			emit_char('/');
-			if (isfactor(cadr(p)))
-				emit_factor(cadr(p));
-			else
-				emit_subexpr(cadr(p));
-		} else {
-			if (isfactor(cadr(p)))
-				emit_factor(cadr(p));
-			else
-				emit_subexpr(cadr(p));
-			emit_char('^');
-			if (isfactor(caddr(p)))
-				emit_factor(caddr(p));
-			else
-				emit_subexpr(caddr(p));
-		}
-		return;
-	}
-	// special case: 1 over something
-	if (is_negative(caddr(p))) {
-		x = emit_x;
-		k1 = yindex;
-		emit_char('1');
-		k2 = yindex;
-		//level++;
-		emit_denominator(p, 1);
-		//level--;
-		fixup_fraction(x, k1, k2);
-		return;
-	}
-	k1 = yindex;
-	if (isfactor(cadr(p)))
-		emit_factor(cadr(p));
-	else
-		emit_subexpr(cadr(p));
-	k2 = yindex;
-	level++;
-	emit_expr(caddr(p));
-	level--;
-	fixup_power(k1, k2);
-}
-
-// if n == 1 then emit as expr (no parens)
-
-// p is a power
-
-void
-emit_denominator(U *p, int n)
-{
-	int k1, k2;
-	// special case: 1 over something
-	if (isminusone(caddr(p))) {
-		if (n == 1)
-			emit_expr(cadr(p));
+	if (iscons(p)) {
+		if (car(p) == symbol(POWER))
+			fmt_power(p);
+		else if (car(p) == symbol(ADD) || car(p) == symbol(MULTIPLY))
+			fmt_subexpr(p);
 		else
-			emit_factor(cadr(p));
+			fmt_function(p);
 		return;
 	}
-	k1 = yindex;
-	// emit base
-	if (isfactor(cadr(p)))
-		emit_factor(cadr(p));
-	else
-		emit_subexpr(cadr(p));
-	k2 = yindex;
-	// emit exponent, don't emit minus sign
-	level++;
-	emit_unsigned_expr(caddr(p));
-	level--;
-	fixup_power(k1, k2);
 }
 
 void
-emit_function(U *p)
+fmt_frac(struct atom *p)
 {
-	if (car(p) == symbol(INDEX) && issymbol(cadr(p))) {
-		emit_index_function(p);
+	fmt_numerators(p);
+	fmt_denominators(p);
+	fmt_update_fraction();
+}
+
+void
+fmt_function(struct atom *p)
+{
+	// d(f(x),x)
+	if (car(p) == symbol(DERIVATIVE)) {
+		fmt_roman_char('d');
+		fmt_args(p);
 		return;
 	}
+	// n!
 	if (car(p) == symbol(FACTORIAL)) {
-		emit_factorial_function(p);
+		p = cadr(p);
+		if (isposint(p) || issymbol(p))
+			fmt_expr(p);
+		else
+			fmt_subexpr(p);
+		fmt_roman_char('!');
 		return;
 	}
-	if (car(p) == symbol(DERIVATIVE))
-		emit_char('d');
+	// A[1,2]
+	if (car(p) == symbol(INDEX)) {
+		p = cdr(p);
+		if (issymbol(car(p)))
+			fmt_symbol(car(p));
+		else
+			fmt_subexpr(car(p));
+		fmt_indices(p);
+		return;
+	}
+	if (car(p) == symbol(SETQ) || car(p) == symbol(TESTEQ)) {
+		fmt_expr(cadr(p));
+		fmt_infix_operator('=');
+		fmt_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTGE)) {
+		fmt_expr(cadr(p));
+		fmt_infix_operator(GREATEREQUAL);
+		fmt_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTGT)) {
+		fmt_expr(cadr(p));
+		fmt_infix_operator('>');
+		fmt_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTLE)) {
+		fmt_expr(cadr(p));
+		fmt_infix_operator(LESSEQUAL);
+		fmt_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTLT)) {
+		fmt_expr(cadr(p));
+		fmt_infix_operator('<');
+		fmt_expr(caddr(p));
+		return;
+	}
+	// default
+	if (issymbol(car(p)))
+		fmt_symbol(car(p));
 	else
-		emit_symbol(car(p));
-	emit_char('(');
+		fmt_subexpr(car(p));
+	fmt_args(p);
+}
+
+void
+fmt_indices(struct atom *p)
+{
+	fmt_roman_char('[');
 	p = cdr(p);
 	if (iscons(p)) {
-		emit_expr(car(p));
+		fmt_expr(car(p));
 		p = cdr(p);
 		while (iscons(p)) {
-			emit_char(',');
-			//emit_char(' ');
-			emit_expr(car(p));
+			fmt_roman_char(',');
+			fmt_expr(car(p));
 			p = cdr(p);
 		}
 	}
-	emit_char(')');
+	fmt_roman_char(']');
 }
 
 void
-emit_index_function(U *p)
+fmt_infix_operator(int c)
 {
+	fmt_space();
+	fmt_roman_char(c);
+	fmt_space();
+}
+
+void
+fmt_list(struct atom *p)
+{
+	int t = tos;
+	fmt_expr(p);
+	fmt_update_list(t);
+}
+
+void
+fmt_matrix(struct atom *p, int d, int k)
+{
+	int i, j, m, n, span;
+	if (d == p->u.tensor->ndim) {
+		fmt_list(p->u.tensor->elem[k]);
+		return;
+	}
+	// compute element span
+	span = 1;
+	for (i = d + 2; i < p->u.tensor->ndim; i++)
+		span *= p->u.tensor->dim[i];
+	n = p->u.tensor->dim[d];	// number of rows
+	m = p->u.tensor->dim[d + 1];	// number of columns
+	for (i = 0; i < n; i++)
+		for (j = 0; j < m; j++)
+			fmt_matrix(p, d + 2, k + (i * m + j) * span);
+	fmt_update_table(n, m);
+}
+
+void
+fmt_numerators(struct atom *p)
+{
+	int t;
+	char *s;
+	struct atom *q;
+	t = tos;
 	p = cdr(p);
-	if (caar(p) == symbol(ADD) || caar(p) == symbol(MULTIPLY) || caar(p) == symbol(POWER) || caar(p) == symbol(FACTORIAL))
-		emit_subexpr(car(p));
-	else
-		emit_expr(car(p));
-	emit_char('[');
-	p = cdr(p);
-	if (iscons(p)) {
-		emit_expr(car(p));
+	q = car(p);
+	if (isrational(q)) {
+		if (!MEQUAL(q->u.q.a, 1)) {
+			s = mstr(q->u.q.a);
+			fmt_roman_string(s);
+		}
 		p = cdr(p);
-		while(iscons(p)) {
-			emit_char(',');
-			emit_expr(car(p));
-			p = cdr(p);
+	}
+	while (iscons(p)) {
+		q = car(p);
+		p = cdr(p);
+		if (isdenominator(q))
+			continue;
+		if (tos > t)
+			fmt_space();
+		fmt_factor(q);
+	}
+	if (t == tos)
+		fmt_roman_char('1'); // no numerators
+	fmt_update_list(t);
+}
+
+// p is rational or double, sign is not emitted
+
+void
+fmt_numeric_exponent(struct atom *p)
+{
+	int t;
+	char *s;
+	fmt_level++;
+	t = tos;
+	if (isrational(p)) {
+		s = mstr(p->u.q.a);
+		fmt_roman_string(s);
+		if (!MEQUAL(p->u.q.b, 1)) {
+			fmt_roman_char('/');
+			s = mstr(p->u.q.b);
+			fmt_roman_string(s);
+		}
+	} else
+		fmt_double(p);
+	fmt_update_list(t);
+	fmt_level--;
+	fmt_update_superscript();
+}
+
+void
+fmt_power(struct atom *p)
+{
+	if (cadr(p) == symbol(EXP1)) {
+		fmt_roman_string("exp");
+		fmt_args(cdr(p));
+		return;
+	}
+	if (isimaginaryunit(p)) {
+		if (isimaginaryunit(get_binding(symbol(SYMBOL_J)))) {
+			fmt_roman_char('j');
+			return;
+		}
+		if (isimaginaryunit(get_binding(symbol(SYMBOL_I)))) {
+			fmt_roman_char('i');
+			return;
 		}
 	}
-	emit_char(']');
+	if (isnegativenumber(caddr(p))) {
+		fmt_reciprocal(p);
+		return;
+	}
+	fmt_base(cadr(p));
+	fmt_exponent(caddr(p));
 }
 
 void
-emit_factorial_function(U *p)
+fmt_rational(struct atom *p)
 {
-	p = cadr(p);
-	if (car(p) == symbol(ADD) || car(p) == symbol(MULTIPLY) || car(p) == symbol(POWER) || car(p) == symbol(FACTORIAL))
-		emit_subexpr(p);
-	else
-		emit_expr(p);
-	emit_char('!');
+	int t;
+	char *s;
+	if (MEQUAL(p->u.q.b, 1)) {
+		s = mstr(p->u.q.a);
+		fmt_roman_string(s);
+		return;
+	}
+	fmt_level++;
+	t = tos;
+	s = mstr(p->u.q.a);
+	fmt_roman_string(s);
+	fmt_update_list(t);
+	t = tos;
+	s = mstr(p->u.q.b);
+	fmt_roman_string(s);
+	fmt_update_list(t);
+	fmt_level--;
+	fmt_update_fraction();
+}
+
+// p = y^x where x is a negative number
+
+void
+fmt_reciprocal(struct atom *p)
+{
+	int t;
+	fmt_roman_char('1'); // numerator
+	t = tos;
+	if (isminusone(caddr(p)))
+		fmt_expr(cadr(p));
+	else {
+		fmt_base(cadr(p));
+		fmt_numeric_exponent(caddr(p)); // sign is not emitted
+	}
+	fmt_update_list(t);
+	fmt_update_fraction();
 }
 
 void
-emit_subexpr(U *p)
+fmt_roman_char(int c)
 {
-	emit_char('(');
-	emit_expr(p);
-	emit_char(')');
+	int d, h, w;
+	h = 1;
+	d = 0;
+	w = 1;
+	push_double(EMIT_CHAR);
+	push_double(h);
+	push_double(d);
+	push_double(w);
+	push_double(c);
+	list(5);
 }
 
 void
-emit_symbol(U *p)
+fmt_roman_string(char *s)
 {
+	while (*s)
+		fmt_roman_char(*s++);
+}
+
+void
+fmt_space(void)
+{
+	push_double(EMIT_SPACE);
+	push_double(0);
+	push_double(0);
+	push_double(1);
+	list(4);
+}
+
+void
+fmt_string(struct atom *p)
+{
+	fmt_roman_string(p->u.str);
+}
+
+void
+fmt_subexpr(struct atom *p)
+{
+	fmt_list(p);
+	fmt_update_subexpr();
+}
+
+void
+fmt_symbol(struct atom *p)
+{
+	int k, t;
 	char *s;
 	if (p == symbol(EXP1)) {
-		emit_str("exp(1)");
+		fmt_roman_string("exp(1)");
 		return;
 	}
-	s = get_printname(p);
-	while (*s)
-		emit_char(*s++);
-}
-
-void
-emit_string(U *p)
-{
-	char *s;
-	s = p->u.str;
-	while (*s)
-		emit_char(*s++);
-}
-
-void
-fixup_fraction(int x, int k1, int k2)
-{
-	int dx, dy, i, w, y;
-	int h1, w1, y1;
-	int h2, w2, y2;
-	get_size(k1, k2, &h1, &w1, &y1);
-	get_size(k2, yindex, &h2, &w2, &y2);
-	if (w2 > w1)
-		dx = (w2 - w1) / 2;	// shift numerator right
-	else
-		dx = 0;
-dx++;
-	// this is how much is below the baseline
-	y = y1 + h1 - 1;
-	dy = -y - 1;
-	move(k1, k2, dx, dy);
-	if (w2 > w1)
-		dx = -w1;
-	else
-		dx = -w1 + (w1 - w2) / 2;
-dx++;
-	dy = -y2 + 1;
-	move(k2, yindex, dx, dy);
-	if (w2 > w1)
-		w = w2;
-	else
-		w = w1;
-w+=2;
-	emit_x = x;
-	for (i = 0; i < w; i++)
-		emit_char('-');
-}
-
-void
-fixup_power(int k1, int k2)
-{
-	int dy;
-	int h1, w1, y1;
-	int h2, w2, y2;
-	get_size(k1, k2, &h1, &w1, &y1);
-	get_size(k2, yindex, &h2, &w2, &y2);
-	// move superscript to baseline
-	dy = -y2 - h2 + 1;
-	// now move above base
-	dy += y1 - 1;
-	move(k2, yindex, 0, dy);
-}
-
-void
-move(int j, int k, int dx, int dy)
-{
-	int i;
-	for (i = j; i < k; i++) {
-		chartab[i].x += dx;
-		chartab[i].y += dy;
-	}
-}
-
-// finds the bounding rectangle and vertical position
-
-void
-get_size(int j, int k, int *h, int *w, int *y)
-{
-	int i;
-	int min_x, max_x, min_y, max_y;
-	min_x = chartab[j].x;
-	max_x = chartab[j].x;
-	min_y = chartab[j].y;
-	max_y = chartab[j].y;
-	for (i = j + 1; i < k; i++) {
-		if (chartab[i].x < min_x)
-			min_x = chartab[i].x;
-		if (chartab[i].x > max_x)
-			max_x = chartab[i].x;
-		if (chartab[i].y < min_y)
-			min_y = chartab[i].y;
-		if (chartab[i].y > max_y)
-			max_y = chartab[i].y;
-	}
-	*h = max_y - min_y + 1;
-	*w = max_x - min_x + 1;
-	*y = min_y;
-}
-
-void
-displaychar(int c)
-{
-	emit_char(c);
-}
-
-void
-emit_char(int c)
-{
-	if (yindex == YMAX)
+	s = printname(p);
+	if (iskeyword(p) || p == symbol(LAST) || p == symbol(TRACE)) {
+		fmt_roman_string(s);
 		return;
-	chartab[yindex].c = c;
-	chartab[yindex].x = emit_x;
-	chartab[yindex].y = 0;
-	yindex++;
-	emit_x++;
-}
-
-void
-emit_str(char *s)
-{
-	while (*s)
-		emit_char(*s++);
-}
-
-void
-emit_number(U *p, int emit_sign)
-{
-	char *s;
-	static char buf[100];
-	switch (p->k) {
-	case NUM:
-		s = mstr(p->u.q.a);
-		if (*s == '-' && emit_sign == 0)
-			s++;
-		while (*s)
-			emit_char(*s++);
-		s = mstr(p->u.q.b);
-		if (strcmp(s, "1") == 0)
-			break;
-		emit_char('/');
-		while (*s)
-			emit_char(*s++);
-		break;
-	case DOUBLE:
-		sprintf(buf, "%g", p->u.d);
-		s = buf;
-		if (*s == '-' && emit_sign == 0)
-			s++;
-		while (*s)
-			emit_char(*s++);
-		break;
-	default:
-		break;
 	}
-}
-
-int
-display_cmp(const void *aa, const void *bb)
-{
-	struct glyph *a, *b;
-	a = (struct glyph *) aa;
-	b = (struct glyph *) bb;
-	if (a->y < b->y)
-		return -1;
-	if (a->y > b->y)
-		return 1;
-	if (a->x < b->x)
-		return -1;
-	if (a->x > b->x)
-		return 1;
-	return 0;
-}
-
-void
-print_it(void)
-{
-	int i, x, y;
-	qsort(chartab, yindex, sizeof (struct glyph), display_cmp);
-	x = 0;
-	y = chartab[0].y;
-	for (i = 0; i < yindex; i++) {
-		while (chartab[i].y > y) {
-			printchar('\n');
-			x = 0;
-			y++;
-		}
-		while (chartab[i].x > x) {
-			printchar_nowrap(' ');
-			x++;
-		}
-		printchar_nowrap(chartab[i].c);
-		x++;
-	}
-	printchar('\n');
-}
-
-char print_buffer[10000];
-
-char *
-getdisplaystr(void)
-{
-	yindex = 0;
-	level = 0;
-	emit_x = 0;
-	emit_expr(pop());
-	fill_buf();
-	return print_buffer;
-}
-
-void
-fill_buf(void)
-{
-	int i, k, x, y;
-	qsort(chartab, yindex, sizeof (struct glyph), display_cmp);
-	k = 0;
-	x = 0;
-	y = chartab[0].y;
-	for (i = 0; i < yindex; i++) {
-		while (chartab[i].y > y) {
-			if (k < sizeof print_buffer - 2)
-				print_buffer[k++] = '\n';
-			x = 0;
-			y++;
-		}
-		while (chartab[i].x > x) {
-			if (k < sizeof print_buffer - 2)
-				print_buffer[k++] = ' ';
-			x++;
-		}
-		if (k < sizeof print_buffer - 2)
-			print_buffer[k++] = chartab[i].c;
-		x++;
-	}
-	if (k == sizeof print_buffer - 2)
-		printf("warning: print buffer full\n");
-	print_buffer[k++] = '\n';
-	print_buffer[k++] = '\0';
+	k = fmt_symbol_fragment(s, 0);
+	if (s[k] == '\0')
+		return;
+	// emit subscript
+	fmt_level++;
+	t = tos;
+	while (s[k] != '\0')
+		k = fmt_symbol_fragment(s, k);
+	fmt_update_list(t);
+	fmt_level--;
+	fmt_update_subscript();
 }
 
 #undef N
+#define N 49
 
-#define N 100
+char *symbol_name_tab[N] = {
 
-struct elem {
-	int x, y, h, w, index, count;
-} elem[N];
+	"Alpha",
+	"Beta",
+	"Gamma",
+	"Delta",
+	"Epsilon",
+	"Zeta",
+	"Eta",
+	"Theta",
+	"Iota",
+	"Kappa",
+	"Lambda",
+	"Mu",
+	"Nu",
+	"Xi",
+	"Omicron",
+	"Pi",
+	"Rho",
+	"Sigma",
+	"Tau",
+	"Upsilon",
+	"Phi",
+	"Chi",
+	"Psi",
+	"Omega",
 
-#define SPACE_BETWEEN_COLUMNS 3
-#define SPACE_BETWEEN_ROWS 1
+	"alpha",
+	"beta",
+	"gamma",
+	"delta",
+	"epsilon",
+	"zeta",
+	"eta",
+	"theta",
+	"iota",
+	"kappa",
+	"lambda",
+	"mu",
+	"nu",
+	"xi",
+	"omicron",
+	"pi",
+	"rho",
+	"sigma",
+	"tau",
+	"upsilon",
+	"phi",
+	"chi",
+	"psi",
+	"omega",
+
+	"hbar",
+};
+
+int symbol_unicode_tab[N] = {
+
+	0xce91, // Alpha
+	0xce92, // Beta
+	0xce93, // Gamma
+	0xce94, // Delta
+	0xce95, // Epsilon
+	0xce96, // Zeta
+	0xce97, // Eta
+	0xce98, // Theta
+	0xce99, // Iota
+	0xce9a, // Kappa
+	0xce9b, // Lambda
+	0xce9c, // Mu
+	0xce9d, // Nu
+	0xce9e, // Xi
+	0xce9f, // Omicron
+	0xcea0, // Pi
+	0xcea1, // Rho
+	0xcea3, // Sigma
+	0xcea4, // Tau
+	0xcea5, // Upsilon
+	0xcea6, // Phi
+	0xcea7, // Chi
+	0xcea8, // Psi
+	0xcea9, // Omega
+
+	0xceb1, // alpha
+	0xceb2, // beta
+	0xceb3, // gamma
+	0xceb4, // delta
+	0xceb5, // epsilon
+	0xceb6, // zeta
+	0xceb7, // eta
+	0xceb8, // theta
+	0xceb9, // iota
+	0xceba, // kappa
+	0xcebb, // lambda
+	0xcebc, // mu
+	0xcebd, // nu
+	0xcebe, // xi
+	0xcebf, // omicron
+	0xcf80, // pi
+	0xcf81, // rho
+	0xcf83, // sigma
+	0xcf84, // tau
+	0xcf85, // upsilon
+	0xcf86, // phi
+	0xcf87, // chi
+	0xcf88, // psi
+	0xcf89, // omega
+
+	0xc4a7, // hbar
+};
+
+int
+fmt_symbol_fragment(char *s, int k)
+{
+	int c, i, n;
+	char *t;
+	for (i = 0; i < N; i++) {
+		t = symbol_name_tab[i];
+		n = (int) strlen(t);
+		if (strncmp(s + k, t, n) == 0)
+			break;
+	}
+	if (i == N) {
+		fmt_roman_char(s[k]);
+		return k + 1;
+	}
+	c = symbol_unicode_tab[i];
+	fmt_roman_char(c);
+	return k + n;
+}
 
 void
-emit_tensor(U *p)
+fmt_table(int x, int y, struct atom *p)
 {
-	int i, n, nrow, ncol;
-	int x, y;
-	int h, w;
-	int dx, dy;
-	int eh, ew;
-	int row, col;
-	if (p->u.tensor->ndim > 2) {
-		emit_flat_tensor(p);
-		return;
+	int cx, dx, i, j, m, n;
+	int column_width, elem_width, row_depth, row_height;
+	struct atom *d, *h, *w, *table;
+	n = VAL1(p);
+	m = VAL2(p);
+	p = cddr(p);
+	table = car(p);
+	h = cadr(p);
+	d = caddr(p);
+	for (i = 0; i < n; i++) { // for each row
+		row_height = VAL1(h);
+		row_depth = VAL1(d);
+		y += row_height;
+		dx = 0;
+		w = cadddr(p);
+		for (j = 0; j < m; j++) { // for each column
+			column_width = VAL1(w);
+			elem_width = WIDTH(car(table));
+			cx = x + dx + (column_width - elem_width) / 2; // center horizontal
+			fmt_draw(cx, y, car(table));
+			dx += column_width + TABLE_HSPACE;
+			table = cdr(table);
+			w = cdr(w);
+		}
+		y += row_depth + TABLE_VSPACE;
+		h = cdr(h);
+		d = cdr(d);
 	}
-	nrow = p->u.tensor->dim[0];
-	if (p->u.tensor->ndim == 2)
-		ncol = p->u.tensor->dim[1];
+}
+
+void
+fmt_tensor(struct atom *p)
+{
+	if (p->u.tensor->ndim % 2 == 1)
+		fmt_vector(p); // odd rank
 	else
-		ncol = 1;
-	n = nrow * ncol;
-	if (n > N) {
-		emit_flat_tensor(p);
+		fmt_matrix(p, 0, 0); // even rank
+}
+
+void
+fmt_term(struct atom *p)
+{
+	if (car(p) == symbol(MULTIPLY))
+		fmt_term_nib(p);
+	else
+		fmt_factor(p);
+}
+
+void
+fmt_term_nib(struct atom *p)
+{
+	if (count_denominators(p) > 0) {
+		fmt_frac(p);
 		return;
 	}
-	// horizontal coordinate of the matrix
-#if 0
-	emit_x += 2; // make space for left paren
-#endif
-	x = emit_x;
-	// emit each element
-	for (i = 0; i < n; i++) {
-		elem[i].index = yindex;
-		elem[i].x = emit_x;
-		emit_expr(p->u.tensor->elem[i]);
-		elem[i].count = yindex - elem[i].index;
-		get_size(elem[i].index, yindex, &elem[i].h, &elem[i].w, &elem[i].y);
+	// no denominators
+	p = cdr(p);
+	if (isminusone(car(p)) && !isdouble(car(p)))
+		p = cdr(p); // sign already emitted
+	fmt_factor(car(p));
+	p = cdr(p);
+	while (iscons(p)) {
+		fmt_space();
+		fmt_factor(car(p));
+		p = cdr(p);
 	}
-	// find element height and width
-	eh = 0;
-	ew = 0;
-	for (i = 0; i < n; i++) {
-		if (elem[i].h > eh)
-			eh = elem[i].h;
-		if (elem[i].w > ew)
-			ew = elem[i].w;
-	}
-	// this is the overall height of the matrix
-	h = nrow * eh + (nrow - 1) * SPACE_BETWEEN_ROWS;
-	// this is the overall width of the matrix
-	w = ncol * ew + (ncol - 1) * SPACE_BETWEEN_COLUMNS;
-	// this is the vertical coordinate of the matrix
-	y = -(h / 2);
-	// move elements around
-	for (row = 0; row < nrow; row++) {
-		for (col = 0; col < ncol; col++) {
-			i = row * ncol + col;
-			// first move to upper left corner of matrix
-			dx = x - elem[i].x;
-			dy = y - elem[i].y;
-			move(elem[i].index, elem[i].index + elem[i].count, dx, dy);
-			// now move to official position
-			dx = 0;
-			if (col > 0)
-				dx = col * (ew + SPACE_BETWEEN_COLUMNS);
-			dy = 0;
-			if (row > 0)
-				dy = row * (eh + SPACE_BETWEEN_ROWS);
-			// small correction for horizontal centering
-			dx += (ew - elem[i].w) / 2;
-			// small correction for vertical centering
-			dy += (eh - elem[i].h) / 2;
-			move(elem[i].index, elem[i].index + elem[i].count, dx, dy);
-		}
-	}
-	emit_x = x + w;
-#if 0
-	// left brace
-	for (i = 0; i < h; i++) {
-		if (yindex == YMAX)
-			break;
-		chartab[yindex].c = '|';
-		chartab[yindex].x = x - 2;
-		chartab[yindex].y = y + i;
-		yindex++;
-	}
-	// right brace
-	emit_x++;
-	for (i = 0; i < h; i++) {
-		if (yindex == YMAX)
-			break;
-		chartab[yindex].c = '|';
-		chartab[yindex].x = emit_x;
-		chartab[yindex].y = y + i;
-		yindex++;
-	}
-	emit_x++;
-#endif
 }
 
 void
-emit_flat_tensor(U *p)
+fmt_update_fraction(void)
 {
-	int k = 0;
-	emit_tensor_inner(p, 0, &k);
-}
-
-void
-emit_tensor_inner(U *p, int j, int *k)
-{
-	int i;
-	emit_char('(');
-	for (i = 0; i < p->u.tensor->dim[j]; i++) {
-		if (j + 1 == p->u.tensor->ndim) {
-			emit_expr(p->u.tensor->elem[*k]);
-			*k = *k + 1;
-		} else
-			emit_tensor_inner(p, j + 1, k);
-		if (i + 1 < p->u.tensor->dim[j])
-			emit_char(',');
-	}
-	emit_char(')');
-}
-
-//	take expr and push all constant subexpr
-
-//	p1	expr
-
-//	p2	independent variable (like x)
-
-void
-distill(void)
-{
+	int d, h, w;
 	save();
-	distill_nib();
-	restore();
-}
-
-void
-distill_nib(void)
-{
-	p2 = pop();
-	p1 = pop();
-	// is the entire expression constant?
-	if (find(p1, p2) == 0) {
-		push(p1);
-		//push(p1);	// may need later for pushing both +a, -a
-		//negate();
-		return;
-	}
-	// sum?
-	if (isadd(p1)) {
-		distill_sum();
-		return;
-	}
-	// product?
-	if (car(p1) == symbol(MULTIPLY)) {
-		distill_product();
-		return;
-	}
-	// naive distill if not sum or product
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		push(car(p3));
-		push(p2);
-		distill();
-		p3 = cdr(p3);
-	}
-}
-
-void
-distill_sum(void)
-{
-	int h;
-	// distill terms involving x
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		if (find(car(p3), p2)) {
-			push(car(p3));
-			push(p2);
-			distill();
-		}
-		p3 = cdr(p3);
-	}
-	// add together all constant terms
-	h = tos;
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		if (find(car(p3), p2) == 0)
-			push(car(p3));
-		p3 = cdr(p3);
-	}
-	if (tos - h) {
-		add_all(tos - h);
-		p3 = pop();
-		push(p3);
-		push(p3);
-		negate();	// need both +a, -a for some integrals
-	}
-}
-
-void
-distill_product(void)
-{
-	int h;
-	// distill factors involving x
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		if (find(car(p3), p2)) {
-			push(car(p3));
-			push(p2);
-			distill();
-		}
-		p3 = cdr(p3);
-	}
-	// multiply together all constant factors
-	h = tos;
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		if (find(car(p3), p2) == 0)
-			push(car(p3));
-		p3 = cdr(p3);
-	}
-	if (tos - h) {
-		multiply_all(tos - h);
-		//p3 = pop();	// may need later for pushing both +a, -a
-		//push(p3);
-		//push(p3);
-		//negate();
-	}
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Generate all divisors of a term
-//
-//	Input:		Term on stack (factor * factor * ...)
-//
-//	Output:		Divisors on stack
-//
-//-----------------------------------------------------------------------------
-
-void
-divisors(void)
-{
-	int i, h, n;
-	save();
-	h = tos - 1;
-	divisors_onstack();
-	n = tos - h;
-	qsort(stack + h, n, sizeof (U *), divisors_cmp);
-	p1 = alloc_tensor(n);
-	p1->u.tensor->ndim = 1;
-	p1->u.tensor->dim[0] = n;
-	for (i = 0; i < n; i++)
-		p1->u.tensor->elem[i] = stack[h + i];
-	tos = h;
+	p2 = pop(); // denominator
+	p1 = pop(); // numerator
+	h = HEIGHT(p1) + DEPTH(p1);
+	d = HEIGHT(p2) + DEPTH(p2);
+	w = MAX(WIDTH(p1), WIDTH(p2));
+	h += 1;
+	w += 2;
+	push_double(EMIT_FRACTION);
+	push_double(h);
+	push_double(d);
+	push_double(w);
 	push(p1);
-	restore();
-}
-
-void
-divisors_onstack(void)
-{
-	int h, i, k, n;
-	save();
-	p1 = pop();
-	h = tos;
-	// push all of the term's factors
-	if (isnum(p1)) {
-		push(p1);
-		factor_small_number();
-	} else if (car(p1) == symbol(ADD)) {
-		push(p1);
-		factor_add();
-//printf(">>>\n");
-//for (i = h; i < tos; i++)
-//print(stdout, stack[i]);
-//printf("<<<\n");
-	} else if (car(p1) == symbol(MULTIPLY)) {
-		p1 = cdr(p1);
-		if (isnum(car(p1))) {
-			push(car(p1));
-			factor_small_number();
-			p1 = cdr(p1);
-		}
-		while (iscons(p1)) {
-			p2 = car(p1);
-			if (car(p2) == symbol(POWER)) {
-				push(cadr(p2));
-				push(caddr(p2));
-			} else {
-				push(p2);
-				push(one);
-			}
-			p1 = cdr(p1);
-		}
-	} else if (car(p1) == symbol(POWER)) {
-		push(cadr(p1));
-		push(caddr(p1));
-	} else {
-		push(p1);
-		push(one);
-	}
-	k = tos;
-	// contruct divisors by recursive descent
-	push(one);
-	gen(h, k);
-	// move
-	n = tos - k;
-	for (i = 0; i < n; i++)
-		stack[h + i] = stack[k + i];
-	tos = h + n;
-	restore();
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Generate divisors
-//
-//	Input:		Base-exponent pairs on stack
-//
-//			h	first pair
-//
-//			k	just past last pair
-//
-//	Output:		Divisors on stack
-//
-//	For example, factor list 2 2 3 1 results in 6 divisors,
-//
-//		1
-//		3
-//		2
-//		6
-//		4
-//		12
-//
-//-----------------------------------------------------------------------------
-
-#undef ACCUM
-#undef BASE
-#undef EXPO
-
-#define ACCUM p1
-#define BASE p2
-#define EXPO p3
-
-void
-gen(int h, int k)
-{
-	int expo, i;
-	save();
-	ACCUM = pop();
-	if (h == k) {
-		push(ACCUM);
-		restore();
-		return;
-	}
-	BASE = stack[h + 0];
-	EXPO = stack[h + 1];
-	push(EXPO);
-	expo = pop_integer();
-	for (i = 0; i <= abs(expo); i++) {
-		push(ACCUM);
-		push(BASE);
-		push_integer(sign(expo) * i);
-		power();
-		multiply();
-		gen(h + 2, k);
-	}
-	restore();
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Factor ADD expression
-//
-//	Input:		Expression on stack
-//
-//	Output:		Factors on stack
-//
-//	Each factor consists of two expressions, the factor itself followed
-//	by the exponent.
-//
-//-----------------------------------------------------------------------------
-
-void
-factor_add(void)
-{
-	save();
-	p1 = pop();
-	// get gcd of all terms
-	p3 = cdr(p1);
-	push(car(p3));
-	p3 = cdr(p3);
-	while (iscons(p3)) {
-		push(car(p3));
-		gcd();
-		p3 = cdr(p3);
-	}
-	// check gcd
-	p2 = pop();
-	if (isplusone(p2)) {
-		push(p1);
-		push(one);
-		restore();
-		return;
-	}
-	// push factored gcd
-	if (isnum(p2)) {
-		push(p2);
-		factor_small_number();
-	} else if (car(p2) == symbol(MULTIPLY)) {
-		p3 = cdr(p2);
-		if (isnum(car(p3))) {
-			push(car(p3));
-			factor_small_number();
-		} else {
-			push(car(p3));
-			push(one);
-		}
-		p3 = cdr(p3);
-		while (iscons(p3)) {
-			push(car(p3));
-			push(one);
-			p3 = cdr(p3);
-		}
-	} else {
-		push(p2);
-		push(one);
-	}
-	// divide each term by gcd
 	push(p2);
-	inverse();
-	p2 = pop();
-	push(zero);
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		push(p2);
-		push(car(p3));
-		multiply();
-		add();
-		p3 = cdr(p3);
-	}
-	push(one);
+	list(6);
 	restore();
+}
+
+void
+fmt_update_list(int t)
+{
+	int d, h, i, w;
+	if (tos - t == 1)
+		return;
+	save();
+	h = 0;
+	d = 0;
+	w = 0;
+	for (i = t; i < tos; i++) {
+		p1 = stack[i];
+		h = MAX(h, HEIGHT(p1));
+		d = MAX(d, DEPTH(p1));
+		w += WIDTH(p1);
+	}
+	list(tos - t);
+	p1 = pop();
+	push_double(EMIT_LIST);
+	push_double(h);
+	push_double(d);
+	push_double(w);
+	push(p1);
+	list(5);
+	restore();
+}
+
+void
+fmt_update_subexpr(void)
+{
+	int d, h, w;
+	save();
+	p1 = pop();
+	h = HEIGHT(p1);
+	d = DEPTH(p1);
+	w = WIDTH(p1);
+	// delimiters have vertical symmetry (h - m == d + m, m = 1/2)
+	if (h > 1 || d > 0) {
+		h = MAX(h, d + 1) + 1; // plus extra
+		d = h - 1; // by symmetry
+	}
+	w += 2;
+	push_double(EMIT_SUBEXPR);
+	push_double(h);
+	push_double(d);
+	push_double(w);
+	push(p1);
+	list(5);
+	restore();
+}
+
+void
+fmt_update_subscript(void)
+{
+	int d, dx, dy, h, w;
+	save();
+	p1 = pop();
+	h = HEIGHT(p1);
+	d = DEPTH(p1);
+	w = WIDTH(p1);
+	dx = 0;
+	dy = 1;
+	push_double(EMIT_SUBSCRIPT);
+	push_double(h);
+	push_double(d + dy);
+	push_double(w);
+	push_double(dx);
+	push_double(dy);
+	push(p1);
+	list(7);
+	restore();
+}
+
+void
+fmt_update_superscript(void)
+{
+	int d, dx, dy, h, w, y;
+	save();
+	p2 = pop(); // exponent
+	p1 = pop(); // base
+	h = HEIGHT(p2);
+	d = DEPTH(p2);
+	w = WIDTH(p2);
+	// y is distance from baseline to bottom of superscript
+	y = HEIGHT(p1) - d - 1;
+	y = MAX(y, 1);
+	dx = 0;
+	dy = -(y + d);
+	h = y + h + d;
+	d = 0;
+	if (OPCODE(p1) == EMIT_SUBSCRIPT) {
+		dx = -WIDTH(p1);
+		w = MAX(0, w - WIDTH(p1));
+	}
+	push(p1); // base
+	push_double(EMIT_SUPERSCRIPT);
+	push_double(h);
+	push_double(d);
+	push_double(w);
+	push_double(dx);
+	push_double(dy);
+	push(p2);
+	list(7);
+	restore();
+}
+
+void
+fmt_update_table(int n, int m)
+{
+	int i, j, t;
+	int d, h, w;
+	int total_height, total_width;
+	save();
+	total_height = 0;
+	total_width = 0;
+	t = tos - n * m;
+	// height of each row
+	for (i = 0; i < n; i++) { // for each row
+		h = 0;
+		for (j = 0; j < m; j++) { // for each column
+			p1 = stack[t + i * m + j];
+			h = MAX(h, HEIGHT(p1));
+		}
+		push_double(h);
+		total_height += h;
+	}
+	list(n);
+	p2 = pop();
+	// depth of each row
+	for (i = 0; i < n; i++) { // for each row
+		d = 0;
+		for (j = 0; j < m; j++) { // for each column
+			p1 = stack[t + i * m + j];
+			d = MAX(d, DEPTH(p1));
+		}
+		push_double(d);
+		total_height += d;
+	}
+	list(n);
+	p3 = pop();
+	// width of each column
+	for (j = 0; j < m; j++) { // for each column
+		w = 0;
+		for (i = 0; i < n; i++) { // for each row
+			p1 = stack[t + i * m + j];
+			w = MAX(w, WIDTH(p1));
+		}
+		push_double(w);
+		total_width += w;
+	}
+	list(m);
+	p4 = pop();
+	// h, d, w for entire table centered vertical
+	total_height += (n - 1) * TABLE_VSPACE + 2; // +2 for delimiters
+	total_width += (m - 1) * TABLE_HSPACE + 4; // +4 for delimiters
+	h = total_height / 2 + 1;
+	d = total_height - h;
+	w = total_width;
+	list(n * m);
+	p1 = pop();
+	push_double(EMIT_TABLE);
+	push_double(h);
+	push_double(d);
+	push_double(w);
+	push_double(n);
+	push_double(m);
+	push(p1);
+	push(p2);
+	push(p3);
+	push(p4);
+	list(10);
+	restore();
+}
+
+void
+fmt_vector(struct atom *p)
+{
+	int i, n, span;
+	// compute element span
+	span = 1;
+	n = p->u.tensor->ndim;
+	for (i = 1; i < n; i++)
+		span *= p->u.tensor->dim[i];
+	n = p->u.tensor->dim[0]; // number of rows
+	for (i = 0; i < n; i++)
+		fmt_matrix(p, 1, i * span);
+	fmt_update_table(n, 1); // n rows, 1 column
 }
 
 int
-divisors_cmp(const void *p1, const void *p2)
+count_denominators(struct atom *p)
 {
-	return cmp_expr(*((U **) p1), *((U **) p2));
+	int n = 0;
+	p = cdr(p);
+	while (iscons(p)) {
+		if (isdenominator(car(p)))
+			n++;
+		p = cdr(p);
+	}
+	return n;
 }
 
-// power function for double precision floating point
+int
+isdenominator(struct atom *p)
+{
+	return car(p) == symbol(POWER) && isnegativenumber(caddr(p));
+}
 
 void
-dpow(void)
+fmt_draw(int x, int y, struct atom *p)
 {
-	double a, b, base, expo, result, theta;
-	expo = pop_double();
-	base = pop_double();
-	// divide by zero?
-	if (base == 0.0 && expo < 0.0)
-		stop("divide by zero");
-	// nonnegative base or integer power?
-	if (base >= 0.0 || fmod(expo, 1.0) == 0.0) {
-		result = pow(base, expo);
-		push_double(result);
-		return;
+	int d, dx, dy, h, i, k, w;
+	k = OPCODE(p);
+	h = HEIGHT(p);
+	d = DEPTH(p);
+	w = WIDTH(p);
+	p = cddddr(p);
+	switch (k) {
+	case EMIT_SPACE:
+		break;
+	case EMIT_CHAR:
+		fmt_draw_char(x, y, VAL1(p));
+		break;
+	case EMIT_LIST:
+		p = car(p);
+		while (iscons(p)) {
+			fmt_draw(x, y, car(p));
+			x += WIDTH(car(p));
+			p = cdr(p);
+		}
+		break;
+	case EMIT_SUPERSCRIPT:
+	case EMIT_SUBSCRIPT:
+		dx = VAL1(p);
+		dy = VAL2(p);
+		p = caddr(p);
+		fmt_draw(x + dx, y + dy, p);
+		break;
+	case EMIT_SUBEXPR:
+		fmt_draw_delims(x, y, h, d, w);
+		fmt_draw(x + 1, y, car(p));
+		break;
+	case EMIT_FRACTION:
+		// horizontal line
+		fmt_draw_char(x, y, BDLR);
+		for (i = 1; i < w - 1; i++)
+			fmt_draw_char(x + i, y, BDLH);
+		fmt_draw_char(x + w - 1, y, BDLL);
+		// numerator
+		dx = (w - WIDTH(car(p))) / 2;
+		dy = -h + HEIGHT(car(p));
+		fmt_draw(x + dx, y + dy, car(p));
+		// denominator
+		p = cdr(p);
+		dx = (w - WIDTH(car(p))) / 2;
+		dy = d - DEPTH(car(p));
+		fmt_draw(x + dx, y + dy, car(p));
+		break;
+	case EMIT_TABLE:
+		fmt_draw_delims(x, y, h, d, w);
+		fmt_draw_table(x + 2, y - h + 1, p);
+		break;
 	}
-	result = pow(fabs(base), expo);
-	theta = M_PI * expo;
-	// this ensures the real part is 0.0 instead of a tiny fraction
-	if (fmod(expo, 0.5) == 0.0) {
-		a = 0.0;
-		b = sin(theta);
-	} else {
-		a = cos(theta);
-		b = sin(theta);
-	}
-	push_double(a * result);
-	push_double(b * result);
-	push(imaginaryunit);
-	multiply();
-	add();
 }
 
-//-----------------------------------------------------------------------------
-//
+void
+fmt_draw_char(int x, int y, int c)
+{
+	if (x >= 0 && x < fmt_ncol && y >= 0 && y < fmt_nrow)
+		fmt_buf[y * fmt_ncol + x] = c;
+}
+
+void
+fmt_draw_delims(int x, int y, int h, int d, int w)
+{
+	if (h > 1 || d > 0) {
+		fmt_draw_ldelim(x, y, h, d, w);
+		fmt_draw_rdelim(x + w - 1, y, h, d, w);
+	} else {
+		fmt_draw_char(x, y, '(');
+		fmt_draw_char(x + w - 1, y, ')');
+	}
+}
+
+void
+fmt_draw_ldelim(int x, int y, int h, int d, int w)
+{
+	int i;
+	fmt_draw_char(x, y - h + 1, BDLDAR);
+	for (i = 1; i < h + d - 1; i++)
+		fmt_draw_char(x, y - h + 1 + i, BDLV);
+	fmt_draw_char(x, y + d, BDLUAR);
+}
+
+void
+fmt_draw_rdelim(int x, int y, int h, int d, int w)
+{
+	int i;
+	fmt_draw_char(x, y - h + 1, BDLDAL);
+	for (i = 1; i < h + d - 1; i++)
+		fmt_draw_char(x, y - h + 1 + i, BDLV);
+	fmt_draw_char(x, y + d, BDLUAL);
+}
+
+void
+fmt_draw_table(int x, int y, struct atom *p)
+{
+	int cx, dx, i, j, m, n;
+	int column_width, elem_width, row_depth, row_height;
+	struct atom *d, *h, *w, *table;
+	n = VAL1(p);
+	m = VAL2(p);
+	p = cddr(p);
+	table = car(p);
+	h = cadr(p);
+	d = caddr(p);
+	for (i = 0; i < n; i++) { // for each row
+		row_height = VAL1(h);
+		row_depth = VAL1(d);
+		y += row_height;
+		dx = 0;
+		w = cadddr(p);
+		for (j = 0; j < m; j++) { // for each column
+			column_width = VAL1(w);
+			elem_width = WIDTH(car(table));
+			cx = x + dx + (column_width - elem_width) / 2; // center horizontal
+			fmt_draw(cx, y, car(table));
+			dx += column_width + TABLE_HSPACE;
+			table = cdr(table);
+			w = cdr(w);
+		}
+		y += row_depth + TABLE_VSPACE;
+		h = cdr(h);
+		d = cdr(d);
+	}
+}
+
 //	Compute eigenvalues and eigenvectors
 //
 //	Input:		stack[tos - 1]		symmetric matrix
@@ -6865,8 +7019,6 @@ dpow(void)
 //		X = Q[1]
 //
 //		dot(A,X) - lambda X
-//
-//-----------------------------------------------------------------------------
 
 #undef D
 #undef Q
@@ -6883,11 +7035,11 @@ eval_eigen(void)
 	if (eigen_check_arg() == 0)
 		stop("eigen: argument is not a square matrix");
 	eigen(EIGEN);
-	p1 = usr_symbol("D");
+	p1 = lookup("D");
 	set_binding(p1, p2);
-	p1 = usr_symbol("Q");
+	p1 = lookup("Q");
 	set_binding(p1, p3);
-	push(symbol(NIL));
+	push_symbol(NIL);
 }
 
 void
@@ -6922,8 +7074,7 @@ eigen_check_arg(void)
 	int i, j;
 	push(cadr(p1));
 	eval();
-	yyfloat();
-	eval();
+	sfloat();
 	p1 = pop();
 	if (!istensor(p1))
 		return 0;
@@ -6941,15 +7092,11 @@ eigen_check_arg(void)
 	return 1;
 }
 
-//-----------------------------------------------------------------------------
-//
 //	Input:		p1		matrix
 //
 //	Output:		p2		eigenvalues
 //
 //			p3		eigenvectors
-//
-//-----------------------------------------------------------------------------
 
 void
 eigen(int op)
@@ -6958,10 +7105,10 @@ eigen(int op)
 	// malloc working vars
 	yydd = (double *) malloc(eigen_n * eigen_n * sizeof (double));
 	if (yydd == NULL)
-		stop("malloc failure");
+		malloc_kaput();
 	yyqq = (double *) malloc(eigen_n * eigen_n * sizeof (double));
 	if (yyqq == NULL)
-		stop("malloc failure");
+		malloc_kaput();
 	// initialize D
 	for (i = 0; i < eigen_n; i++) {
 		D(i, i) = p1->u.tensor->elem[eigen_n * i + i]->u.d;
@@ -6983,7 +7130,7 @@ eigen(int op)
 		if (step() == 0)
 			break;
 	if (i == 100)
-		printstr("\nnote: eigen did not converge\n");
+		printbuf("note: eigen did not converge\n", RED);
 	// p2 = D
 	if (op == EIGEN || op == EIGENVAL) {
 		push(p1);
@@ -7013,8 +7160,6 @@ eigen(int op)
 	free(yyqq);
 }
 
-//-----------------------------------------------------------------------------
-//
 //	Example: p = 1, q = 3
 //
 //		c	0	s	0
@@ -7091,7 +7236,7 @@ eigen(int op)
 //
 //	In other words, we just want to update components A[i,j] where i < j.
 //
-//-----------------------------------------------------------------------------
+//
 //
 //	Example: p = 2, q = 5
 //
@@ -7111,7 +7256,7 @@ eigen(int op)
 //
 //		i=6	.	A[6,2]	.	.	A[6,5]	.
 //
-//-----------------------------------------------------------------------------
+//
 //
 //	This is what B = GA does:
 //
@@ -7154,7 +7299,7 @@ eigen(int op)
 //		B[5,5] = c * A[5,5] - s * A[5,2]
 //		B[6,5] = c * A[6,5] - s * A[6,2]
 //
-//-----------------------------------------------------------------------------
+//
 //
 //	Step 1: Just do upper triangle (i < j), B[2,5] = 0
 //
@@ -7170,7 +7315,7 @@ eigen(int op)
 //
 //		B[5,6] = c * A[5,6] + s * A[2,6]
 //
-//-----------------------------------------------------------------------------
+//
 //
 //	Step 2: Transpose where i > j since A[i,j] == A[j,i]
 //
@@ -7186,7 +7331,7 @@ eigen(int op)
 //
 //		B[5,6] = c * A[5,6] + s * A[2,6]
 //
-//-----------------------------------------------------------------------------
+//
 //
 //	Step 3: Same as above except reorder
 //
@@ -7207,8 +7352,6 @@ eigen(int op)
 //
 //		A[2,6] = c * A[2,6] + s * A[5,6]
 //		A[5,6] = c * A[5,6] - s * A[2,6]
-//
-//-----------------------------------------------------------------------------
 
 int
 step(void)
@@ -7274,19 +7417,19 @@ eval_erf(void)
 {
 	push(cadr(p1));
 	eval();
-	yerf();
+	serf();
 }
 
 void
-yerf(void)
+serf(void)
 {
 	save();
-	yyerf();
+	serf_nib();
 	restore();
 }
 
 void
-yyerf(void)
+serf_nib(void)
 {
 	double d;
 	p1 = pop();
@@ -7306,7 +7449,6 @@ yyerf(void)
 	push_symbol(ERF);
 	push(p1);
 	list(2);
-	return;
 }
 
 void
@@ -7314,19 +7456,19 @@ eval_erfc(void)
 {
 	push(cadr(p1));
 	eval();
-	yerfc();
+	serfc();
 }
 
 void
-yerfc(void)
+serfc(void)
 {
 	save();
-	yyerfc();
+	serfc_nib();
 	restore();
 }
 
 void
-yyerfc(void)
+serfc_nib(void)
 {
 	double d;
 	p1 = pop();
@@ -7340,186 +7482,56 @@ yyerfc(void)
 	list(2);
 }
 
-// Evaluate an expression, for example...
-//
-//	push(p1)
-//	eval()
-//	p2 = pop()
-
 void
 eval(void)
 {
-	check_esc_flag();
 	save();
 	p1 = pop();
-	switch (p1->k) {
-	case CONS:
+	if (p1->k == CONS)
 		eval_cons();
-		break;
-	case NUM:
-		push(p1);
-		break;
-	case DOUBLE:
-		push(p1);
-		break;
-	case STR:
-		push(p1);
-		break;
-	case TENSOR:
+	else if (p1->k == KSYM)
+		eval_ksym();
+	else if (p1->k == USYM)
+		eval_usym();
+	else if (p1->k == TENSOR)
 		eval_tensor();
-		break;
-	case SYM:
-		eval_sym();
-		break;
-	default:
-		stop("atom?");
-		break;
-	}
+	else
+		push(p1); // rational, double, or string
 	restore();
-}
-
-void
-eval_sym(void)
-{
-	// bare keyword?
-	if (iskeyword(p1)) {
-		push(p1);
-		push(symbol(LAST));
-		list(2);
-		eval();
-		return;
-	}
-	// evaluate symbol's binding
-	p2 = get_binding(p1);
-	push(p2);
-	if (p1 != p2)
-		eval();
 }
 
 void
 eval_cons(void)
 {
-	if (!issymbol(car(p1)))
-		stop("cons?");
-	switch (symnum(car(p1))) {
-	case ABS:		eval_abs();		break;
-	case ADD:		eval_add();		break;
-	case ADJ:		eval_adj();		break;
-	case AND:		eval_and();		break;
-	case ARCCOS:		eval_arccos();		break;
-	case ARCCOSH:		eval_arccosh();		break;
-	case ARCSIN:		eval_arcsin();		break;
-	case ARCSINH:		eval_arcsinh();		break;
-	case ARCTAN:		eval_arctan();		break;
-	case ARCTANH:		eval_arctanh();		break;
-	case ARG:		eval_arg();		break;
-	case ATOMIZE:		eval_atomize();		break;
-	case BESSELJ:		eval_besselj();		break;
-	case BESSELY:		eval_bessely();		break;
-	case BINDING:		eval_binding();		break;
-	case BINOMIAL:		eval_binomial();	break;
-	case CEILING:		eval_ceiling();		break;
-	case CHECK:		eval_check();		break;
-	case CHOOSE:		eval_choose();		break;
-	case CIRCEXP:		eval_circexp();		break;
-	case CLOCK:		eval_clock();		break;
-	case COEFF:		eval_coeff();		break;
-	case COFACTOR:		eval_cofactor();	break;
-	case CONDENSE:		eval_condense();	break;
-	case CONJ:		eval_conj();		break;
-	case CONTRACT:		eval_contract();	break;
-	case COS:		eval_cos();		break;
-	case COSH:		eval_cosh();		break;
-	case DECOMP:		eval_decomp();		break;
-	case DEGREE:		eval_degree();		break;
-	case DEFINT:		eval_defint();		break;
-	case DENOMINATOR:	eval_denominator();	break;
-	case DERIVATIVE:	eval_derivative();	break;
-	case DET:		eval_det();		break;
-	case DIM:		eval_dim();		break;
-	case DISPLAY:		eval_print();		break;
-	case DIVISORS:		eval_divisors();	break;
-	case DO:		eval_do();		break;
-	case DOT:		eval_inner();		break;
-	case DRAW:		eval_draw();		break;
-	case EIGEN:		eval_eigen();		break;
-	case EIGENVAL:		eval_eigenval();	break;
-	case EIGENVEC:		eval_eigenvec();	break;
-	case ERF:		eval_erf();		break;
-	case ERFC:		eval_erfc();		break;
-	case EVAL:		eval_eval();		break;
-	case EXP:		eval_exp();		break;
-	case EXPAND:		eval_expand();		break;
-	case EXPCOS:		eval_expcos();		break;
-	case EXPSIN:		eval_expsin();		break;
-	case FACTOR:		eval_factor();		break;
-	case FACTORIAL:		eval_factorial();	break;
-	case FACTORPOLY:	eval_factorpoly();	break;
-	case FILTER:		eval_filter();		break;
-	case FLOATF:		eval_float();		break;
-	case FLOOR:		eval_floor();		break;
-	case FOR:		eval_for();		break;
-	case GCD:		eval_gcd();		break;
-	case HERMITE:		eval_hermite();		break;
-	case HILBERT:		eval_hilbert();		break;
-	case IMAG:		eval_imag();		break;
-	case INDEX:		eval_index();		break;
-	case INNER:		eval_inner();		break;
-	case INTEGRAL:		eval_integral();	break;
-	case INV:		eval_inv();		break;
-	case INVG:		eval_invg();		break;
-	case ISINTEGER:		eval_isinteger();	break;
-	case ISPRIME:		eval_isprime();		break;
-	case LAGUERRE:		eval_laguerre();	break;
-	case LCM:		eval_lcm();		break;
-	case LEADING:		eval_leading();		break;
-	case LEGENDRE:		eval_legendre();	break;
-	case LOG:		eval_log();		break;
-	case MAG:		eval_mag();		break;
-	case MOD:		eval_mod();		break;
-	case MULTIPLY:		eval_multiply();	break;
-	case NOT:		eval_not();		break;
-	case NROOTS:		eval_nroots();		break;
-	case NUMBER:		eval_number();		break;
-	case NUMERATOR:		eval_numerator();	break;
-	case OPERATOR:		eval_operator();	break;
-	case OR:		eval_or();		break;
-	case OUTER:		eval_outer();		break;
-	case POLAR:		eval_polar();		break;
-	case POWER:		eval_power();		break;
-	case PRIME:		eval_prime();		break;
-	case PRINT:		eval_print();		break;
-	case PRODUCT:		eval_product();		break;
-	case QUOTE:		eval_quote();		break;
-	case QUOTIENT:		eval_quotient();	break;
-	case RANK:		eval_rank();		break;
-	case RATIONALIZE:	eval_rationalize();	break;
-	case REAL:		eval_real();		break;
-	case YYRECT:		eval_rect();		break;
-	case ROOTS:		eval_roots();		break;
-	case SETQ:		eval_setq();		break;
-	case SGN:		eval_sgn();		break;
-	case SIMPLIFY:		eval_simplify();	break;
-	case SIN:		eval_sin();		break;
-	case SINH:		eval_sinh();		break;
-	case SQRT:		eval_sqrt();		break;
-	case STOP:		eval_stop();		break;
-	case SUBST:		eval_subst();		break;
-	case SUM:		eval_sum();		break;
-	case TAN:		eval_tan();		break;
-	case TANH:		eval_tanh();		break;
-	case TAYLOR:		eval_taylor();		break;
-	case TEST:		eval_test();		break;
-	case TESTEQ:		eval_testeq();		break;
-	case TESTGE:		eval_testge();		break;
-	case TESTGT:		eval_testgt();		break;
-	case TESTLE:		eval_testle();		break;
-	case TESTLT:		eval_testlt();		break;
-	case TRANSPOSE:		eval_transpose();	break;
-	case UNIT:		eval_unit();		break;
-	case ZERO:		eval_zero();		break;
-	default:		eval_user_function();	break;
-	}
+	if (car(p1)->k == KSYM)
+		car(p1)->u.ksym.func(); // call through function pointer
+	else if (car(p1)->k == USYM)
+		eval_user_function();
+	else
+		push(p1); // not evaluated
+}
+
+// bare keyword
+
+void
+eval_ksym(void)
+{
+	push(p1);
+	push_symbol(LAST); // default arg
+	list(2);
+	p1 = pop();
+	car(p1)->u.ksym.func(); // call through function pointer
+}
+
+// evaluate symbol's binding
+
+void
+eval_usym(void)
+{
+	p2 = get_binding(p1);
+	push(p2);
+	if (p1 != p2)
+		eval();
 }
 
 void
@@ -7528,60 +7540,23 @@ eval_binding(void)
 	push(get_binding(cadr(p1)));
 }
 
-// checks a predicate, i.e. check(A = B)
-
 void
-eval_check(void)
+eval_clear(void)
 {
-	push(cadr(p1));
-	eval_predicate();
-	p1 = pop();
-	if (iszero(p1))
-		stop("check(arg): arg is zero");
-	push(symbol(NIL)); // no result is printed
-}
-
-void
-eval_det(void)
-{
-	push(cadr(p1));
-	eval();
-	det();
-}
-
-void
-eval_dim(void)
-{
-	int n;
-	push(cadr(p1));
-	eval();
-	p2 = pop();
-	if (iscons(cddr(p1))) {
-		push(caddr(p1));
-		eval();
-		n = pop_integer();
-	} else
-		n = 1;
-	if (!istensor(p2))
-		push_integer(1); // dim of scalar is 1
-	else if (n < 1 || n > p2->u.tensor->ndim)
-		push(p1);
-	else
-		push_integer(p2->u.tensor->dim[n - 1]);
-}
-
-void
-eval_divisors(void)
-{
-	push(cadr(p1));
-	eval();
-	divisors();
+	save_binding(symbol(TRACE));
+	save_binding(symbol(TTY));
+	clear_symbols();
+	run_init_script();
+	gc(); // garbage collection
+	restore_binding(symbol(TTY));
+	restore_binding(symbol(TRACE));
+	push_symbol(NIL); // result
 }
 
 void
 eval_do(void)
 {
-	push(car(p1));
+	push_integer(0);
 	p1 = cdr(p1);
 	while (iscons(p1)) {
 		pop();
@@ -7611,127 +7586,9 @@ eval_eval(void)
 }
 
 void
-eval_exp(void)
+eval_nil(void)
 {
-	push(cadr(p1));
-	eval();
-	exponential();
-}
-
-void
-eval_factorial(void)
-{
-	push(cadr(p1));
-	eval();
-	factorial();
-}
-
-void
-eval_factorpoly(void)
-{
-	p1 = cdr(p1);
-	push(car(p1));
-	eval();
-	p1 = cdr(p1);
-	push(car(p1));
-	eval();
-	factorpoly();
-	p1 = cdr(p1);
-	while (iscons(p1)) {
-		push(car(p1));
-		eval();
-		factorpoly();
-		p1 = cdr(p1);
-	}
-}
-
-void
-eval_hermite(void)
-{
-	push(cadr(p1));
-	eval();
-	push(caddr(p1));
-	eval();
-	hermite();
-}
-
-void
-eval_hilbert(void)
-{
-	push(cadr(p1));
-	eval();
-	hilbert();
-}
-
-void
-eval_index(void)
-{
-	int h;
-	h = tos;
-	p1 = cdr(p1);
-	while (iscons(p1)) {
-		push(car(p1));
-		eval();
-		p1 = cdr(p1);
-	}
-	index_function(tos - h);
-}
-
-void
-eval_inv(void)
-{
-	push(cadr(p1));
-	eval();
-	inv();
-}
-
-void
-eval_invg(void)
-{
-	push(cadr(p1));
-	eval();
-	invg();
-}
-
-void
-eval_isinteger(void)
-{
-	int n;
-	push(cadr(p1));
-	eval();
-	p1 = pop();
-	if (isrational(p1)) {
-		if (isinteger(p1))
-			push(one);
-		else
-			push(zero);
-		return;
-	}
-	if (isdouble(p1)) {
-		n = (int) p1->u.d;
-		if (n == p1->u.d)
-			push(one);
-		else
-			push(zero);
-		return;
-	}
-	push_symbol(ISINTEGER);
-	push(p1);
-	list(2);
-}
-
-void
-eval_multiply(void)
-{
-	push(cadr(p1));
-	eval();
-	p1 = cddr(p1);
-	while (iscons(p1)) {
-		push(car(p1));
-		eval();
-		multiply();
-		p1 = cdr(p1);
-	}
+	push_symbol(NIL);
 }
 
 void
@@ -7740,110 +7597,16 @@ eval_number(void)
 	push(cadr(p1));
 	eval();
 	p1 = pop();
-	if (p1->k == NUM || p1->k == DOUBLE)
+	if (isnum(p1))
 		push_integer(1);
 	else
 		push_integer(0);
 }
 
 void
-eval_operator(void)
-{
-	int h = tos;
-	push_symbol(OPERATOR);
-	p1 = cdr(p1);
-	while (iscons(p1)) {
-		push(car(p1));
-		eval();
-		p1 = cdr(p1);
-	}
-	list(tos - h);
-}
-
-void
-eval_print(void)
-{
-	p1 = cdr(p1);
-	while (iscons(p1)) {
-		push(car(p1));
-		eval_and_print_result(0);
-		p1 = cdr(p1);
-	}
-	push(symbol(NIL));
-}
-
-void
 eval_quote(void)
 {
 	push(cadr(p1));
-}
-
-void
-eval_rank(void)
-{
-	push(cadr(p1));
-	eval();
-	p1 = pop();
-	if (istensor(p1))
-		push_integer(p1->u.tensor->ndim);
-	else
-		push(zero);
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Example: a[1] = b
-//
-//	p1	*-------*-----------------------*
-//		|	|			|
-//		setq	*-------*-------*	b
-//			|	|	|
-//			index	a	1
-//
-//	cadadr(p1) -> a
-//
-//-----------------------------------------------------------------------------
-
-void
-setq_indexed(void)
-{
-	int h;
-	p4 = cadadr(p1);
-	if (!issymbol(p4))
-		stop("indexed assignment: error in symbol");
-	h = tos;
-	push(caddr(p1));
-	eval();
-	p2 = cdadr(p1);
-	while (iscons(p2)) {
-		push(car(p2));
-		eval();
-		p2 = cdr(p2);
-	}
-	set_component(tos - h);
-	p3 = pop();
-	set_binding(p4, p3);
-	push(symbol(NIL));
-}
-
-void
-eval_setq(void)
-{
-	if (caadr(p1) == symbol(INDEX)) {
-		setq_indexed();
-		return;
-	}
-	if (iscons(cadr(p1))) {
-		define_user_function();
-		return;
-	}
-	if (!issymbol(cadr(p1)))
-		stop("symbol assignment: error in symbol");
-	push(caddr(p1));
-	eval();
-	p2 = pop();
-	set_binding(cadr(p1), p2);
-	push(symbol(NIL));
 }
 
 void
@@ -7858,7 +7621,7 @@ eval_sqrt(void)
 void
 eval_stop(void)
 {
-	stop("user stop");
+	stop("stop function");
 }
 
 void
@@ -7875,132 +7638,34 @@ eval_subst(void)
 }
 
 void
-eval_unit(void)
+expand_expr(void)
 {
-	int i, n;
+	expanding++;
+	eval();
+	expanding--;
+}
+
+void
+eval_exp(void)
+{
 	push(cadr(p1));
 	eval();
-	n = pop_integer();
-	if (n < 2) {
-		push(p1);
-		return;
-	}
-	p1 = alloc_tensor(n * n);
-	p1->u.tensor->ndim = 2;
-	p1->u.tensor->dim[0] = n;
-	p1->u.tensor->dim[1] = n;
-	for (i = 0; i < n; i++)
-		p1->u.tensor->elem[n * i + i] = one;
-	push(p1);
+	exponential();
 }
 
 void
-eval_noexpand(void)
+exponential(void)
 {
-	int x = expanding;
-	expanding = 0;
-	eval();
-	expanding = x;
+	push_symbol(EXP1);
+	swap();
+	power();
 }
-
-// like eval() except "=" is evaluated as "=="
-
-void
-eval_predicate(void)
-{
-	save();
-	p1 = pop();
-	if (car(p1) == symbol(SETQ))
-		eval_testeq();
-	else {
-		push(p1);
-		eval();
-	}
-	restore();
-}
-
-void
-eval_and_print_result(int update)
-{
-	save();
-	p1 = pop();
-	push(p1);
-	eval();
-	p2 = pop();
-	// "draw", "for" and "setq" return "nil", there is no result to print
-	if (p2 == symbol(NIL)) {
-		restore();
-		return;
-	}
-	if (!iszero(get_binding(symbol(BAKE)))) {
-		push(p2);
-		bake();
-		p2 = pop();
-	}
-	if (update)
-		set_binding(symbol(LAST), p2);
-	// print string result in small font
-	if (isstr(p2)) {
-		printstr(p2->u.str);
-		printstr("\n");
-		restore();
-		return;
-	}
-	// If we evaluated the symbol "i" or "j" and the result was sqrt(-1)
-	// then don't do anything.
-	// Otherwise if "j" is an imaginary unit then subst.
-	// Otherwise if "i" is an imaginary unit then subst.
-	if ((p1 == symbol(SYMBOL_I) || p1 == symbol(SYMBOL_J)) && isimaginaryunit(p2))
-		;
-	else if (isimaginaryunit(get_binding(symbol(SYMBOL_J)))) {
-		push(p2);
-		push(imaginaryunit);
-		push_symbol(SYMBOL_J);
-		subst();
-		p2 = pop();
-	} else if (isimaginaryunit(get_binding(symbol(SYMBOL_I)))) {
-		push(p2);
-		push(imaginaryunit);
-		push_symbol(SYMBOL_I);
-		subst();
-		p2 = pop();
-	}
-	// if we evaluated the symbol "a" and got "b" then print "a=b"
-	// do not print "a=a"
-	if (issymbol(p1) && !iskeyword(p1) && p1 != p2) {
-		push(symbol(SETQ));
-		push(p1);
-		push(p2);
-		list(3);
-		p2 = pop();
-	}
-	if (equaln(get_binding(symbol(TTY)), 1))
-		print(p2);
-	else {
-		push(p2);
-		cmdisplay();
-	}
-	restore();
-}
-
-// Partial fraction expansion
-//
-// Example
-//
-//      expand(1/(x^3+x^2),x)
-//
-//        1      1       1
-//      ---- - --- + -------
-//        2     x     x + 1
-//       x
 
 void
 eval_expand(void)
 {
-	// 1st arg
 	push(cadr(p1));
 	eval();
-	// 2nd arg
 	push(caddr(p1));
 	eval();
 	p2 = pop();
@@ -8032,6 +7697,7 @@ eval_expand(void)
 void
 expand(void)
 {
+	int h;
 	save();
 	X = pop();
 	F = pop();
@@ -8042,15 +7708,15 @@ expand(void)
 	}
 	// if sum of terms then sum over the expansion of each term
 	if (car(F) == symbol(ADD)) {
-		push_integer(0);
+		h = tos;
 		p1 = cdr(F);
 		while (iscons(p1)) {
 			push(car(p1));
 			push(X);
 			expand();
-			add();
 			p1 = cdr(p1);
 		}
+		add_terms(tos - h);
 		restore();
 		return;
 	}
@@ -8087,6 +7753,16 @@ expand(void)
 	push(X);
 	factorpoly();
 	A = pop();
+	// remove numeric factor if there is one
+	if (car(A) == symbol(MULTIPLY) && isnum(cadr(A))) {
+		push(cadr(A)); // save numeric factor on stack
+		push(cadr(A));
+		reciprocate();
+		push(A);
+		multiply_noexpand(); // remove numeric factor
+		A = pop();
+	} else
+		push_integer(1); // numeric factor on stack
 	expand_get_C();
 	expand_get_B();
 	expand_get_A();
@@ -8104,6 +7780,8 @@ expand(void)
 		push(A);
 		multiply();
 	}
+	swap();
+	divide(); // divide by numeric factor
 	push(Q);
 	add();
 	restore();
@@ -8143,7 +7821,7 @@ remove_negative_exponents(void)
 			continue;
 		push(caddr(p1));
 		k = pop_integer();
-		if (k == (int) 0x80000000)
+		if (k == ERR)
 			continue;
 		if (k < j)
 			j = k;
@@ -8227,7 +7905,7 @@ void
 expand_get_C(void)
 {
 	int h, i, j, n;
-	U **a;
+	struct atom **a;
 	h = tos;
 	if (car(A) == symbol(MULTIPLY)) {
 		p1 = cdr(A);
@@ -8389,7 +8067,7 @@ trivial_divide(void)
 			}
 			p0 = cdr(p0);
 		}
-		multiply_all(tos - h);
+		multiply_factors(tos - h);
 	} else
 		push_integer(1);
 	T = pop();
@@ -8550,13 +8228,23 @@ expsin(void)
 	restore();
 }
 
-// factor a polynomial or integer
-
 void
 eval_factor(void)
 {
 	push(cadr(p1));
 	eval();
+	p2 = pop();
+	if (isrational(p2)) {
+		push(p2);
+		factor_rational();
+		return;
+	}
+	if (isdouble(p2)) {
+		convert_double_to_rational(p2->u.d);
+		factor_rational();
+		return;
+	}
+	push(p2);
 	push(caddr(p1));
 	eval();
 	p2 = pop();
@@ -8564,7 +8252,7 @@ eval_factor(void)
 		guess();
 	else
 		push(p2);
-	factor();
+	factorpoly();
 	// more factoring?
 	p1 = cdddr(p1);
 	while (iscons(p1)) {
@@ -8598,7 +8286,7 @@ factor_again(void)
 	}
 	n = tos - h;
 	if (n > 1)
-		multiply_all_noexpand(n);
+		multiply_factors_noexpand(n);
 	restore();
 }
 
@@ -8620,18 +8308,53 @@ factor_term(void)
 }
 
 void
-factor(void)
+factor_rational(void)
 {
+	int h, i, n, t;
 	save();
-	p2 = pop();
 	p1 = pop();
-	if (isinteger(p1)) {
-		push(p1);
-		factor_number(); // see pollard.cpp
-	} else {
-		push(p1);
+	h = tos;
+	// factor numerator
+	push(p1);
+	numerator();
+	p2 = pop();
+	if (!isplusone(p2)) {
 		push(p2);
-		factorpoly();
+		factor_number();
+	}
+	// factor denominator
+	push(p1);
+	denominator();
+	p2 = pop();
+	if (!isplusone(p2)) {
+		t = tos;
+		push(p2);
+		factor_number();
+		for (i = t; i < tos; i++) {
+			p2 = stack[i];
+			if (car(p2) == symbol(POWER)) {
+				push_symbol(POWER);
+				push(cadr(p2)); // base
+				push(caddr(p2)); // exponent
+				negate();
+				list(3);
+			} else {
+				push_symbol(POWER);
+				push(p2); // base
+				push_integer(-1); // exponent
+				list(3);
+			}
+			stack[i] = pop();
+		}
+	}
+	n = tos - h;
+	if (n == 0)
+		push(one);
+	else if (n > 1) {
+		list(n);
+		push_symbol(MULTIPLY);
+		swap();
+		cons(); // make MULTIPLY head of list
 	}
 	restore();
 }
@@ -8641,25 +8364,25 @@ factor(void)
 void
 factor_small_number(void)
 {
-	int d, expo, i, n;
+	int d, k, m, n;
 	save();
 	n = pop_integer();
-	if (n == (int) 0x80000000)
+	if (n == ERR)
 		stop("number too big to factor");
 	if (n < 0)
 		n = -n;
-	for (i = 0; i < MAXPRIMETAB; i++) {
-		d = primetab[i];
-		if (d > n / d)
-			break;
-		expo = 0;
+	for (k = 0; k < MAXPRIMETAB; k++) {
+		d = primetab[k];
+		if (n / d < d)
+			break; // n is 1 or prime
+		m = 0;
 		while (n % d == 0) {
 			n /= d;
-			expo++;
+			m++;
 		}
-		if (expo) {
+		if (m) {
 			push_integer(d);
-			push_integer(expo);
+			push_integer(m);
 		}
 	}
 	if (n > 1) {
@@ -8669,173 +8392,166 @@ factor_small_number(void)
 	restore();
 }
 
-extern void bignum_factorial(int);
+#undef FARG
+#undef BASE
+#undef EXPO
+#undef P
+
+#define FARG p1
+#define BASE p2
+#define EXPO p3
+#define P p4
+
+// factors N or N^M where N and M are rational numbers, returns factors on stack
+
+void
+factor_factor(void)
+{
+	save();
+	factor_factor_nib();
+	restore();
+}
+
+void
+factor_factor_nib(void)
+{
+	uint32_t *numer, *denom;
+	FARG = pop();
+	if (car(FARG) == symbol(POWER)) {
+		BASE = cadr(FARG);
+		EXPO = caddr(FARG);
+		if (BASE->k != RATIONAL || EXPO->k != RATIONAL) {
+			push(FARG);
+			return;
+		}
+		if (equaln(BASE, -1)) {
+			push(FARG); // -1 to the M
+			return;
+		}
+		if (BASE->sign == MMINUS) {
+			push_symbol(POWER);
+			push_integer(-1);
+			push(EXPO);
+			list(3); // leave on stack
+		}
+		numer = BASE->u.q.a;
+		denom = BASE->u.q.b;
+		if (!MEQUAL(numer, 1))
+			factor_bignum(numer);
+		if (!MEQUAL(denom, 1)) {
+			// flip sign of exponent
+			push(EXPO);
+			negate();
+			EXPO = pop();
+			factor_bignum(denom);
+		}
+		return;
+	}
+	if (FARG->k != RATIONAL || iszero(FARG) || isplusone(FARG) || isminusone(FARG)) {
+		push(FARG);
+		return;
+	}
+	if (FARG->sign == MMINUS)
+		push_integer(-1);
+	numer = FARG->u.q.a;
+	denom = FARG->u.q.b;
+	if (!MEQUAL(numer, 1)) {
+		EXPO = one;
+		factor_bignum(numer);
+	}
+	if (!MEQUAL(denom, 1)) {
+		EXPO = minusone;
+		factor_bignum(denom);
+	}
+}
+
+void
+factor_bignum(uint32_t *a)
+{
+	int d, k, m;
+	uint32_t n;
+	if (MLENGTH(a) > 1) {
+		// too big to factor
+		push_rational_number(MPLUS, mcopy(a), mint(1));
+		if (!equaln(EXPO, 1)) {
+			push_symbol(POWER);
+			swap();
+			push(EXPO);
+			list(3);
+		}
+		return;
+	}
+	n = a[0];
+	for (k = 0; k < MAXPRIMETAB; k++) {
+		d = primetab[k];
+		if (n / d < d)
+			break; // n is 1 or prime
+		m = 0;
+		while (n % d == 0) {
+			n /= d;
+			m++;
+		}
+		if (m == 0)
+			continue;
+		push_rational_number(MPLUS, mint(d), mint(1));
+		push_integer(m);
+		push(EXPO);
+		multiply();
+		P = pop();
+		if (!equaln(P, 1)) {
+			push_symbol(POWER);
+			swap();
+			push(P);
+			list(3);
+		}
+	}
+	if (n > 1) {
+		push_rational_number(MPLUS, mint(n), mint(1));
+		if (!equaln(EXPO, 1)) {
+			push_symbol(POWER);
+			swap();
+			push(EXPO);
+			list(3);
+		}
+	}
+}
+
+void
+eval_factorial(void)
+{
+	push(cadr(p1));
+	eval();
+	factorial();
+}
 
 void
 factorial(void)
 {
-	int n;
 	save();
+	factorial_nib();
+	restore();
+}
+
+void
+factorial_nib(void)
+{
+	int n;
 	p1 = pop();
 	push(p1);
 	n = pop_integer();
-	if (n < 0 || n == (int) 0x80000000) {
+	if (n < 0) {
 		push_symbol(FACTORIAL);
 		push(p1);
 		list(2);
-		restore();
 		return;
 	}
 	bignum_factorial(n);
-	restore();
+	if (isdouble(p1))
+		bignum_float();
 }
-
-void sfac_product(void);
-void sfac_product_f(U **, int, int);
-
-// simplification rules for factorials (m < n)
-//
-//	(e + 1) * factorial(e)	->	factorial(e + 1)
-//
-//	factorial(e) / e	->	factorial(e - 1)
-//
-//	e / factorial(e)	->	1 / factorial(e - 1)
-//
-//	factorial(e + n)
-//	----------------	->	(e + m + 1)(e + m + 2)...(e + n)
-//	factorial(e + m)
-//
-//	factorial(e + m)                               1
-//	----------------	->	--------------------------------
-//	factorial(e + n)		(e + m + 1)(e + m + 2)...(e + n)
-
-void
-simplifyfactorials(void)
-{
-	int x;
-	save();
-	x = expanding;
-	expanding = 0;
-	p1 = pop();
-	if (car(p1) == symbol(ADD)) {
-		push(zero);
-		p1 = cdr(p1);
-		while (iscons(p1)) {
-			push(car(p1));
-			simplifyfactorials();
-			add();
-			p1 = cdr(p1);
-		}
-		expanding = x;
-		restore();
-		return;
-	}
-	if (car(p1) == symbol(MULTIPLY)) {
-		sfac_product();
-		expanding = x;
-		restore();
-		return;
-	}
-	push(p1);
-	expanding = x;
-	restore();
-}
-
-void
-sfac_product(void)
-{
-	int i, j, n;
-	U **s;
-	s = stack + tos;
-	p1 = cdr(p1);
-	n = 0;
-	while (iscons(p1)) {
-		push(car(p1));
-		p1 = cdr(p1);
-		n++;
-	}
-	for (i = 0; i < n - 1; i++) {
-		if (s[i] == symbol(NIL))
-			continue;
-		for (j = i + 1; j < n; j++) {
-			if (s[j] == symbol(NIL))
-				continue;
-			sfac_product_f(s, i, j);
-		}
-	}
-	push(one);
-	for (i = 0; i < n; i++) {
-		if (s[i] == symbol(NIL))
-			continue;
-		push(s[i]);
-		multiply();
-	}
-	p1 = pop();
-	tos -= n;
-	push(p1);
-}
-
-void
-sfac_product_f(U **s, int a, int b)
-{
-	int i, n;
-	p1 = s[a];
-	p2 = s[b];
-	if (ispower(p1)) {
-		p3 = caddr(p1);
-		p1 = cadr(p1);
-	} else
-		p3 = one;
-	if (ispower(p2)) {
-		p4 = caddr(p2);
-		p2 = cadr(p2);
-	} else
-		p4 = one;
-	if (isfactorial(p1) && isfactorial(p2)) {
-		// Determine if the powers cancel.
-		push(p3);
-		push(p4);
-		add();
-		yyexpand();
-		n = pop_integer();
-		if (n != 0)
-			return;
-		// Find the difference between the two factorial args.
-		// For example, the difference between (a + 2)! and a! is 2.
-		push(cadr(p1));
-		push(cadr(p2));
-		subtract();
-		yyexpand(); // to simplify
-		n = pop_integer();
-		if (n == 0 || n == (int) 0x80000000)
-			return;
-		if (n < 0) {
-			n = -n;
-			p5 = p1;
-			p1 = p2;
-			p2 = p5;
-			p5 = p3;
-			p3 = p4;
-			p4 = p5;
-		}
-		push(one);
-		for (i = 1; i <= n; i++) {
-			push(cadr(p2));
-			push_integer(i);
-			add();
-			push(p3);
-			power();
-			multiply();
-		}
-		s[a] = pop();
-		s[b] = symbol(NIL);
-	}
-}
-
-// Factor a polynomial
 
 int expo;
-U **polycoeff;
+struct atom **polycoeff;
 
 #undef POLY
 #undef X
@@ -8878,30 +8594,24 @@ factorpoly(void)
 	}
 	push(p1);
 	push(p2);
-	yyfactorpoly();
+	factorpoly_nib();
 	restore();
 }
 
-//-----------------------------------------------------------------------------
-//
 //	Input:		tos-2		true polynomial
 //
 //			tos-1		free variable
 //
 //	Output:		factored polynomial on stack
-//
-//-----------------------------------------------------------------------------
 
 void
-yyfactorpoly(void)
+factorpoly_nib(void)
 {
 	int h, i;
 	save();
 	X = pop();
 	POLY = pop();
 	h = tos;
-	if (isfloating(POLY))
-		stop("floating point numbers in polynomial");
 	polycoeff = stack + tos;
 	push(POLY);
 	push(X);
@@ -8923,27 +8633,16 @@ yyfactorpoly(void)
 		push(B);
 		add();
 		YFACTOR = pop();
-		// factor out negative sign (not req'd because A > 1)
-#if 0
-		if (isnegativeterm(A)) {
-			push(FACTOR);
-			negate();
-			FACTOR = pop();
-			push(RESULT);
-			negate_noexpand();
-			RESULT = pop();
-		}
-#endif
 		push(RESULT);
 		push(YFACTOR);
 		multiply_noexpand();
 		RESULT = pop();
-		yydivpoly();
+		factor_divpoly();
 		while (expo && iszero(polycoeff[expo]))
 			expo--;
 	}
 	// unfactored polynomial
-	push(zero);
+	push_integer(0);
 	for (i = 0; i <= expo; i++) {
 		push(polycoeff[i]);
 		push(X);
@@ -8978,6 +8677,10 @@ rationalize_coefficients(int h)
 	// LCM of all polynomial coefficients
 	RESULT = one;
 	for (i = h; i < tos; i++) {
+		if (isdouble(stack[i])) {
+			convert_double_to_rational(stack[i]->u.d);
+			stack[i] = pop();
+		}
 		push(stack[i]);
 		denominator();
 		push(RESULT);
@@ -9043,8 +8746,6 @@ get_factor(void)
 	return 0;
 }
 
-//-----------------------------------------------------------------------------
-//
 //	Divide a polynomial by Ax+B
 //
 //	Input:		polycoeff	Dividend coefficients
@@ -9056,11 +8757,9 @@ get_factor(void)
 //			B		As above
 //
 //	Output:		polycoeff	Contains quotient coefficients
-//
-//-----------------------------------------------------------------------------
 
 void
-yydivpoly(void)
+factor_divpoly(void)
 {
 	int i;
 	Q = zero;
@@ -9084,7 +8783,7 @@ void
 evalpoly(void)
 {
 	int i;
-	push(zero);
+	push_integer(0);
 	for (i = expo; i >= 0; i--) {
 		push(Z);
 		multiply();
@@ -9092,6 +8791,181 @@ evalpoly(void)
 		add();
 	}
 	Q = pop();
+}
+
+void
+divisors_onstack(void)
+{
+	int h, i, k, n;
+	save();
+	p1 = pop();
+	h = tos;
+	// push all of the term's factors
+	if (isnum(p1)) {
+		push(p1);
+		factor_small_number();
+	} else if (car(p1) == symbol(ADD)) {
+		push(p1);
+		factor_add();
+	} else if (car(p1) == symbol(MULTIPLY)) {
+		p1 = cdr(p1);
+		if (isnum(car(p1))) {
+			push(car(p1));
+			factor_small_number();
+			p1 = cdr(p1);
+		}
+		while (iscons(p1)) {
+			p2 = car(p1);
+			if (car(p2) == symbol(POWER)) {
+				push(cadr(p2));
+				push(caddr(p2));
+			} else {
+				push(p2);
+				push_integer(1);
+			}
+			p1 = cdr(p1);
+		}
+	} else if (car(p1) == symbol(POWER)) {
+		push(cadr(p1));
+		push(caddr(p1));
+	} else {
+		push(p1);
+		push_integer(1);
+	}
+	k = tos;
+	// contruct divisors by recursive descent
+	push_integer(1);
+	gen(h, k);
+	// move
+	n = tos - k;
+	for (i = 0; i < n; i++)
+		stack[h + i] = stack[k + i];
+	tos = h + n;
+	restore();
+}
+
+//	Generate divisors
+//
+//	Input:		Base-exponent pairs on stack
+//
+//			h	first pair
+//
+//			k	just past last pair
+//
+//	Output:		Divisors on stack
+//
+//	For example, factor list 2 2 3 1 results in 6 divisors,
+//
+//		1
+//		3
+//		2
+//		6
+//		4
+//		12
+
+#undef ACCUM
+#undef BASE
+#undef EXPO
+
+#define ACCUM p1
+#define BASE p2
+#define EXPO p3
+
+void
+gen(int h, int k)
+{
+	int expo, i;
+	save();
+	ACCUM = pop();
+	if (h == k) {
+		push(ACCUM);
+		restore();
+		return;
+	}
+	BASE = stack[h + 0];
+	EXPO = stack[h + 1];
+	push(EXPO);
+	expo = pop_integer();
+	for (i = 0; i <= abs(expo); i++) {
+		push(ACCUM);
+		push(BASE);
+		push_integer(sign(expo) * i);
+		power();
+		multiply();
+		gen(h + 2, k);
+	}
+	restore();
+}
+
+//	Factor ADD expression
+//
+//	Input:		Expression on stack
+//
+//	Output:		Factors on stack
+//
+//	Each factor consists of two expressions, the factor itself followed
+//	by the exponent.
+
+void
+factor_add(void)
+{
+	save();
+	p1 = pop();
+	// get gcd of all terms
+	p3 = cdr(p1);
+	push(car(p3));
+	p3 = cdr(p3);
+	while (iscons(p3)) {
+		push(car(p3));
+		gcd();
+		p3 = cdr(p3);
+	}
+	// check gcd
+	p2 = pop();
+	if (isplusone(p2)) {
+		push(p1);
+		push_integer(1);
+		restore();
+		return;
+	}
+	// push factored gcd
+	if (isnum(p2)) {
+		push(p2);
+		factor_small_number();
+	} else if (car(p2) == symbol(MULTIPLY)) {
+		p3 = cdr(p2);
+		if (isnum(car(p3))) {
+			push(car(p3));
+			factor_small_number();
+		} else {
+			push(car(p3));
+			push_integer(1);
+		}
+		p3 = cdr(p3);
+		while (iscons(p3)) {
+			push(car(p3));
+			push_integer(1);
+			p3 = cdr(p3);
+		}
+	} else {
+		push(p2);
+		push_integer(1);
+	}
+	// divide each term by gcd
+	push(p2);
+	reciprocate();
+	p2 = pop();
+	push_integer(0);
+	p3 = cdr(p1);
+	while (iscons(p3)) {
+		push(p2);
+		push(car(p3));
+		multiply();
+		add();
+		p3 = cdr(p3);
+	}
+	push_integer(1);
+	restore();
 }
 
 // Push expression factors onto the stack. For example...
@@ -9111,10 +8985,10 @@ evalpoly(void)
 //
 // but not necessarily in that order. Returns the number of factors.
 
-// Local U *p is OK here because no functional path to garbage collector.
+// Local "struct atom *" is OK here because no functional path to garbage collector.
 
 int
-factors(U *p)
+factors(struct atom *p)
 {
 	int h = tos;
 	if (car(p) == symbol(ADD)) {
@@ -9128,10 +9002,10 @@ factors(U *p)
 	return tos - h;
 }
 
-// Local U *p is OK here because no functional path to garbage collector.
+// Local "struct atom *" is OK here because no functional path to garbage collector.
 
 void
-push_term_factors(U *p)
+push_term_factors(struct atom *p)
 {
 	if (car(p) == symbol(MULTIPLY)) {
 		p = cdr(p);
@@ -9228,71 +9102,96 @@ filter_tensor(void)
 	push(p3);
 }
 
-// returns 1 if expr p contains expr q, otherweise returns 0
-
-int
-find(U *p, U *q)
-{
-	int i;
-	if (equal(p, q))
-		return 1;
-	if (istensor(p)) {
-		for (i = 0; i < p->u.tensor->nelem; i++)
-			if (find(p->u.tensor->elem[i], q))
-				return 1;
-		return 0;
-	}
-	while (iscons(p)) {
-		if (find(car(p), q))
-			return 1;
-		p = cdr(p);
-	}
-	return 0;
-}
-
 void
 eval_float(void)
 {
 	push(cadr(p1));
 	eval();
-	yyfloat();
-	eval(); // normalize
+	sfloat();
 }
 
 void
-yyfloat(void)
+sfloat(void)
 {
-	int i, h;
+	sfloat_subst();
+	eval();
+	sfloat_subst(); // in case pi popped up
+	eval();
+}
+
+void
+sfloat_subst(void)
+{
 	save();
+	sfloat_subst_nib();
+	restore();
+}
+
+void
+sfloat_subst_nib(void)
+{
+	int h, i, n;
 	p1 = pop();
+	if (p1 == symbol(PI)) {
+		push_double(M_PI);
+		return;
+	}
+	if (p1 == symbol(EXP1)) {
+		push_double(M_E);
+		return;
+	}
+	if (isrational(p1)) {
+		push(p1);
+		bignum_float();
+		return;
+	}
+	// don't float exponential
+	if (car(p1) == symbol(POWER) && cadr(p1) == symbol(EXP1)) {
+		push_symbol(POWER);
+		push_symbol(EXP1);
+		push(caddr(p1));
+		sfloat_subst();
+		list(3);
+		return;
+	}
+	// don't float imaginary unit, but multiply it by 1.0
+	if (car(p1) == symbol(POWER) && isminusone(cadr(p1))) {
+		push_symbol(MULTIPLY);
+		push_double(1.0);
+		push_symbol(POWER);
+		push(cadr(p1));
+		push(caddr(p1));
+		sfloat_subst();
+		list(3);
+		list(3);
+		return;
+	}
 	if (iscons(p1)) {
 		h = tos;
+		push(car(p1));
+		p1 = cdr(p1);
 		while (iscons(p1)) {
 			push(car(p1));
-			yyfloat();
+			sfloat_subst();
 			p1 = cdr(p1);
 		}
 		list(tos - h);
-	} else if (p1->k == TENSOR) {
+		return;
+	}
+	if (istensor(p1)) {
 		push(p1);
 		copy_tensor();
 		p1 = pop();
-		for (i = 0; i < p1->u.tensor->nelem; i++) {
+		n = p1->u.tensor->nelem;
+		for (i = 0; i < n; i++) {
 			push(p1->u.tensor->elem[i]);
-			yyfloat();
+			sfloat_subst();
 			p1->u.tensor->elem[i] = pop();
 		}
 		push(p1);
-	} else if (p1->k == NUM) {
-		push(p1);
-		bignum_float();
-	} else if (p1 == symbol(PI))
-		push_double(M_PI);
-	else if (p1 == symbol(EXP1))
-		push_double(M_E);
-	else
-		push(p1);
-	restore();
+		return;
+	}
+	push(p1);
 }
 
 void
@@ -9300,19 +9199,19 @@ eval_floor(void)
 {
 	push(cadr(p1));
 	eval();
-	yfloor();
+	sfloor();
 }
 
 void
-yfloor(void)
+sfloor(void)
 {
 	save();
-	yyfloor();
+	sfloor_nib();
 	restore();
 }
 
 void
-yyfloor(void)
+sfloor_nib(void)
 {
 	double d;
 	p1 = pop();
@@ -9331,66 +9230,56 @@ yyfloor(void)
 		push(p1);
 		return;
 	}
-	p3 = alloc();
-	p3->k = NUM;
-	p3->u.q.a = mdiv(p1->u.q.a, p1->u.q.b);
-	p3->u.q.b = mint(1);
-	push(p3);
-	if (isnegativenumber(p1)) {
+	push_rational_number(p1->sign, mdiv(p1->u.q.a, p1->u.q.b), mint(1));
+	if (p1->sign == MMINUS) {
 		push_integer(-1);
 		add();
 	}
 }
 
-// 'for' function
-
-#undef I
-#undef X
-
-#define I p5
-#define X p6
-
 void
 eval_for(void)
 {
-	int i, j, k;
-	// 1st arg (quoted)
-	X = cadr(p1);
-	if (!issymbol(X))
+	int j, k;
+	p1 = cdr(p1);
+	p2 = car(p1);
+	if (!issymbol(p2))
 		stop("for: 1st arg?");
-	// 2nd arg
-	push(caddr(p1));
+	p1 = cdr(p1);
+	push(car(p1));
 	eval();
 	j = pop_integer();
-	if (j == (int) 0x80000000)
+	if (j == ERR)
 		stop("for: 2nd arg?");
-	// 3rd arg
-	push(cadddr(p1));
+	p1 = cdr(p1);
+	push(car(p1));
 	eval();
 	k = pop_integer();
-	if (k == (int) 0x80000000)
+	if (k == ERR)
 		stop("for: 3rd arg?");
-	// remaining args
-	p1 = cddddr(p1);
-	push_binding(X);
-	for (i = j; i <= k; i++) {
-		push_integer(i);
-		I = pop();
-		set_binding(X, I);
-		p2 = p1;
-		while (iscons(p2)) {
-			push(car(p2));
+	p1 = cdr(p1);
+	save_binding(p2);
+	for (;;) {
+		push_integer(j);
+		p3 = pop();
+		set_binding(p2, p3);
+		p3 = p1;
+		while (iscons(p3)) {
+			push(car(p3));
 			eval();
 			pop();
-			p2 = cdr(p2);
+			p3 = cdr(p3);
 		}
+		if (j < k)
+			j++;
+		else if (j > k)
+			j--;
+		else
+			break;
 	}
-	pop_binding(X);
-	// return value
-	push_symbol(NIL);
+	restore_binding(p2);
+	push_symbol(NIL); // return value
 }
-
-// Greatest common denominator
 
 void
 eval_gcd(void)
@@ -9427,7 +9316,7 @@ gcd_main(void)
 		push(p1);
 		return;
 	}
-	if (isrational(p1) && isrational(p2)) {
+	if (isnum(p1) && isnum(p2)) {
 		push(p1);
 		push(p2);
 		gcd_numbers();
@@ -9469,7 +9358,7 @@ gcd_main(void)
 	} else
 		p4 = one;
 	if (!equal(p1, p2)) {
-		push(one);
+		push_integer(1);
 		return;
 	}
 	// are both exponents numerical?
@@ -9510,7 +9399,7 @@ gcd_main(void)
 	subtract();
 	p5 = pop();
 	if (!isnum(p5)) {
-		push(one);
+		push_integer(1);
 		return;
 	}
 	// can't be equal because of test near beginning
@@ -9528,7 +9417,7 @@ void
 gcd_expr_expr(void)
 {
 	if (length(p1) != length(p2)) {
-		push(one);
+		push_integer(1);
 		return;
 	}
 	p3 = cdr(p1);
@@ -9564,11 +9453,11 @@ gcd_expr_expr(void)
 		gcd();
 		multiply();
 	} else
-		push(one);
+		push_integer(1);
 }
 
 void
-gcd_expr(U *p)
+gcd_expr(struct atom *p)
 {
 	p = cdr(p);
 	push(car(p));
@@ -9583,7 +9472,7 @@ gcd_expr(U *p)
 void
 gcd_term_term(void)
 {
-	push(one);
+	push_integer(1);
 	p3 = cdr(p1);
 	while (iscons(p3)) {
 		p4 = cdr(p2);
@@ -9601,7 +9490,7 @@ gcd_term_term(void)
 void
 gcd_term_factor(void)
 {
-	push(one);
+	push_integer(1);
 	p3 = cdr(p1);
 	while (iscons(p3)) {
 		push(car(p3));
@@ -9615,7 +9504,7 @@ gcd_term_factor(void)
 void
 gcd_factor_term(void)
 {
-	push(one);
+	push_integer(1);
 	p4 = cdr(p2);
 	while (iscons(p4)) {
 		push(p1);
@@ -9626,12 +9515,33 @@ gcd_factor_term(void)
 	}
 }
 
+void
+gcd_numbers(void)
+{
+	uint32_t *a, *b;
+	save();
+	p2 = pop();
+	p1 = pop();
+	if (isdouble(p1)) {
+		convert_double_to_rational(p1->u.d);
+		p1 = pop();
+	}
+	if (isdouble(p2)) {
+		convert_double_to_rational(p2->u.d);
+		p2 = pop();
+	}
+	a = mgcd(p1->u.q.a, p2->u.q.a);
+	b = mgcd(p1->u.q.b, p2->u.q.b);
+	push_rational_number(MPLUS, a, b);
+	restore();
+}
+
 // Guess which symbol to use for derivative, integral, etc.
 
 void
 guess(void)
 {
-	U *p;
+	struct atom *p;
 	p = pop();
 	push(p);
 	if (find(p, symbol(SYMBOL_X)))
@@ -9648,105 +9558,50 @@ guess(void)
 		push_symbol(SYMBOL_X);
 }
 
-//-----------------------------------------------------------------------------
-//
-//	Hermite polynomial
-//
-//	Input:		tos-2		x	(can be a symbol or expr)
-//
-//			tos-1		n
-//
-//	Output:		Result on stack
-//
-//-----------------------------------------------------------------------------
-
 void
-hermite(void)
+eval_hermite(void)
 {
-	save();
-	yyhermite();
-	restore();
-}
-
-// uses the recurrence relation H(x,n+1)=2*x*H(x,n)-2*n*H(x,n-1)
-
-#undef X
-#undef N
-#undef Y
-#undef Y1
-#undef Y0
-
-#define X p1
-#define N p2
-#define Y p3
-#define Y1 p4
-#define Y0 p5
-
-void
-yyhermite(void)
-{
-	int n;
-	N = pop();
-	X = pop();
-	push(N);
+	int k, n;
+	p1 = cdr(p1);
+	push(car(p1));
+	eval();
+	p0 = pop();
+	p1 = cdr(p1);
+	push(car(p1));
+	eval();
 	n = pop_integer();
-	if (n < 0) {
-		push_symbol(HERMITE);
-		push(X);
-		push(N);
-		list(3);
-		return;
+	if (n == ERR || n < 0)
+		stop("hermite");
+	for (k = 0; k <= n / 2; k++) {
+		push_integer(-1);
+		push_integer(k);
+		power();
+		push_integer(k);
+		factorial();
+		divide();
+		push_integer(n - 2 * k);
+		factorial();
+		divide();
+		push_integer(2);
+		push(p0);
+		multiply();
+		push_integer(n - 2 * k);
+		power();
+		multiply();
 	}
-	if (issymbol(X))
-		yyhermite2(n);
-	else {
-		Y = X;			// do this when X is an expr
-		X = symbol(SPECX);
-		yyhermite2(n);
-		X = Y;
-		push_symbol(SPECX);
-		push(X);
-		subst();
-		eval();
-	}
+	add_terms(n / 2 + 1);
+	push_integer(n);
+	factorial();
+	multiply();
 }
 
 void
-yyhermite2(int n)
+eval_hilbert(void)
 {
-	int i;
-	push_integer(1);
-	push_integer(0);
-	Y1 = pop();
-	for (i = 0; i < n; i++) {
-		Y0 = Y1;
-		Y1 = pop();
-		push(X);
-		push(Y1);
-		multiply();
-		push_integer(i);
-		push(Y0);
-		multiply();
-		subtract();
-		push_integer(2);
-		multiply();
-	}
+	push(cadr(p1));
+	eval();
+	hilbert();
 }
-
-//-----------------------------------------------------------------------------
-//
-//	Create a Hilbert matrix
-//
-//	Input:		Dimension on stack
-//
-//	Output:		Hilbert matrix on stack
-//
-//	Example:
-//
-//	> hilbert(5)
-//	((1,1/2,1/3,1/4),(1/2,1/3,1/4,1/5),(1/3,1/4,1/5,1/6),(1/4,1/5,1/6,1/7))
-//
-//-----------------------------------------------------------------------------
 
 #undef A
 #undef N
@@ -9764,19 +9619,14 @@ hilbert(void)
 	N = pop();
 	push(N);
 	n = pop_integer();
-	if (n < 2) {
-		push_symbol(HILBERT);
-		push(N);
-		list(2);
-		restore();
-		return;
-	}
+	if (n < 2)
+		stop("hilbert arg");
 	push_zero_matrix(n, n);
 	A = pop();
 	for (i = 0; i < n; i++) {
 		for (j = 0; j < n; j++) {
 			push_integer(i + j + 1);
-			inverse();
+			reciprocate();
 			AELEM(i, j) = pop();
 		}
 	}
@@ -9784,15 +9634,14 @@ hilbert(void)
 	restore();
 }
 
-/* Returns the coefficient of the imaginary part of complex z
-
-	z		imag(z)
-	-		-------
-
-	a + i b		b
-
-	exp(i a)	sin(a)
-*/
+void
+push_zero_matrix(int i, int j)
+{
+	push(alloc_tensor(i * j));
+	stack[tos - 1]->u.tensor->ndim = 2;
+	stack[tos - 1]->u.tensor->dim[0] = i;
+	stack[tos - 1]->u.tensor->dim[1] = j;
+}
 
 void
 eval_imag(void)
@@ -9808,43 +9657,59 @@ imag(void)
 	save();
 	rect();
 	p1 = pop();
+	push_rational(-1, 2);
+	push(imaginaryunit);
 	push(p1);
 	push(p1);
 	conjugate();
 	subtract();
-	push_integer(2);
-	divide();
-	push(imaginaryunit);
-	divide();
+	multiply_factors(3);
 	restore();
 }
 
-// n is the total number of things on the stack. The first thing on the stack
-// is the object to be indexed, followed by the indices themselves.
+void
+eval_index(void)
+{
+	int h = tos;
+	p1 = cdr(p1);
+	while (iscons(p1)) {
+		push(car(p1));
+		eval();
+		p1 = cdr(p1);
+	}
+	index_function(tos - h);
+}
+
+// tensor and indices on stack
 
 void
 index_function(int n)
 {
-	int i, k, m, ndim, nelem, t;
-	U **s;
 	save();
+	index_function_nib(n);
+	restore();
+}
+
+void
+index_function_nib(int n)
+{
+	int i, k, m, ndim, nelem, t;
+	struct atom **s;
 	s = stack + tos - n;
 	p1 = s[0];
-	// index of number (FIXME include complex numbers)
+	// index of number
 	if (isnum(p1)) {
 		tos -= n;
 		push(p1);
-		restore();
 		return;
 	}
 	// index of symbol (f.e., u[2] -> u[2])
 	if (!istensor(p1)) {
 		list(n);
 		p1 = pop();
-		push(symbol(INDEX));
+		push_symbol(INDEX);
 		push(p1);
 		append();
-		restore();
 		return;
 	}
 	ndim = p1->u.tensor->ndim;
@@ -9862,7 +9727,6 @@ index_function(int n)
 	if (ndim == m) {
 		tos -= n;
 		push(p1->u.tensor->elem[k]);
-		restore();
 		return;
 	}
 	for (i = m; i < ndim; i++)
@@ -9878,291 +9742,14 @@ index_function(int n)
 		p2->u.tensor->elem[i] = p1->u.tensor->elem[k + i];
 	tos -= n;
 	push(p2);
-	restore();
 }
-
-//-----------------------------------------------------------------------------
-//
-//	Input:		n		Number of args on stack
-//
-//			tos-n		Right-hand value
-//
-//			tos-n+1		Left-hand value
-//
-//			tos-n+2		First index
-//
-//			.
-//			.
-//			.
-//
-//			tos-1		Last index
-//
-//	Output:		Result on stack
-//
-//-----------------------------------------------------------------------------
-
-#define LVALUE p1
-#define RVALUE p2
-#undef TMP
-#define TMP p3
-
-void
-set_component(int n)
-{
-	int i, k, m, ndim, t;
-	U **s;
-	save();
-	if (n < 3)
-		stop("error in indexed assign");
-	s = stack + tos - n;
-	RVALUE = s[0];
-	LVALUE = s[1];
-	if (!istensor(LVALUE))
-		stop("error in indexed assign");
-	ndim = LVALUE->u.tensor->ndim;
-	m = n - 2;
-	if (m > ndim)
-		stop("error in indexed assign");
-	k = 0;
-	for (i = 0; i < m; i++) {
-		push(s[i + 2]);
-		t = pop_integer();
-		if (t < 1 || t > LVALUE->u.tensor->dim[i])
-			stop("error in indexed assign\n");
-		k = k * p1->u.tensor->dim[i] + t - 1;
-	}
-	for (i = m; i < ndim; i++)
-		k = k * p1->u.tensor->dim[i] + 0;
-	// copy
-	TMP = alloc_tensor(LVALUE->u.tensor->nelem);
-	TMP->u.tensor->ndim = LVALUE->u.tensor->ndim;
-	for (i = 0; i < p1->u.tensor->ndim; i++)
-		TMP->u.tensor->dim[i] = LVALUE->u.tensor->dim[i];
-	for (i = 0; i < p1->u.tensor->nelem; i++)
-		TMP->u.tensor->elem[i] = LVALUE->u.tensor->elem[i];
-	LVALUE = TMP;
-	if (ndim == m) {
-		if (istensor(RVALUE))
-			stop("error in indexed assign");
-		LVALUE->u.tensor->elem[k] = RVALUE;
-		tos -= n;
-		push(LVALUE);
-		restore();
-		return;
-	}
-	// see if the rvalue matches
-	if (!istensor(RVALUE))
-		stop("error in indexed assign");
-	if (ndim - m != RVALUE->u.tensor->ndim)
-		stop("error in indexed assign");
-	for (i = 0; i < RVALUE->u.tensor->ndim; i++)
-		if (LVALUE->u.tensor->dim[m + i] != RVALUE->u.tensor->dim[i])
-			stop("error in indexed assign");
-	// copy rvalue
-	for (i = 0; i < RVALUE->u.tensor->nelem; i++)
-		LVALUE->u.tensor->elem[k + i] = RVALUE->u.tensor->elem[i];
-	tos -= n;
-	push(LVALUE);
-	restore();
-}
-
-void
-init(void)
-{
-	init_symbol_table();
-	tos = 0;
-	esc_flag = 0;
-	draw_flag = 0;
-	frame = stack + TOS;
-	p0 = symbol(NIL);
-	p1 = symbol(NIL);
-	p2 = symbol(NIL);
-	p3 = symbol(NIL);
-	p4 = symbol(NIL);
-	p5 = symbol(NIL);
-	p6 = symbol(NIL);
-	p7 = symbol(NIL);
-	p8 = symbol(NIL);
-	p9 = symbol(NIL);
-	// caution, jmp_buf not set up, stop() will crash
-	push_integer(0);
-	binding[V0] = pop();
-	push_integer(1);
-	binding[V1] = pop();
-	push_symbol(POWER);
-	push_integer(-1);
-	push_rational(1, 2);
-	list(3);
-	binding[IU] = pop();
-}
-
-void
-init_symbol_table(void)
-{
-	int i;
-	for (i = 0; i < NSYM; i++) {
-		symtab[i].k = SYM;
-		binding[i] = symtab + i;
-		arglist[i] = symbol(NIL);
-	}
-	std_symbol("abs", ABS);
-	std_symbol("add", ADD);
-	std_symbol("adj", ADJ);
-	std_symbol("and", AND);
-	std_symbol("arccos", ARCCOS);
-	std_symbol("arccosh", ARCCOSH);
-	std_symbol("arcsin", ARCSIN);
-	std_symbol("arcsinh", ARCSINH);
-	std_symbol("arctan", ARCTAN);
-	std_symbol("arctanh", ARCTANH);
-	std_symbol("arg", ARG);
-	std_symbol("atomize", ATOMIZE);
-	std_symbol("besselj", BESSELJ);
-	std_symbol("bessely", BESSELY);
-	std_symbol("binding", BINDING);
-	std_symbol("binomial", BINOMIAL);
-	std_symbol("ceiling", CEILING);
-	std_symbol("check", CHECK);
-	std_symbol("choose", CHOOSE);
-	std_symbol("circexp", CIRCEXP);
-	std_symbol("clock", CLOCK);
-	std_symbol("coeff", COEFF);
-	std_symbol("cofactor", COFACTOR);
-	std_symbol("condense", CONDENSE);
-	std_symbol("conj", CONJ);
-	std_symbol("contract", CONTRACT);
-	std_symbol("cos", COS);
-	std_symbol("cosh", COSH);
-	std_symbol("decomp", DECOMP);
-	std_symbol("defint", DEFINT);
-	std_symbol("deg", DEGREE);
-	std_symbol("denominator", DENOMINATOR);
-	std_symbol("det", DET);
-	std_symbol("derivative", DERIVATIVE);
-	std_symbol("dim", DIM);
-	std_symbol("display", DISPLAY);
-	std_symbol("divisors", DIVISORS);
-	std_symbol("do", DO);
-	std_symbol("dot", DOT);
-	std_symbol("draw", DRAW);
-	std_symbol("erf", ERF);
-	std_symbol("erfc", ERFC);
-	std_symbol("eigen", EIGEN);
-	std_symbol("eigenval", EIGENVAL);
-	std_symbol("eigenvec", EIGENVEC);
-	std_symbol("eval", EVAL);
-	std_symbol("exp", EXP);
-	std_symbol("expand", EXPAND);
-	std_symbol("expcos", EXPCOS);
-	std_symbol("expsin", EXPSIN);
-	std_symbol("factor", FACTOR);
-	std_symbol("factorial", FACTORIAL);
-	std_symbol("factorpoly", FACTORPOLY);
-	std_symbol("filter", FILTER);
-	std_symbol("float", FLOATF);
-	std_symbol("floor", FLOOR);
-	std_symbol("for", FOR);
-	std_symbol("gcd", GCD);
-	std_symbol("hermite", HERMITE);
-	std_symbol("hilbert", HILBERT);
-	std_symbol("imag", IMAG);
-	std_symbol("component", INDEX);
-	std_symbol("inner", INNER);
-	std_symbol("integral", INTEGRAL);
-	std_symbol("inv", INV);
-	std_symbol("invg", INVG);
-	std_symbol("isinteger", ISINTEGER);
-	std_symbol("isprime", ISPRIME);
-	std_symbol("laguerre", LAGUERRE);
-	std_symbol("lcm", LCM);
-	std_symbol("leading", LEADING);
-	std_symbol("legendre", LEGENDRE);
-	std_symbol("log", LOG);
-	std_symbol("mag", MAG);
-	std_symbol("mod", MOD);
-	std_symbol("multiply", MULTIPLY);
-	std_symbol("not", NOT);
-	std_symbol("nroots", NROOTS);
-	std_symbol("number", NUMBER);
-	std_symbol("numerator", NUMERATOR);
-	std_symbol("operator", OPERATOR);
-	std_symbol("or", OR);
-	std_symbol("outer", OUTER);
-	std_symbol("polar", POLAR);
-	std_symbol("power", POWER);
-	std_symbol("prime", PRIME);
-	std_symbol("print", PRINT);
-	std_symbol("product", PRODUCT);
-	std_symbol("quote", QUOTE);
-	std_symbol("quotient", QUOTIENT);
-	std_symbol("rank", RANK);
-	std_symbol("rationalize", RATIONALIZE);
-	std_symbol("real", REAL);
-	std_symbol("rect", YYRECT);
-	std_symbol("roots", ROOTS);
-	std_symbol("equals", SETQ);
-	std_symbol("sgn", SGN);
-	std_symbol("simplify", SIMPLIFY);
-	std_symbol("sin", SIN);
-	std_symbol("sinh", SINH);
-	std_symbol("sqrt", SQRT);
-	std_symbol("stop", STOP);
-	std_symbol("subst", SUBST);
-	std_symbol("sum", SUM);
-	std_symbol("tan", TAN);
-	std_symbol("tanh", TANH);
-	std_symbol("taylor", TAYLOR);
-	std_symbol("test", TEST);
-	std_symbol("testeq", TESTEQ);
-	std_symbol("testge", TESTGE);
-	std_symbol("testgt", TESTGT);
-	std_symbol("testle", TESTLE);
-	std_symbol("testlt", TESTLT);
-	std_symbol("transpose", TRANSPOSE);
-	std_symbol("unit", UNIT);
-	std_symbol("zero", ZERO);
-	std_symbol("$", MARK1);
-	std_symbol("~", NATNUM); // tilde so sort after other symbols
-	std_symbol("nil", NIL);
-	std_symbol("pi", PI);
-	std_symbol("$0", V0);
-	std_symbol("$1", V1);
-	std_symbol("$I", IU);
-	std_symbol("$", MARK2);
-	std_symbol("$a", METAA); // must be distinct so they sort correctly
-	std_symbol("$b", METAB);
-	std_symbol("$x", METAX);
-	std_symbol("$X", SPECX);
-	std_symbol("a", SYMBOL_A);
-	std_symbol("b", SYMBOL_B);
-	std_symbol("c", SYMBOL_C);
-	std_symbol("d", SYMBOL_D);
-	std_symbol("i", SYMBOL_I);
-	std_symbol("j", SYMBOL_J);
-	std_symbol("n", SYMBOL_N);
-	std_symbol("r", SYMBOL_R);
-	std_symbol("s", SYMBOL_S);
-	std_symbol("t", SYMBOL_T);
-	std_symbol("x", SYMBOL_X);
-	std_symbol("y", SYMBOL_Y);
-	std_symbol("z", SYMBOL_Z);
-	std_symbol("autoexpand", AUTOEXPAND);
-	std_symbol("bake", BAKE);
-	std_symbol("last", LAST);
-	std_symbol("trace", TRACE);
-	std_symbol("tty", TTY);
-	std_symbol("$", MARK3);
-}
-
-// Do the inner product of tensors.
 
 void
 eval_inner(void)
 {
-	p1 = cdr(p1);
-	push(car(p1));
+	push(cadr(p1));
 	eval();
-	p1 = cdr(p1);
+	p1 = cddr(p1);
 	while (iscons(p1)) {
 		push(car(p1));
 		eval();
@@ -10175,525 +9762,1375 @@ void
 inner(void)
 {
 	save();
-	p2 = pop();
-	p1 = pop();
-	if (istensor(p1) && istensor(p2))
-		inner_f();
-	else {
-		push(p1);
-		push(p2);
-		if (istensor(p1))
-			tensor_times_scalar();
-		else if (istensor(p2))
-			scalar_times_tensor();
-		else
-			multiply();
-	}
+	inner_nib();
 	restore();
 }
 
-// inner product of tensors p1 and p2
-
 void
-inner_f(void)
+inner_nib(void)
 {
-	int ak, bk, i, j, k, n, ndim;
-	U **a, **b, **c;
-	n = p1->u.tensor->dim[p1->u.tensor->ndim - 1];
-	if (n != p2->u.tensor->dim[0])
-		stop("inner: tensor dimension check");
+	int i, j, k, n, mcol, mrow, ncol, ndim, nrow;
+	struct atom **a, **b, **c;
+	p2 = pop();
+	p1 = pop();
+	if (!istensor(p1) && !istensor(p2)) {
+		push(p1);
+		push(p2);
+		multiply();
+		return;
+	}
+	if (istensor(p1) && !istensor(p2)) {
+		p3 = p1;
+		p1 = p2;
+		p2 = p3;
+	}
+	if (!istensor(p1) && istensor(p2)) {
+		push(p2);
+		copy_tensor();
+		p2 = pop();
+		n = p2->u.tensor->nelem;
+		for (i = 0; i < n; i++) {
+			push(p1);
+			push(p2->u.tensor->elem[i]);
+			multiply();
+			p2->u.tensor->elem[i] = pop();
+		}
+		push(p2);
+		return;
+	}
+	k = p1->u.tensor->ndim - 1;
+	ncol = p1->u.tensor->dim[k];
+	mrow = p2->u.tensor->dim[0];
+	if (ncol != mrow)
+		stop("tensor dimensions");
 	ndim = p1->u.tensor->ndim + p2->u.tensor->ndim - 2;
 	if (ndim > MAXDIM)
-		stop("inner: rank of result exceeds maximum");
-	a = p1->u.tensor->elem;
-	b = p2->u.tensor->elem;
-	//---------------------------------------------------------------------
+		stop("rank exceeds max");
+	//	nrow is the number of rows in p1
 	//
-	//	ak is the number of rows in tensor A
-	//
-	//	bk is the number of columns in tensor B
+	//	mcol is the number of columns p2
 	//
 	//	Example:
 	//
 	//	A[3][3][4] B[4][4][3]
 	//
-	//	  3  3				ak = 3 * 3 = 9
+	//	  3  3				nrow = 3 * 3 = 9
 	//
-	//	                4  3		bk = 4 * 3 = 12
-	//
-	//---------------------------------------------------------------------
-	ak = 1;
-	for (i = 0; i < p1->u.tensor->ndim - 1; i++)
-		ak *= p1->u.tensor->dim[i];
-	bk = 1;
-	for (i = 1; i < p2->u.tensor->ndim; i++)
-		bk *= p2->u.tensor->dim[i];
-	p3 = alloc_tensor(ak * bk);
+	//	                4  3		mcol = 4 * 3 = 12
+	nrow = p1->u.tensor->nelem / ncol;
+	mcol = p2->u.tensor->nelem / mrow;
+	p3 = alloc_tensor(nrow * mcol);
+	a = p1->u.tensor->elem;
+	b = p2->u.tensor->elem;
 	c = p3->u.tensor->elem;
-	for (i = 0; i < ak; i++) {
-		for (j = 0; j < n; j++) {
-			if (iszero(a[i * n + j]))
-				continue;
-			for (k = 0; k < bk; k++) {
-				push(a[i * n + j]);
-				push(b[j * bk + k]);
+	for (i = 0; i < nrow; i++) {
+		for (j = 0; j < mcol; j++) {
+			for (k = 0; k < ncol; k++) {
+				push(a[i * ncol + k]);
+				push(b[k * mcol + j]);
 				multiply();
-				push(c[i * bk + k]);
-				add();
-				c[i * bk + k] = pop();
 			}
+			add_terms(ncol);
+			c[i * mcol + j] = pop();
 		}
 	}
-	//---------------------------------------------------------------------
-	//
-	//	Note on understanding "k * bk + j"
-	//
-	//	k * bk because each element of a column is bk locations apart
-	//
-	//	+ j because the beginnings of all columns are in the first bk
-	//	locations
-	//
-	//	Example: n = 2, bk = 6
-	//
-	//	b111	<- 1st element of 1st column
-	//	b112	<- 1st element of 2nd column
-	//	b113	<- 1st element of 3rd column
-	//	b121	<- 1st element of 4th column
-	//	b122	<- 1st element of 5th column
-	//	b123	<- 1st element of 6th column
-	//
-	//	b211	<- 2nd element of 1st column
-	//	b212	<- 2nd element of 2nd column
-	//	b213	<- 2nd element of 3rd column
-	//	b221	<- 2nd element of 4th column
-	//	b222	<- 2nd element of 5th column
-	//	b223	<- 2nd element of 6th column
-	//
-	//---------------------------------------------------------------------
-	if (ndim == 0)
-		push(p3->u.tensor->elem[0]);
-	else {
-		p3->u.tensor->ndim = ndim;
-		for (i = 0; i < p1->u.tensor->ndim - 1; i++)
-			p3->u.tensor->dim[i] = p1->u.tensor->dim[i];
-		j = i;
-		for (i = 0; i < p2->u.tensor->ndim - 1; i++)
-			p3->u.tensor->dim[j + i] = p2->u.tensor->dim[i + 1];
-		push(p3);
+	if (ndim == 0) {
+		push(c[0]);
+		return;
 	}
+	// add dim info
+	p3->u.tensor->ndim = ndim;
+	k = 0;
+	for (i = 0; i < p1->u.tensor->ndim - 1; i++)
+		p3->u.tensor->dim[k++] = p1->u.tensor->dim[i];
+	for (i = 1; i < p2->u.tensor->ndim; i++)
+		p3->u.tensor->dim[k++] = p2->u.tensor->dim[i];
+	push(p3);
 }
 
-#undef X
+char *integral_tab_exp[] = {
 
-#define X p3
+// x^n exp(a x + b)
+
+	"exp(a x)",
+	"exp(a x) / a",
+	"1",
+
+	"exp(a x + b)",
+	"exp(a x + b) / a",
+	"1",
+
+	"x exp(a x)",
+	"exp(a x) (a x - 1) / (a^2)",
+	"1",
+
+	"x exp(a x + b)",
+	"exp(a x + b) (a x - 1) / (a^2)",
+	"1",
+
+	"x^2 exp(a x)",
+	"exp(a x) (a^2 x^2 - 2 a x + 2) / (a^3)",
+	"1",
+
+	"x^2 exp(a x + b)",
+	"exp(a x + b) (a^2 x^2 - 2 a x + 2) / (a^3)",
+	"1",
+
+	"x^3 exp(a x)",
+	"(a^3 x^3 - 3 a^2 x^2 + 6 a x - 6) exp(a x) / a^4",
+	"1",
+
+	"x^3 exp(a x + b)",
+	"(a^3 x^3 - 3 a^2 x^2 + 6 a x - 6) exp(a x + b) / a^4",
+	"1",
+
+// x^n exp(a x^2 + b)
+
+// erfi(x) = -i erf(i x)
+
+	"exp(a x^2)",
+	"-1/2 i sqrt(pi) erf(i sqrt(a) x) / sqrt(a)",
+	"1",
+
+	"exp(a x^2 + b)",
+	"-1/2 i sqrt(pi) exp(b) erf(i sqrt(a) x) / sqrt(a)",
+	"1",
+
+	"x exp(a x^2)",
+	"1/2 exp(a x^2) / a",
+	"1",
+
+	"x exp(a x^2 + b)",
+	"1/2 exp(a x^2 + b) / a",
+	"1",
+
+	"x^2 exp(a x^2)",
+	"1/2 x exp(a x^2) / a + 1/4 i sqrt(pi) erf(i sqrt(a) x) / a^(3/2)",
+	"1",
+
+	"x^2 exp(a x^2 + b)",
+	"1/2 x exp(a x^2 + b) / a + 1/4 i sqrt(pi) exp(b) erf(i sqrt(a) x) / a^(3/2)",
+	"1",
+
+	"x^3 exp(a x^2)",
+	"1/2 exp(a x^2) (x^2 / a - 1 / a^2)",
+	"1",
+
+	"x^3 exp(a x^2 + b)",
+	"1/2 exp(a x^2) exp(b) (x^2 / a - 1 / a^2)",
+	"1",
+
+	"x exp(a x + b x)",
+	"exp(a x + b x) (a x + b x + 1) / (a + b)^2",
+	"1",
+
+	NULL,
+};
+
+// log(a x) is transformed to log(a) + log(x)
+
+char *integral_tab_log[] = {
+
+	"log(x)",
+	"x log(x) - x",
+	"1",
+
+	"log(a x + b)",
+	"x log(a x + b) + b log(a x + b) / a - x",
+	"1",
+
+	"x log(x)",
+	"x^2 log(x) 1/2 - x^2 1/4",
+	"1",
+
+	"x log(a x + b)",
+	"1/2 (a x - b) (a x + b) log(a x + b) / a^2 - 1/4 x (a x - 2 b) / a",
+	"1",
+
+	"x^2 log(x)",
+	"x^3 log(x) 1/3 - 1/9 x^3",
+	"1",
+
+	"x^2 log(a x + b)",
+	"1/3 (a x + b) (a^2 x^2 - a b x + b^2) log(a x + b) / a^3 - 1/18 x (2 a^2 x^2 - 3 a b x + 6 b^2) / a^2",
+	"1",
+
+	"log(x)^2",
+	"x log(x)^2 - 2 x log(x) + 2 x",
+	"1",
+
+	"log(a x + b)^2",
+	"(a x + b) (log(a x + b)^2 - 2 log(a x + b) + 2) / a",
+	"1",
+
+	"log(x) / x^2",
+	"-(log(x) + 1) / x",
+	"1",
+
+	"log(a x + b) / x^2",
+	"a log(x) / b - (a x + b) log(a x + b) / (b x)",
+	"1",
+
+	"1 / (x (a + log(x)))",
+	"log(a + log(x))",
+	"1",
+
+	NULL,
+};
+
+char *integral_tab_trig[] = {
+
+	"sin(a x)",
+	"-cos(a x) / a",
+	"1",
+
+	"cos(a x)",
+	"sin(a x) / a",
+	"1",
+
+	"tan(a x)",
+	"-log(cos(a x)) / a",
+	"1",
+
+	"sin(a x)^2",
+	"x 1/2 - sin(2 a x) / (4 a)",
+	"1",
+
+	"sin(a x)^3",
+	"-cos(a x) (sin(a x)^2 + 2) / (3 a)",
+	"1",
+
+	"sin(a x)^4",
+	"3/8 x - sin(2 a x) / (4 a) + sin(4 a x) / (32 a)",
+	"1",
+
+	"cos(a x)^2",
+	"x 1/2 + sin(2 a x) / (4 a)",
+	"1",
+
+	"cos(a x)^3",
+	"sin(a x) (cos(a x)^2 + 2) / (3 a)",
+	"1",
+
+	"cos(a x)^4",
+	"3/8 x + sin(2 a x) / (4 a) + sin(4 a x) / (32 a)",
+	"1",
+
+	"sin(a x) cos(a x)",
+	"1/2 sin(a x)^2 / a",
+	"1",
+
+	"sin(a x) cos(a x)^2",
+	"-1/3 cos(a x)^3 / a",
+	"1",
+
+	"sin(a x)^2 cos(a x)",
+	"1/3 sin(a x)^3 / a",
+	"1",
+
+	"sin(a x)^2 cos(a x)^2",
+	"1/8 x - 1/32 sin(4 a x) / a",
+	"1",
+// 329
+	"1 / sin(a x) / cos(a x)",
+	"log(tan(a x)) / a",
+	"1",
+// 330
+	"1 / sin(a x) / cos(a x)^2",
+	"(1 / cos(a x) + log(tan(a x 1/2))) / a",
+	"1",
+// 331
+	"1 / sin(a x)^2 / cos(a x)",
+	"(log(tan(pi 1/4 + a x 1/2)) - 1 / sin(a x)) / a",
+	"1",
+// 333
+	"1 / sin(a x)^2 / cos(a x)^2",
+	"-2 / (a tan(2 a x))",
+	"1",
+//
+	"sin(a x) / cos(a x)",
+	"-log(cos(a x)) / a",
+	"1",
+
+	"sin(a x) / cos(a x)^2",
+	"1 / a / cos(a x)",
+	"1",
+
+	"sin(a x)^2 / cos(a x)",
+	"-(sin(a x) + log(cos(a x / 2) - sin(a x / 2)) - log(sin(a x / 2) + cos(a x / 2))) / a",
+	"1",
+
+	"sin(a x)^2 / cos(a x)^2",
+	"tan(a x) / a - x",
+	"1",
+//
+	"cos(a x) / sin(a x)",
+	"log(sin(a x)) / a",
+	"1",
+
+	"cos(a x) / sin(a x)^2",
+	"-1 / (a sin(a x))",
+	"1",
+
+	"cos(a x)^2 / sin(a x)",
+	"cos(a x) / a + log(sin(a x / 2)) / a - log(cos(a x / 2)) / a",
+	"1",
+
+	"cos(a x)^2 / sin(a x)^2",
+	"-x - cos(a x) / sin(a x) / a",
+	"1",
+//
+	"sin(a + b x)",
+	"-cos(a + b x) / b",
+	"1",
+
+	"cos(a + b x)",
+	"sin(a + b x) / b",
+	"1",
+
+	"x sin(a x)",
+	"sin(a x) / (a^2) - x cos(a x) / a",
+	"1",
+
+	"x^2 sin(a x)",
+	"2 x sin(a x) / (a^2) - (a^2 x^2 - 2) cos(a x) / (a^3)",
+	"1",
+
+	"x cos(a x)",
+	"cos(a x) / (a^2) + x sin(a x) / a",
+	"1",
+
+	"x^2 cos(a x)",
+	"2 x cos(a x) / (a^2) + (a^2 x^2 - 2) sin(a x) / (a^3)",
+	"1",
+
+	"1 / tan(a x)",
+	"log(sin(a x)) / a",
+	"1",
+
+	"1 / cos(a x)",
+	"log(tan(pi 1/4 + a x 1/2)) / a",
+	"1",
+
+	"1 / sin(a x)",
+	"log(tan(a x 1/2)) / a",
+	"1",
+
+	"1 / sin(a x)^2",
+	"-1 / (a tan(a x))",
+	"1",
+
+	"1 / cos(a x)^2",
+	"tan(a x) / a",
+	"1",
+
+	"1 / (b + b sin(a x))",
+	"-tan(pi 1/4 - a x 1/2) / (a b)",
+	"1",
+
+	"1 / (b - b sin(a x))",
+	"tan(pi 1/4 + a x 1/2) / (a b)",
+	"1",
+
+	"1 / (b + b cos(a x))",
+	"tan(a x 1/2) / (a b)",
+	"1",
+
+	"1 / (b - b cos(a x))",
+	"-1 / (tan(a x 1/2) a b)",
+	"1",
+
+	"1 / (a + b sin(x))",
+	"log((a tan(x 1/2) + b - sqrt(b^2 - a^2)) / (a tan(x 1/2) + b + sqrt(b^2 - a^2))) / sqrt(b^2 - a^2)",
+	"b^2 - a^2",
+
+	"1 / (a + b cos(x))",
+	"log((sqrt(b^2 - a^2) tan(x 1/2) + a + b) / (sqrt(b^2 - a^2) tan(x 1/2) - a - b)) / sqrt(b^2 - a^2)",
+	"b^2 - a^2",
+
+	"x sin(a x) sin(b x)",
+	"1/2 ((x sin(x (a - b)))/(a - b) - (x sin(x (a + b)))/(a + b) + cos(x (a - b))/(a - b)^2 - cos(x (a + b))/(a + b)^2)",
+	"and(not(a + b == 0),not(a - b == 0))",
+
+	NULL,
+};
+
+char *integral_tab_power[] = {
+
+	"a", // for forms c^d where both c and d are constant expressions
+	"a x",
+	"1",
+
+	"1 / x",
+	"log(x)",
+	"1",
+
+	"x^a",			// integrand
+	"x^(a + 1) / (a + 1)",	// answer
+	"not(a = -1)",		// condition
+
+	"a^x",
+	"a^x / log(a)",
+	"or(not(number(a)),a>0)",
+
+	"1 / (a + b x)",
+	"log(a + b x) / b",
+	"1",
+// 124
+	"sqrt(a x + b)",
+	"2/3 (a x + b)^(3/2) / a",
+	"1",
+// 138
+	"sqrt(a x^2 + b)",
+	"1/2 x sqrt(a x^2 + b) + 1/2 b log(sqrt(a) sqrt(a x^2 + b) + a x) / sqrt(a)",
+	"1",
+// 131
+	"1 / sqrt(a x + b)",
+	"2 sqrt(a x + b) / a",
+	"1",
+
+	"1 / ((a + b x)^2)",
+	"-1 / (b (a + b x))",
+	"1",
+
+	"1 / ((a + b x)^3)",
+	"-1 / ((2 b) ((a + b x)^2))",
+	"1",
+// 16
+	"1 / (a x^2 + b)",
+	"arctan(sqrt(a) x / sqrt(b)) / sqrt(a) / sqrt(b)",
+	"1",
+// 17
+	"1 / sqrt(a x^2 + b)",
+	"log(sqrt(a) sqrt(a x^2 + b) + a x) / sqrt(a)",
+	"1",
+// 65
+	"1 / (a x^2 + b)^2",
+	"1/2 ((arctan((sqrt(a) x) / sqrt(b))) / (sqrt(a) b^(3/2)) + x / (a b x^2 + b^2))",
+	"1",
+// 165
+	"(a x^2 + b)^(-3/2)",
+	"x / b / sqrt(a x^2 + b)",
+	"1",
+// 74
+	"1 / (a x^3 + b)",
+	"-log(a^(2/3) x^2 - a^(1/3) b^(1/3) x + b^(2/3))/(6 a^(1/3) b^(2/3))"
+	" + log(a^(1/3) x + b^(1/3))/(3 a^(1/3) b^(2/3))"
+	" - (i log(1 - (i (1 - (2 a^(1/3) x)/b^(1/3)))/sqrt(3)))/(2 sqrt(3) a^(1/3) b^(2/3))"
+	" + (i log(1 + (i (1 - (2 a^(1/3) x)/b^(1/3)))/sqrt(3)))/(2 sqrt(3) a^(1/3) b^(2/3))", // from Wolfram Alpha
+	"1",
+// 77
+	"1 / (a x^4 + b)",
+	"-log(-sqrt(2) a^(1/4) b^(1/4) x + sqrt(a) x^2 + sqrt(b))/(4 sqrt(2) a^(1/4) b^(3/4))"
+	" + log(sqrt(2) a^(1/4) b^(1/4) x + sqrt(a) x^2 + sqrt(b))/(4 sqrt(2) a^(1/4) b^(3/4))"
+	" - (i log(1 - i (1 - (sqrt(2) a^(1/4) x)/b^(1/4))))/(4 sqrt(2) a^(1/4) b^(3/4))"
+	" + (i log(1 + i (1 - (sqrt(2) a^(1/4) x)/b^(1/4))))/(4 sqrt(2) a^(1/4) b^(3/4))"
+	" + (i log(1 - i ((sqrt(2) a^(1/4) x)/b^(1/4) + 1)))/(4 sqrt(2) a^(1/4) b^(3/4))"
+	" - (i log(1 + i ((sqrt(2) a^(1/4) x)/b^(1/4) + 1)))/(4 sqrt(2) a^(1/4) b^(3/4))", // from Wolfram Alpha
+	"1",
+// 164
+	"sqrt(a + x^6 + 3 a^(1/3) x^4 + 3 a^(2/3) x^2)",
+	"1/4 (x sqrt((x^2 + a^(1/3))^3) + 3/2 a^(1/3) x sqrt(x^2 + a^(1/3)) + 3/2 a^(2/3) log(x + sqrt(x^2 + a^(1/3))))",
+	"1",
+// 165
+	"sqrt(-a + x^6 - 3 a^(1/3) x^4 + 3 a^(2/3) x^2)",
+	"1/4 (x sqrt((x^2 - a^(1/3))^3) - 3/2 a^(1/3) x sqrt(x^2 - a^(1/3)) + 3/2 a^(2/3) log(x + sqrt(x^2 - a^(1/3))))",
+	"1",
+
+	"sinh(x)^2",
+	"sinh(2 x) 1/4 - x 1/2",
+	"1",
+
+	"tanh(x)^2",
+	"x - tanh(x)",
+	"1",
+
+	"cosh(x)^2",
+	"sinh(2 x) 1/4 + x 1/2",
+	"1",
+
+	NULL,
+};
+
+char *integral_tab[] = {
+
+	"a",
+	"a x",
+	"1",
+
+	"x",
+	"1/2 x^2",
+	"1",
+// 18
+	"x / sqrt(a x^2 + b)",
+	"sqrt(a x^2 + b) / a",
+	"1",
+
+	"x / (a + b x)",
+	"x / b - a log(a + b x) / (b b)",
+	"1",
+
+	"x / ((a + b x)^2)",
+	"(log(a + b x) + a / (a + b x)) / (b^2)",
+	"1",
+// 33
+	"x^2 / (a + b x)",
+	"a^2 log(a + b x) / b^3 + x (b x - 2 a) / (2 b^2)",
+	"1",
+// 34
+	"x^2 / (a + b x)^2",
+	"(-a^2 / (a + b x) - 2 a log(a + b x) + b x) / b^3",
+	"1",
+
+	"x^2 / (a + b x)^3",
+	"(log(a + b x) + 2 a / (a + b x) - a^2 / (2 ((a + b x)^2))) / (b^3)",
+	"1",
+
+	"1 / x / (a + b x)",
+	"-log((a + b x) / x) / a",
+	"1",
+
+	"1 / x / (a + b x)^2",
+	"1 / (a (a + b x)) - log((a + b x) / x) / (a^2)",
+	"1",
+
+	"1 / x / (a + b x)^3",
+	"(1/2 ((2 a + b x) / (a + b x))^2 + log(x / (a + b x))) / (a^3)",
+	"1",
+
+	"1 / x^2 / (a + b x)",
+	"-1 / (a x) + b log((a + b x) / x) / (a^2)",
+	"1",
+
+	"1 / x^3 / (a + b x)",
+	"(2 b x - a) / (2 a^2 x^2) + b^2 log(x / (a + b x)) / (a^3)",
+	"1",
+
+	"1 / x^2 / (a + b x)^2",
+	"-(a + 2 b x) / (a^2 x (a + b x)) + 2 b log((a + b x) / x) / (a^3)",
+	"1",
+
+	"x / (a + b x^2)",
+	"log(a + b x^2) / (2 b)",
+	"1",
+// 64
+	"x^2 / (a x^2 + b)",
+	"1/2 i a^(-3/2) sqrt(b) (log(1 + i sqrt(a) x / sqrt(b)) - log(1 - i sqrt(a) x / sqrt(b))) + x / a",
+	"1",
+
+	"1 / x * 1 / (a + b x^2)",
+	"1 log(x^2 / (a + b x^2)) / (2 a)",
+	"1",
+// 71
+	"1 / x^2 * 1 / (a x^2 + b)",
+	"1/2 i sqrt(a) b^(-3/2) (log(1 + i sqrt(a) x / sqrt(b)) - log(1 - i sqrt(a) x / sqrt(b))) - 1 / (b x)",
+	"1",
+// 76
+	"x^2 / (a + b x^3)",
+	"1 log(a + b x^3) / (3 b)",
+	"1",
+
+	"x / (a + b x^4)",
+	"sqrt(b / a) arctan(x^2 sqrt(b / a)) / (2 b)",
+	"or(not(number(a b)),testgt(a b,0))",
+
+	"x / (a + b x^4)",
+	"sqrt(-b / a) log((x^2 - sqrt(-a / b)) / (x^2 + sqrt(-a / b))) / (4 b)",
+	"or(not(number(a b)),testlt(a b,0))",
+
+	"x^2 / (a + b x^4)",
+	"1 (1/2 log((x^2 - 2 (a 1/4 / b)^(1/4) x + 2 sqrt(a 1/4 / b)) / (x^2 + 2 (a 1/4 / b)^(1/4) x + 2 sqrt(a 1/4 / b))) + arctan(2 (a 1/4 / b)^(1/4) x / (2 sqrt(a 1/4 / b) - x^2))) / (4 b (a 1/4 / b)^(1/4))",
+	"or(not(number(a b)),testgt(a b,0))",
+
+	"x^2 / (a + b x^4)",
+	"1 (log((x - (-a / b)^(1/4)) / (x + (-a / b)^(1/4))) + 2 arctan(x / ((-a / b)^(1/4)))) / (4 b (-a / b)^(1/4))",
+	"or(not(number(a b)),testlt(a b,0))",
+
+	"x^3 / (a + b x^4)",
+	"1 log(a + b x^4) / (4 b)",
+	"1",
+
+	"x sqrt(a + b x)",
+	"-2 (2 a - 3 b x) sqrt((a + b x)^3) 1/15 / (b^2)",
+	"1",
+
+	"x^2 sqrt(a + b x)",
+	"2 (8 a^2 - 12 a b x + 15 b^2 x^2) sqrt((a + b x)^3) 1/105 / (b^3)",
+	"1",
+
+	"x^2 sqrt(a + b x^2)",
+	"(sqrt(b) x sqrt(a + b x^2) (a + 2 b x^2) - a^2 log(sqrt(b) sqrt(a + b x^2) + b x)) / (8 b^(3/2))",
+	"1",
+// 128
+	"sqrt(a x + b) / x",
+	"2 sqrt(a x + b) - 2 sqrt(b) arctanh(sqrt(a x + b) / sqrt(b))",
+	"1",
+// 129
+	"sqrt(a x + b) / x^2",
+	"-sqrt(a x + b) / x - a arctanh(sqrt(a x + b) / sqrt(b)) / sqrt(b)",
+	"1",
+
+	"x / sqrt(a + b x)",
+	"-2 (2 a - b x) sqrt(a + b x) / (3 (b^2))",
+	"1",
+
+	"x^2 / sqrt(a + b x)",
+	"2 (8 a^2 - 4 a b x + 3 b^2 x^2) sqrt(a + b x) / (15 (b^3))",
+	"1",
+// 134
+	"1 / x / sqrt(a x + b)",
+	"-2 arctanh(sqrt(a x + b) / sqrt(b)) / sqrt(b)",
+	"1",
+// 137
+	"1 / x^2 / sqrt(a x + b)",
+	"a arctanh(sqrt(a x + b) / sqrt(b)) / b^(3/2) - sqrt(a x + b) / (b x)",
+	"1",
+// 158
+	"1 / x / sqrt(a x^2 + b)",
+	"(log(x) - log(sqrt(b) sqrt(a x^2 + b) + b)) / sqrt(b)",
+	"1",
+// 160
+	"sqrt(a x^2 + b) / x",
+	"sqrt(a x^2 + b) - sqrt(b) log(sqrt(b) sqrt(a x^2 + b) + b) + sqrt(b) log(x)",
+	"1",
+// 163
+	"x sqrt(a x^2 + b)",
+	"1/3 (a x^2 + b)^(3/2) / a",
+	"1",
+// 166
+	"x (a x^2 + b)^(-3/2)",
+	"-1 / a / sqrt(a x^2 + b)",
+	"1",
+
+	"x sqrt(a + x^6 + 3 a^(1/3) x^4 + 3 a^(2/3) x^2)",
+	"1/5 sqrt((x^2 + a^(1/3))^5)",
+	"1",
+// 168
+	"x^2 sqrt(a x^2 + b)",
+	"1/8 a^(-3/2) (sqrt(a) x sqrt(a x^2 + b) (2 a x^2 + b) - b^2 log(sqrt(a) sqrt(a x^2 + b) + a x))",
+	"and(number(a),a>0)",
+// 169
+	"x^3 sqrt(a x^2 + b)",
+	"1/15 sqrt(a x^2 + b) (3 a^2 x^4 + a b x^2 - 2 b^2) / a^2",
+	"1",
+// 171
+	"x^2 / sqrt(a x^2 + b)",
+	"1/2 a^(-3/2) (sqrt(a) x sqrt(a x^2 + b) - b log(sqrt(a) sqrt(a x^2 + b) + a x))",
+	"1",
+// 172
+	"x^3 / sqrt(a x^2 + b)",
+	"1/3 (a x^2 - 2 b) sqrt(a x^2 + b) / a^2",
+	"1",
+// 173
+	"1 / x^2 / sqrt(a x^2 + b)",
+	"-sqrt(a x^2 + b) / (b x)",
+	"1",
+// 174
+	"1 / x^3 / sqrt(a x^2 + b)",
+	"-sqrt(a x^2 + b) / (2 b x^2) + a (log(sqrt(b) sqrt(a x^2 + b) + b) - log(x)) / (2 b^(3/2))",
+	"1",
+// 216
+	"sqrt(a x^2 + b) / x^2",
+	"sqrt(a) log(sqrt(a) sqrt(a x^2 + b) + a x) - sqrt(a x^2 + b) / x",
+	"and(number(a),a>0)",
+// 217
+	"sqrt(a x^2 + b) / x^3",
+	"1/2 (-sqrt(a x^2 + b) / x^2 - (a log(sqrt(b) sqrt(a x^2 + b) + b)) / sqrt(b) + (a log(x)) / sqrt(b))",
+	"and(number(b),b>0)",
+
+	"arcsin(a x)",
+	"x arcsin(a x) + sqrt(1 - a^2 x^2) / a",
+	"1",
+
+	"arccos(a x)",
+	"x arccos(a x) + sqrt(1 - a^2 x^2) / a",
+	"1",
+
+	"arctan(a x)",
+	"x arctan(a x) - log(1 + a^2 x^2) / (2 a)",
+	"1",
+
+	"sinh(x)",
+	"cosh(x)",
+	"1",
+
+	"cosh(x)",
+	"sinh(x)",
+	"1",
+
+	"tanh(x)",
+	"log(cosh(x))",
+	"1",
+
+	"x sinh(x)",
+	"x cosh(x) - sinh(x)",
+	"1",
+
+	"x cosh(x)",
+	"x sinh(x) - cosh(x)",
+	"1",
+
+	"erf(a x)",
+	"x erf(a x) + exp(-a^2 x^2) / (a sqrt(pi))",
+	"1",
+
+	"x^2 (1 - x^2)^(3/2)",
+	"(x sqrt(1 - x^2) (-8 x^4 + 14 x^2 - 3) + 3 arcsin(x)) 1/48",
+	"1",
+
+	"x^2 (1 - x^2)^(5/2)",
+	"(x sqrt(1 - x^2) (48 x^6 - 136 x^4 + 118 x^2 - 15) + 15 arcsin(x)) 1/384",
+	"1",
+
+	"x^4 (1 - x^2)^(3/2)",
+	"(-x sqrt(1 - x^2) (16 x^6 - 24 x^4 + 2 x^2 + 3) + 3 arcsin(x)) 1/128",
+	"1",
+
+	NULL,
+};
+
+// examples
+//
+// integral(f)
+// integral(f,2)
+// integral(f,x)
+// integral(f,x,2)
+// integral(f,x,y)
+
+#undef X
+#undef Y
+
+#define X p4
+#define Y p5
 
 void
 eval_integral(void)
 {
-	int i, n;
-	// evaluate 1st arg to get function F
-	p1 = cdr(p1);
-	push(car(p1));
+	int i, n, flag;
+	expanding++;
+	push(cadr(p1));
 	eval();
-	// check for single arg
-	if (cdr(p1) == symbol(NIL)) {
+	p1 = cddr(p1);
+	if (!iscons(p1)) {
 		guess();
 		integral();
+		expanding--;
 		return;
 	}
-	p1 = cdr(p1);
-	while (iscons(p1)) {
-		// next arg should be a symbol
-		push(car(p1)); // have to eval in case of $METAX
-		eval();
-		X = pop();
-		if (!issymbol(X))
-			stop("integral: symbol expected");
-		p1 = cdr(p1);
-		// if next arg is a number then use it
-		n = 1;
-		if (isnum(car(p1))) {
+	flag = 0;
+	while (iscons(p1) || flag) {
+		if (flag) {
+			X = Y;
+			flag = 0;
+		} else {
 			push(car(p1));
-			n = pop_integer();
-			if (n < 1)
-				stop("nth integral: check n");
+			eval();
+			X = pop();
 			p1 = cdr(p1);
 		}
-		for (i = 0; i < n; i++) {
+		if (isnum(X)) {
 			push(X);
-			integral();
+			n = pop_integer();
+			if (n == ERR)
+				stop("integral: integer expected");
+			guess();
+			X = pop();
+			for (i = 0; i < n; i++) {
+				push(X);
+				integral();
+			}
+			continue;
 		}
+		if (!issymbol(X))
+			stop("integral: symbol expected");
+		if (iscons(p1)) {
+			push(car(p1));
+			eval();
+			Y = pop();
+			p1 = cdr(p1);
+			if (isnum(Y)) {
+				push(Y);
+				n = pop_integer();
+				if (n == ERR)
+					stop("integral: integer expected");
+				for (i = 0; i < n; i++) {
+					push(X);
+					integral();
+				}
+				continue;
+			}
+			flag = 1;
+		}
+		push(X);
+		integral();
 	}
+	expanding--;
 }
+
+#undef F
+#undef X
+#undef I
+#undef C
+
+#define F p3
+#define X p4
+#define I p5
+#define C p6
 
 void
 integral(void)
 {
 	save();
-	p2 = pop();
-	p1 = pop();
-	if (car(p1) == symbol(ADD))
-		integral_of_sum();
-	else if (car(p1) == symbol(MULTIPLY))
-		integral_of_product();
-	else
-		integral_of_form();
-	p1 = pop();
-	if (find(p1, symbol(INTEGRAL)))
-		stop("integral: sorry, could not find a solution");
-	push(p1);
-	simplify();	// polish the result
-	eval();		// normalize the result
+	integral_nib();
 	restore();
 }
 
 void
-integral_of_sum(void)
+integral_nib(void)
 {
-	p1 = cdr(p1);
-	push(car(p1));
-	push(p2);
-	integral();
-	p1 = cdr(p1);
-	while (iscons(p1)) {
-		push(car(p1));
-		push(p2);
-		integral();
-		add();
-		p1 = cdr(p1);
+	int h;
+	X = pop();
+	F = pop();
+	if (car(F) == symbol(ADD)) {
+		h = tos;
+		p1 = cdr(F);
+		while (iscons(p1)) {
+			push(car(p1));
+			push(X);
+			integral();
+			p1 = cdr(p1);
+		}
+		add_terms(tos - h);
+		return;
 	}
-}
-
-void
-integral_of_product(void)
-{
-	push(p1);
-	push(p2);
-	partition();
-	p1 = pop();			// pop variable part
+	if (car(F) == symbol(MULTIPLY)) {
+		push(F);
+		push(X);
+		partition_integrand();	// push const part then push var part
+		F = pop();		// pop var part
+		integral_of_form();
+		multiply();		// multiply by const part
+		return;
+	}
 	integral_of_form();
-	multiply();			// multiply constant part
 }
-
-extern char *itab[];
 
 void
 integral_of_form(void)
 {
-	push(p1);
-	push(p2);
-	transform(itab);
-	p3 = pop();
-	if (p3 == symbol(NIL)) {
-		push_symbol(INTEGRAL);
-		push(p1);
-		push(p2);
-		list(3);
-	} else
-		push(p3);
+	int h;
+	save_binding(symbol(METAA));
+	save_binding(symbol(METAB));
+	save_binding(symbol(METAX));
+	set_binding(symbol(METAX), X);
+	// put constants in F(X) on the stack
+	h = tos;
+	push_integer(1); // 1 is a candidate for a or b
+	push(F);
+	push(X);
+	collect_coeffs();
+	push(X);
+	decomp();
+	integral_lookup(h);
+	restore_binding(symbol(METAX));
+	restore_binding(symbol(METAB));
+	restore_binding(symbol(METAA));
 }
 
-//-----------------------------------------------------------------------------
-//
-//	Input:		Matrix on stack
-//
-//	Output:		Inverse on stack
-//
-//	Example:
-//
-//	> inv(((1,2),(3,4))
-//	((-2,1),(3/2,-1/2))
-//
-//	Note:
-//
-//	Uses Gaussian elimination for numerical matrices.
-//
-//-----------------------------------------------------------------------------
+void
+integral_lookup(int h)
+{
+	int t;
+	char **s;
+	t = integral_classify(F);
+	if ((t & 1) && find_integral(h, integral_tab_exp))
+		return;
+	if ((t & 2) && find_integral(h, integral_tab_log))
+		return;
+	if ((t & 4) && find_integral(h, integral_tab_trig))
+		return;
+	if (car(F) == symbol(POWER))
+		s = integral_tab_power;
+	else
+		s = integral_tab;
+	if (find_integral(h, s))
+		return;
+	stop("integral: could not find a solution");
+}
 
 int
-inv_check_arg(void)
+integral_classify(struct atom *p)
 {
-	if (!istensor(p1))
-		return 0;
-	else if (p1->u.tensor->ndim != 2)
-		return 0;
-	else if (p1->u.tensor->dim[0] != p1->u.tensor->dim[1])
-		return 0;
-	else
+	int t = 0;
+	if (iscons(p)) {
+		while (iscons(p)) {
+			t |= integral_classify(car(p));
+			p = cdr(p);
+		}
+		return t;
+	}
+	if (p == symbol(EXP1))
 		return 1;
+	if (p == symbol(LOG))
+		return 2;
+	if (p == symbol(SIN) || p == symbol(COS) || p == symbol(TAN))
+		return 4;
+	return 0;
+}
+
+int
+find_integral(int h, char **s)
+{
+	for (;;) {
+		if (*s == NULL)
+			return 0;
+		scan1(s[0]); // integrand
+		I = pop();
+		scan1(s[2]); // condition
+		C = pop();
+		if (find_integral_nib(h))
+			break;
+		s += 3;
+	}
+	tos = h; // pop all
+	scan1(s[1]); // answer
+	eval();
+	return 1;
+}
+
+int
+find_integral_nib(int h)
+{
+	int i, j;
+	for (i = h; i < tos; i++) {
+		set_binding(symbol(METAA), stack[i]);
+		for (j = h; j < tos; j++) {
+			set_binding(symbol(METAB), stack[j]);
+			push(C);			// condition ok?
+			eval();
+			p1 = pop();
+			if (iszero(p1))
+				continue;		// no, go to next j
+			push(F);			// F = I?
+			push(I);
+			eval();
+			subtract();
+			p1 = pop();
+			if (iszero(p1))
+				return 1;		// yes
+		}
+	}
+	return 0;					// no
+}
+
+// returns constant expresions on the stack
+
+void
+decomp(void)
+{
+	save();
+	decomp_nib();
+	restore();
+}
+
+void
+decomp_nib(void)
+{
+	p2 = pop(); // x
+	p1 = pop(); // expr
+	// is the entire expression constant?
+	if (!find(p1, p2)) {
+		push(p1);
+		return;
+	}
+	// sum?
+	if (car(p1) == symbol(ADD)) {
+		decomp_sum();
+		return;
+	}
+	// product?
+	if (car(p1) == symbol(MULTIPLY)) {
+		decomp_product();
+		return;
+	}
+	// naive decomp if not sum or product
+	p3 = cdr(p1);
+	while (iscons(p3)) {
+		push(car(p3));
+		push(p2);
+		decomp();
+		p3 = cdr(p3);
+	}
+}
+
+void
+decomp_sum(void)
+{
+	int h;
+	// decomp terms involving x
+	p3 = cdr(p1);
+	while (iscons(p3)) {
+		if (find(car(p3), p2)) {
+			push(car(p3));
+			push(p2);
+			decomp();
+		}
+		p3 = cdr(p3);
+	}
+	// add together all constant terms
+	h = tos;
+	p3 = cdr(p1);
+	while (iscons(p3)) {
+		if (!find(car(p3), p2))
+			push(car(p3));
+		p3 = cdr(p3);
+	}
+	if (tos - h) {
+		add_terms(tos - h);
+		p3 = pop();
+		push(p3);
+		push(p3);
+		negate(); // need both +a, -a for some integrals
+	}
+}
+
+void
+decomp_product(void)
+{
+	int h;
+	// decomp factors involving x
+	p3 = cdr(p1);
+	while (iscons(p3)) {
+		if (find(car(p3), p2)) {
+			push(car(p3));
+			push(p2);
+			decomp();
+		}
+		p3 = cdr(p3);
+	}
+	// multiply together all constant factors
+	h = tos;
+	p3 = cdr(p1);
+	while (iscons(p3)) {
+		if (!find(car(p3), p2))
+			push(car(p3));
+		p3 = cdr(p3);
+	}
+	if (tos - h)
+		multiply_factors(tos - h);
+}
+
+// for example, exp(a x + b x) -> exp((a + b) x)
+
+void
+collect_coeffs(void)
+{
+	save();
+	collect_coeffs_nib();
+	restore();
+}
+
+void
+collect_coeffs_nib(void)
+{
+	int h, i, j, n, t;
+	struct atom **s;
+	p2 = pop(); // x
+	p1 = pop(); // expr
+	if (!iscons(p1)) {
+		push(p1);
+		return;
+	}
+	h = tos;
+	s = stack + tos;
+	// depth first
+	push(car(p1));
+	p1 = cdr(p1);
+	while (iscons(p1)) {
+		push(car(p1));
+		push(p2);
+		collect_coeffs();
+		p1 = cdr(p1);
+	}
+	list(tos - h);
+	p1 = pop();
+	if (car(p1) != symbol(ADD)) {
+		push(p1);
+		return;
+	}
+	// partition terms
+	p1 = cdr(p1);
+	while (iscons(p1)) {
+		p3 = car(p1);
+		if (car(p3) == symbol(MULTIPLY)) {
+			push(p3);
+			push(p2);
+			partition_integrand();	// push const part then push var part
+		} else if (find(p3, p2)) {
+			push_integer(1);	// const part
+			push(p3);		// var part
+		} else {
+			push(p3);		// const part
+			push_integer(1);	// var part
+		}
+		p1 = cdr(p1);
+	}
+	// sort by var part
+	n = tos - h;
+	qsort(s, n / 2, 2 * sizeof (struct atom *), collect_coeffs_sort_func);
+	// combine const parts of matching var parts
+	for (i = 0; i < n - 2; i += 2) {
+		if (equal(s[i + 1], s[i + 3])) {
+			push(s[0]);
+			push(s[2]);
+			add();
+			s[0] = pop();
+			for (j = i + 2; j < n; j++)
+				s[j] = s[j + 2];
+			n -= 2;
+			tos -= 2;
+			i -= 2; // use the same index again
+		}
+	}
+	// combine all the parts without expanding
+	t = expanding;
+	expanding = 0;
+	n = tos - h;
+	for (i = 0; i < n; i += 2) {
+		push(s[i]);		// const part
+		push(s[i + 1]);		// var part
+		multiply();
+		s[i / 2] = pop();
+	}
+	tos -= n / 2;
+	add_terms(tos - h);
+	expanding = t;
+}
+
+int
+collect_coeffs_sort_func(const void *q1, const void *q2)
+{
+	return cmp_terms(((struct atom **) q1)[1], ((struct atom **) q2)[1]);
+}
+
+void
+partition_integrand(void)
+{
+	int h;
+	save();
+	p2 = pop(); // x
+	p1 = pop(); // expr
+	// push const part
+	h = tos;
+	p3 = cdr(p1);
+	while (iscons(p3)) {
+		if (!find(car(p3), p2))
+			push(car(p3));
+		p3 = cdr(p3);
+	}
+	if (h == tos)
+		push_integer(1);
+	else
+		multiply_factors(tos - h);
+	// push var part
+	h = tos;
+	p3 = cdr(p1);
+	while (iscons(p3)) {
+		if (find(car(p3), p2))
+			push(car(p3));
+		p3 = cdr(p3);
+	}
+	if (h == tos)
+		push_integer(1);
+	else
+		multiply_factors(tos - h);
+	restore();
+}
+
+void
+eval_inv(void)
+{
+	push(cadr(p1));
+	eval();
+	inv();
 }
 
 void
 inv(void)
 {
-	int i, n;
-	U **a;
 	save();
-	p1 = pop();
-	if (inv_check_arg() == 0) {
-		push_symbol(INV);
-		push(p1);
-		list(2);
-		restore();
-		return;
-	}
-	n = p1->u.tensor->nelem;
-	a = p1->u.tensor->elem;
-	for (i = 0; i < n; i++)
-		if (!isnum(a[i]))
-			break;
-	if (i == n)
-		yyinvg();
-	else {
-		push(p1);
-		adj();
-		push(p1);
-		det();
-		p2 = pop();
-		if (iszero(p2))
-			stop("inverse of singular matrix");
-		push(p2);
-		divide();
-	}
+	inv_nib();
 	restore();
 }
 
 void
-invg(void)
+inv_nib(void)
 {
-	save();
 	p1 = pop();
-	if (inv_check_arg() == 0) {
-		push_symbol(INVG);
+	if (!istensor(p1)) {
 		push(p1);
-		list(2);
-		restore();
+		reciprocate();
 		return;
 	}
-	yyinvg();
-	restore();
-}
-
-// inverse using gaussian elimination
-
-void
-yyinvg(void)
-{
-	int h, i, j, n;
-	n = p1->u.tensor->dim[0];
-	h = tos;
-	for (i = 0; i < n; i++)
-		for (j = 0; j < n; j++)
-			if (i == j)
-				push(one);
-			else
-				push(zero);
-	for (i = 0; i < n * n; i++)
-		push(p1->u.tensor->elem[i]);
-	inv_decomp(n);
-	p1 = alloc_tensor(n * n);
-	p1->u.tensor->ndim = 2;
-	p1->u.tensor->dim[0] = n;
-	p1->u.tensor->dim[1] = n;
-	for (i = 0; i < n * n; i++)
-		p1->u.tensor->elem[i] = stack[h + i];
-	tos -= 2 * n * n;
+	if (p1->u.tensor->ndim != 2 || p1->u.tensor->dim[0] != p1->u.tensor->dim[1])
+		stop("inv: square matrix expected");
 	push(p1);
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Input:		n * n unit matrix on stack
-//
-//			n * n operand on stack
-//
-//	Output:		n * n inverse matrix on stack
-//
-//			n * n garbage on stack
-//
-//			p2 mangled
-//
-//-----------------------------------------------------------------------------
-
-#undef A
-#undef U
-
-#define A(i, j) stack[a + n * (i) + (j)]
-#define U(i, j) stack[u + n * (i) + (j)]
-
-void
-inv_decomp(int n)
-{
-	int a, d, i, j, u;
-	a = tos - n * n;
-	u = a - n * n;
-	for (d = 0; d < n; d++) {
-		// diagonal element zero?
-		if (equal(A(d, d), zero)) {
-			// find a new row
-			for (i = d + 1; i < n; i++)
-				if (!equal(A(i, d), zero))
-					break;
-			if (i == n)
-				stop("inverse of singular matrix");
-			// exchange rows
-			for (j = 0; j < n; j++) {
-				p2 = A(d, j);
-				A(d, j) = A(i, j);
-				A(i, j) = p2;
-				p2 = U(d, j);
-				U(d, j) = U(i, j);
-				U(i, j) = p2;
-			}
-		}
-		// multiply the pivot row by 1 / pivot
-		p2 = A(d, d);
-		for (j = 0; j < n; j++) {
-			if (j > d) {
-				push(A(d, j));
-				push(p2);
-				divide();
-				A(d, j) = pop();
-			}
-			push(U(d, j));
-			push(p2);
-			divide();
-			U(d, j) = pop();
-		}
-		// clear out the column above and below the pivot
-		for (i = 0; i < n; i++) {
-			if (i == d)
-				continue;
-			// multiplier
-			p2 = A(i, d);
-			// add pivot row to i-th row
-			for (j = 0; j < n; j++) {
-				if (j > d) {
-					push(A(i, j));
-					push(A(d, j));
-					push(p2);
-					multiply();
-					subtract();
-					A(i, j) = pop();
-				}
-				push(U(i, j));
-				push(U(d, j));
-				push(p2);
-				multiply();
-				subtract();
-				U(i, j) = pop();
-			}
-		}
-	}
+	adj();
+	push(p1);
+	det();
+	p2 = pop();
+	if (iszero(p2))
+		stop("inv: singular matrix");
+	push(p2);
+	divide();
 }
 
 int
-iszero(U *p)
+iszero(struct atom *p)
 {
 	int i;
-	switch (p->k) {
-	case NUM:
-		if (MZERO(p->u.q.a))
-			return 1;
-		break;
-	case DOUBLE:
-		if (p->u.d == 0.0)
-			return 1;
-		break;
-	case TENSOR:
+	if (isrational(p))
+		return MZERO(p->u.q.a);
+	else if (isdouble(p))
+		return p->u.d == 0.0;
+	else if (istensor(p)) {
 		for (i = 0; i < p->u.tensor->nelem; i++)
 			if (!iszero(p->u.tensor->elem[i]))
 				return 0;
 		return 1;
-	default:
-		break;
-	}
-	return 0;
+	} else
+		return 0;
 }
 
 int
-isnegativenumber(U *p)
+isplusone(struct atom *p)
 {
-	switch (p->k) {
-	case NUM:
-		if (MSIGN(p->u.q.a) == -1)
-			return 1;
-		break;
-	case DOUBLE:
-		if (p->u.d < 0.0)
-			return 1;
-		break;
-	default:
-		break;
-	}
-	return 0;
+	return equaln(p, 1);
 }
 
 int
-isplusone(U *p)
+isminusone(struct atom *p)
 {
-	switch (p->k) {
-	case NUM:
-		if (MEQUAL(p->u.q.a, 1) && MEQUAL(p->u.q.b, 1))
-			return 1;
-		break;
-	case DOUBLE:
-		if (p->u.d == 1.0)
-			return 1;
-		break;
-	default:
-		break;
-	}
-	return 0;
+	return equaln(p, -1);
 }
 
 int
-isminusone(U *p)
+isinteger(struct atom *p)
 {
-	switch (p->k) {
-	case NUM:
-		if (MEQUAL(p->u.q.a, -1) && MEQUAL(p->u.q.b, 1))
-			return 1;
-		break;
-	case DOUBLE:
-		if (p->u.d == -1.0)
-			return 1;
-		break;
-	default:
-		break;
-	}
-	return 0;
+	return isrational(p) && MEQUAL(p->u.q.b, 1);
 }
 
 int
-isinteger(U *p)
+isfraction(struct atom *p)
 {
-	if (p->k == NUM && MEQUAL(p->u.q.b, 1))
-		return 1;
+	return isrational(p) && !MEQUAL(p->u.q.b, 1);
+}
+
+int
+isposint(struct atom *p)
+{
+	return isinteger(p) && p->sign == MPLUS;
+}
+
+int
+iseveninteger(struct atom *p)
+{
+	return isinteger(p) && (p->u.q.a[0] & 1) == 0;
+}
+
+int
+isradical(struct atom *p)
+{
+	return car(p) == symbol(POWER) && isposint(cadr(p)) && isfraction(caddr(p));
+}
+
+int
+isnegative(struct atom *p)
+{
+	return isnegativeterm(p) || (car(p) == symbol(ADD) && isnegativeterm(cadr(p)));
+}
+
+int
+isnegativeterm(struct atom *p)
+{
+	return isnegativenumber(p) || (car(p) == symbol(MULTIPLY) && isnegativenumber(cadr(p)));
+}
+
+int
+isnegativenumber(struct atom *p)
+{
+	if (isrational(p))
+		return p->sign == MMINUS;
+	else if (isdouble(p))
+		return p->u.d < 0.0;
 	else
 		return 0;
 }
 
 int
-isnonnegativeinteger(U *p)
+iscomplexnumber(struct atom *p)
 {
-	if (isrational(p) && MEQUAL(p->u.q.b, 1) && MSIGN(p->u.q.a) == 1)
-		return 1;
-	else
-		return 0;
+	return isimaginarynumber(p) || (length(p) == 3 && car(p) == symbol(ADD) && isnum(cadr(p)) && isimaginarynumber(caddr(p)));
 }
 
 int
-isposint(U *p)
+isimaginarynumber(struct atom *p)
 {
-	if (isinteger(p) && MSIGN(p->u.q.a) == 1)
-		return 1;
-	else
-		return 0;
+	return isimaginaryunit(p) || (length(p) == 3 && car(p) == symbol(MULTIPLY) && isnum(cadr(p)) && isimaginaryunit(caddr(p)));
 }
 
 int
-ispoly(U *p, U *x)
+isimaginaryunit(struct atom *p)
+{
+	return car(p) == symbol(POWER) && equaln(cadr(p), -1) && equalq(caddr(p), 1, 2);
+}
+
+// p == 1/sqrt(2) ?
+
+int
+isoneoversqrttwo(struct atom *p)
+{
+	return car(p) == symbol(POWER) && equaln(cadr(p), 2) && equalq(caddr(p), -1, 2);
+}
+
+// p == -1/sqrt(2) ?
+
+int
+isminusoneoversqrttwo(struct atom *p)
+{
+	return length(p) == 3 && car(p) == symbol(MULTIPLY) && equaln(cadr(p), -1) && isoneoversqrttwo(caddr(p));
+}
+
+// x + y * (-1)^(1/2) where x and y are double?
+
+int
+isdoublez(struct atom *p)
+{
+	if (car(p) == symbol(ADD)) {
+		if (length(p) != 3)
+			return 0;
+		if (!isdouble(cadr(p))) // x
+			return 0;
+		p = caddr(p);
+	}
+	if (car(p) != symbol(MULTIPLY))
+		return 0;
+	if (length(p) != 3)
+		return 0;
+	if (!isdouble(cadr(p))) // y
+		return 0;
+	p = caddr(p);
+	if (car(p) != symbol(POWER))
+		return 0;
+	if (!equaln(cadr(p), -1))
+		return 0;
+	if (!equalq(caddr(p), 1, 2))
+		return 0;
+	return 1;
+}
+
+int
+ispoly(struct atom *p, struct atom *x)
 {
 	if (find(p, x))
 		return ispoly_expr(p, x);
@@ -10702,7 +11139,7 @@ ispoly(U *p, U *x)
 }
 
 int
-ispoly_expr(U *p, U *x)
+ispoly_expr(struct atom *p, struct atom *x)
 {
 	if (car(p) == symbol(ADD)) {
 		p = cdr(p);
@@ -10717,7 +11154,7 @@ ispoly_expr(U *p, U *x)
 }
 
 int
-ispoly_term(U *p, U *x)
+ispoly_term(struct atom *p, struct atom *x)
 {
 	if (car(p) == symbol(MULTIPLY)) {
 		p = cdr(p);
@@ -10732,7 +11169,7 @@ ispoly_term(U *p, U *x)
 }
 
 int
-ispoly_factor(U *p, U *x)
+ispoly_factor(struct atom *p, struct atom *x)
 {
 	if (equal(p, x))
 		return 1;
@@ -10748,755 +11185,639 @@ ispoly_factor(U *p, U *x)
 		return 1;
 }
 
-int
-isnegativeterm(U *p)
-{
-	if (isnegativenumber(p))
-		return 1;
-	else if (car(p) == symbol(MULTIPLY) && isnegativenumber(cadr(p)))
-		return 1;
-	else
-		return 0;
-}
-
-int
-isimaginarynumber(U *p)
-{
-	if ((car(p) == symbol(MULTIPLY)
-	&& length(p) == 3
-	&& isnum(cadr(p))
-	&& equal(caddr(p), imaginaryunit))
-	|| equal(p, imaginaryunit))
-		return 1;
-	else
-		return 0;
-}
-
-int
-iscomplexnumber(U *p)
-{
-	if ((car(p) == symbol(ADD)
-	&& length(p) == 3
-	&& isnum(cadr(p))
-	&& isimaginarynumber(caddr(p)))
-	|| isimaginarynumber(p))
-		return 1;
-	else
-		return 0;
-}
-
-int
-iseveninteger(U *p)
-{
-	if (isinteger(p) && (p->u.q.a[0] & 1) == 0)
-		return 1;
-	else
-		return 0;
-}
-
-int
-isnegative(U *p)
-{
-	if (car(p) == symbol(ADD) && isnegativeterm(cadr(p)))
-		return 1;
-	else if (isnegativeterm(p))
-		return 1;
-	else
-		return 0;
-}
-
-// returns 1 if there's a symbol somewhere
-
-int
-issymbolic(U *p)
-{
-	if (issymbol(p))
-		return 1;
-	else {
-		while (iscons(p)) {
-			if (issymbolic(car(p)))
-				return 1;
-			p = cdr(p);
-		}
-		return 0;
-	}
-}
-
-// i.e. 2, 2^3, etc.
-
-int
-isintegerfactor(U *p)
-{
-	if (isinteger(p) || (car(p) == symbol(POWER)
-	&& isinteger(cadr(p))
-	&& isinteger(caddr(p))))
-		return 1;
-	else
-		return 0;
-}
-
-int
-isoneover(U *p)
-{
-	if (car(p) == symbol(POWER)
-	&& isminusone(caddr(p)))
-		return 1;
-	else
-		return 0;
-}
-
-int
-isfraction(U *p)
-{
-	if (p->k == NUM && !MEQUAL(p->u.q.b, 1))
-		return 1;
-	else
-		return 0;
-}
-
-int
-equaln(U *p, int n)
-{
-	switch (p->k) {
-	case NUM:
-		if (MEQUAL(p->u.q.a, n) && MEQUAL(p->u.q.b, 1))
-			return 1;
-		break;
-	case DOUBLE:
-		if (p->u.d == (double) n)
-			return 1;
-		break;
-	default:
-		break;
-	}
-	return 0;
-}
-
-int
-equalq(U *p, int a, int b)
-{
-	switch (p->k) {
-	case NUM:
-		if (MEQUAL(p->u.q.a, a) && MEQUAL(p->u.q.b, b))
-			return 1;
-		break;
-	case DOUBLE:
-		if (p->u.d == (double) a / b)
-			return 1;
-		break;
-	default:
-		break;
-	}
-	return 0;
-}
-
-// p == 1/sqrt(2) ?
-
-int
-isoneoversqrttwo(U *p)
-{
-	if (car(p) == symbol(POWER)
-	&& equaln(cadr(p), 2)
-	&& equalq(caddr(p), -1, 2))
-		return 1;
-	else
-		return 0;
-}
-
-// p == -1/sqrt(2) ?
-
-int
-isminusoneoversqrttwo(U *p)
-{
-	if (car(p) == symbol(MULTIPLY)
-	&& equaln(cadr(p), -1)
-	&& isoneoversqrttwo(caddr(p))
-	&& length(p) == 3)
-		return 1;
-	else
-		return 0;
-}
-
-int
-isfloating(U *p)
-{
-	if (p->k == DOUBLE)
-		return 1;
-	while (iscons(p)) {
-		if (isfloating(car(p)))
-			return 1;
-		p = cdr(p);
-	}
-	return 0;
-}
-
-int
-isimaginaryunit(U *p)
-{
-	if (equal(p, imaginaryunit))
-		return 1;
-	else
-		return 0;
-}
-
-// n/2 * i * pi ?
-
-// return value:
-
-//	0	no
-
-//	1	1
-
-//	2	-1
-
-//	3	i
-
-//	4	-i
-
-int
-isquarterturn(U *p)
-{
-	int n, minussign = 0;
-	if (car(p) != symbol(MULTIPLY))
-		return 0;
-	if (equal(cadr(p), imaginaryunit)) {
-		if (caddr(p) != symbol(PI))
-			return 0;
-		if (length(p) != 3)
-			return 0;
-		return 2;
-	}
-	if (!isnum(cadr(p)))
-		return 0;
-	if (!equal(caddr(p), imaginaryunit))
-		return 0;
-	if (cadddr(p) != symbol(PI))
-		return 0;
-	if (length(p) != 4)
-		return 0;
-	push(cadr(p));
-	push_integer(2);
-	multiply();
-	n = pop_integer();
-	if (n == (int) 0x80000000)
-		return 0;
-	if (n < 1) {
-		minussign = 1;
-		n = -n;
-	}
-	switch (n % 4) {
-	case 0:
-		n = 1;
-		break;
-	case 1:
-		if (minussign)
-			n = 4;
-		else
-			n = 3;
-		break;
-	case 2:
-		n = 2;
-		break;
-	case 3:
-		if (minussign)
-			n = 3;
-		else
-			n = 4;
-		break;
-	}
-	return n;
-}
-
-// special multiple of pi?
-
-// returns for the following multiples of pi...
-
-//	-4/2	-3/2	-2/2	-1/2	1/2	2/2	3/2	4/2
-
-//	4	1	2	3	1	2	3	4
-
-int
-isnpi(U *p)
-{
-	int n;
-	if (p == symbol(PI))
-		return 2;
-	if (car(p) == symbol(MULTIPLY)
-	&& isnum(cadr(p))
-	&& caddr(p) == symbol(PI)
-	&& length(p) == 3)
-		;
-	else
-		return 0;
-	push(cadr(p));
-	push_integer(2);
-	multiply();
-	n = pop_integer();
-	if (n == (int) 0x80000000)
-		return 0;
-	if (n < 0)
-		n = 4 - (-n) % 4;
-	else
-		n = 1 + (n - 1) % 4;
-	return n;
-}
-
 void
 eval_isprime(void)
 {
 	push(cadr(p1));
 	eval();
 	p1 = pop();
-	if (isnonnegativeinteger(p1) && mprime(p1->u.q.a))
+	if (isposint(p1) && mprime(p1->u.q.a))
 		push_integer(1);
 	else
 		push_integer(0);
 }
 
-/* Table of integrals
-
-The symbol f is just a dummy symbol for creating a list f(A,B,C,C,...) where
-
-	A	is the template expression
-
-	B	is the result expression
-
-	C	is an optional list of conditional expressions
-*/
-
-char *itab[] = {
-// 1
-	"f(a,a*x)",
-// 9 (need a caveat for 7 so we can put 9 after 7)
-	"f(1/x,log(x))",
-// 7
-	"f(x^a,x^(a+1)/(a+1))",
-// 12
-	"f(exp(a*x),1/a*exp(a*x))",
-	"f(exp(a*x+b),1/a*exp(a*x+b))",
-	"f(x*exp(a*x^2),exp(a*x^2)/(2*a))",
-	"f(x*exp(a*x^2+b),exp(a*x^2+b)/(2*a))",
-// 14
-	"f(log(a*x),x*log(a*x)-x)",
-// 15
-	"f(a^x,a^x/log(a),or(not(number(a)),a>0))",
-// 16
-	"f(1/(a+x^2),1/sqrt(a)*arctan(x/sqrt(a)),or(not(number(a)),a>0))",
-// 17
-	"f(1/(a-x^2),1/sqrt(a)*arctanh(x/sqrt(a)))",
-// 19
-	"f(1/sqrt(a-x^2),arcsin(x/(sqrt(a))))",
-// 20
-	"f(1/sqrt(a+x^2),log(x+sqrt(a+x^2)))",
-// 27
-	"f(1/(a+b*x),1/b*log(a+b*x))",
-// 28
-	"f(1/(a+b*x)^2,-1/(b*(a+b*x)))",
-// 29
-	"f(1/(a+b*x)^3,-1/(2*b)*1/(a+b*x)^2)",
-// 30
-	"f(x/(a+b*x),x/b-a*log(a+b*x)/b/b)",
-// 31
-	"f(x/(a+b*x)^2,1/b^2*(log(a+b*x)+a/(a+b*x)))",
-// 33
-	"f(x^2/(a+b*x),1/b^2*(1/2*(a+b*x)^2-2*a*(a+b*x)+a^2*log(a+b*x)))",
-// 34
-	"f(x^2/(a+b*x)^2,1/b^3*(a+b*x-2*a*log(a+b*x)-a^2/(a+b*x)))",
-// 35
-	"f(x^2/(a+b*x)^3,1/b^3*(log(a+b*x)+2*a/(a+b*x)-1/2*a^2/(a+b*x)^2))",
-// 37
-	"f(1/x*1/(a+b*x),-1/a*log((a+b*x)/x))",
-// 38
-	"f(1/x*1/(a+b*x)^2,1/a*1/(a+b*x)-1/a^2*log((a+b*x)/x))",
-// 39
-	"f(1/x*1/(a+b*x)^3,1/a^3*(1/2*((2*a+b*x)/(a+b*x))^2+log(x/(a+b*x))))",
-// 40
-	"f(1/x^2*1/(a+b*x),-1/(a*x)+b/a^2*log((a+b*x)/x))",
-// 41
-	"f(1/x^3*1/(a+b*x),(2*b*x-a)/(2*a^2*x^2)+b^2/a^3*log(x/(a+b*x)))",
-// 42
-	"f(1/x^2*1/(a+b*x)^2,-(a+2*b*x)/(a^2*x*(a+b*x))+2*b/a^3*log((a+b*x)/x))",
-// 60
-	"f(1/(a+b*x^2),1/sqrt(a*b)*arctan(x*sqrt(a*b)/a),or(not(number(a*b)),a*b>0))",
-// 61
-	"f(1/(a+b*x^2),1/(2*sqrt(-a*b))*log((a+x*sqrt(-a*b))/(a-x*sqrt(-a*b))),or(not(number(a*b)),a*b<0))",
-// 62 is the same as 60
-// 63
-	"f(x/(a+b*x^2),1/2*1/b*log(a+b*x^2))",
-//64
-	"f(x^2/(a+b*x^2),x/b-a/b*integral(1/(a+b*x^2),x))",
-//65
-	"f(1/(a+b*x^2)^2,x/(2*a*(a+b*x^2))+1/2*1/a*integral(1/(a+b*x^2),x))",
-//66 is covered by 61
-//70
-	"f(1/x*1/(a+b*x^2),1/2*1/a*log(x^2/(a+b*x^2)))",
-//71
-	"f(1/x^2*1/(a+b*x^2),-1/(a*x)-b/a*integral(1/(a+b*x^2),x))",
-//74
-	"f(1/(a+b*x^3),1/3*1/a*(a/b)^(1/3)*(1/2*log(((a/b)^(1/3)+x)^3/(a+b*x^3))+sqrt(3)*arctan((2*x-(a/b)^(1/3))*(a/b)^(-1/3)/sqrt(3))))",
-//76
-	"f(x^2/(a+b*x^3),1/3*1/b*log(a+b*x^3))",
-//77
-	"f(1/(a+b*x^4),1/2*1/a*(a/b/4)^(1/4)*(1/2*log((x^2+2*(a/b/4)^(1/4)*x+2*(a/b/4)^(1/2))/(x^2-2*(a/b/4)^(1/4)*x+2*(a/b/4)^(1/2)))+arctan(2*(a/b/4)^(1/4)*x/(2*(a/b/4)^(1/2)-x^2))),or(not(number(a*b)),a*b>0))",
-//78
-	"f(1/(a+b*x^4),1/2*(-a/b)^(1/4)/a*(1/2*log((x+(-a/b)^(1/4))/(x-(-a/b)^(1/4)))+arctan(x*(-a/b)^(-1/4))),or(not(number(a*b)),a*b<0))",
-//79
-	"f(x/(a+b*x^4),1/2*sqrt(b/a)/b*arctan(x^2*sqrt(b/a)),or(not(number(a*b)),a*b>0))",
-//80
-	"f(x/(a+b*x^4),1/4*sqrt(-b/a)/b*log((x^2-sqrt(-a/b))/(x^2+sqrt(-a/b))),or(not(number(a*b)),a*b<0))",
-//81
-	"f(x^2/(a+b*x^4),1/4*1/b*(a/b/4)^(-1/4)*(1/2*log((x^2-2*(a/b/4)^(1/4)*x+2*sqrt(a/b/4))/(x^2+2*(a/b/4)^(1/4)*x+2*sqrt(a/b/4)))+arctan(2*(a/b/4)^(1/4)*x/(2*sqrt(a/b/4)-x^2))),or(not(number(a*b)),a*b>0))",
-//82
-	"f(x^2/(a+b*x^4),1/4*1/b*(-a/b)^(-1/4)*(log((x-(-a/b)^(1/4))/(x+(-a/b)^(1/4)))+2*arctan(x*(-a/b)^(-1/4))),or(not(number(a*b)),a*b<0))",
-//83
-	"f(x^3/(a+b*x^4),1/4*1/b*log(a+b*x^4))",
-//124
-	"f(sqrt(a+b*x),2/3*1/b*sqrt((a+b*x)^3))",
-//125
-	"f(x*sqrt(a+b*x),-2*(2*a-3*b*x)*sqrt((a+b*x)^3)/15/b^2)",
-//126
-	"f(x^2*sqrt(a+b*x),2*(8*a^2-12*a*b*x+15*b^2*x^2)*sqrt((a+b*x)^3)/105/b^3)",
-//128
-	"f(sqrt(a+b*x)/x,2*sqrt(a+b*x)+a*integral(1/x*1/sqrt(a+b*x),x))",
-//129
-	"f(sqrt(a+b*x)/x^2,-sqrt(a+b*x)/x+b/2*integral(1/x*1/sqrt(a+b*x),x))",
-//131
-	"f(1/sqrt(a+b*x),2*sqrt(a+b*x)/b)",
-//132
-	"f(x/sqrt(a+b*x),-2/3*(2*a-b*x)*sqrt(a+b*x)/b^2)",
-//133
-	"f(x^2/sqrt(a+b*x),2/15*(8*a^2-4*a*b*x+3*b^2*x^2)*sqrt(a+b*x)/b^3)",
-//135
-	"f(1/x*1/sqrt(a+b*x),1/sqrt(a)*log((sqrt(a+b*x)-sqrt(a))/(sqrt(a+b*x)+sqrt(a))),or(not(number(a)),a>0))",
-//136
-	"f(1/x*1/sqrt(a+b*x),2/sqrt(-a)*arctan(sqrt(-(a+b*x)/a)),or(not(number(a)),a<0))",
-//137
-	"f(1/x^2*1/sqrt(a+b*x),-sqrt(a+b*x)/a/x-1/2*b/a*integral(1/x*1/sqrt(a+b*x),x))",
-//156
-	"f(sqrt(x^2+a),1/2*(x*sqrt(x^2+a)+a*log(x+sqrt(x^2+a))))",
-//157
-	"f(1/sqrt(x^2+a),log(x+sqrt(x^2+a)))",
-//158
-	"f(1/x*1/sqrt(x^2+a),arcsec(x/sqrt(-a))/sqrt(-a),or(not(number(a)),a<0))",
-//159
-	"f(1/x*1/sqrt(x^2+a),-1/sqrt(a)*log((sqrt(a)+sqrt(x^2+a))/x),or(not(number(a)),a>0))",
-//160
-	"f(sqrt(x^2+a)/x,sqrt(x^2+a)-sqrt(a)*log((sqrt(a)+sqrt(x^2+a))/x),or(not(number(a)),a>0))",
-//161
-	"f(sqrt(x^2+a)/x,sqrt(x^2+a)-sqrt(-a)*arcsec(x/sqrt(-a)),or(not(number(a)),a<0))",
-//162
-	"f(x/sqrt(x^2+a),sqrt(x^2+a))",
-//163
-	"f(x*sqrt(x^2+a),1/3*sqrt((x^2+a)^3))",
-//164 need an unexpanded version?
-	"f(sqrt(a+x^6+3*a^(1/3)*x^4+3*a^(2/3)*x^2),1/4*(x*sqrt((x^2+a^(1/3))^3)+3/2*a^(1/3)*x*sqrt(x^2+a^(1/3))+3/2*a^(2/3)*log(x+sqrt(x^2+a^(1/3)))))",
-	// match doesn't work for the following
-	"f(sqrt(-a+x^6-3*a^(1/3)*x^4+3*a^(2/3)*x^2),1/4*(x*sqrt((x^2-a^(1/3))^3)-3/2*a^(1/3)*x*sqrt(x^2-a^(1/3))+3/2*a^(2/3)*log(x+sqrt(x^2-a^(1/3)))))",
-//165
-	"f(1/sqrt(a+x^6+3*a^(1/3)*x^4+3*a^(2/3)*x^2),x/a^(1/3)/sqrt(x^2+a^(1/3)))",
-//166
-	"f(x/sqrt(a+x^6+3*a^(1/3)*x^4+3*a^(2/3)*x^2),-1/sqrt(x^2+a^(1/3)))",
-//167
-	"f(x*sqrt(a+x^6+3*a^(1/3)*x^4+3*a^(2/3)*x^2),1/5*sqrt((x^2+a^(1/3))^5))",
-//168
-	"f(x^2*sqrt(x^2+a),1/4*x*sqrt((x^2+a)^3)-1/8*a*x*sqrt(x^2+a)-1/8*a^2*log(x+sqrt(x^2+a)))",
-//169
-	"f(x^3*sqrt(x^2+a),(1/5*x^2-2/15*a)*sqrt((x^2+a)^3),and(number(a),a>0))",
-//170
-	"f(x^3*sqrt(x^2+a),sqrt((x^2+a)^5)/5-a*sqrt((x^2+a)^3)/3,and(number(a),a<0))",
-//171
-	"f(x^2/sqrt(x^2+a),1/2*x*sqrt(x^2+a)-1/2*a*log(x+sqrt(x^2+a)))",
-//172
-	"f(x^3/sqrt(x^2+a),1/3*sqrt((x^2+a)^3)-a*sqrt(x^2+a))",
-//173
-	"f(1/x^2*1/sqrt(x^2+a),-sqrt(x^2+a)/a/x)",
-//174
-	"f(1/x^3*1/sqrt(x^2+a),-1/2*sqrt(x^2+a)/a/x^2+1/2*log((sqrt(a)+sqrt(x^2+a))/x)/a^(3/2),or(not(number(a)),a>0))",
-//175
-	"f(1/x^3*1/sqrt(x^2-a),1/2*sqrt(x^2-a)/a/x^2+1/2*1/(a^(3/2))*arcsec(x/(a^(1/2))),or(not(number(a)),a>0))",
-//176+
-	"f(x^2*sqrt(a+x^6+3*a^(1/3)*x^4+3*a^(2/3)*x^2),1/6*x*sqrt((x^2+a^(1/3))^5)-1/24*a^(1/3)*x*sqrt((x^2+a^(1/3))^3)-1/16*a^(2/3)*x*sqrt(x^2+a^(1/3))-1/16*a*log(x+sqrt(x^2+a^(1/3))),or(not(number(a)),a>0))",
-//176-
-	"f(x^2*sqrt(-a-3*a^(1/3)*x^4+3*a^(2/3)*x^2+x^6),1/6*x*sqrt((x^2-a^(1/3))^5)+1/24*a^(1/3)*x*sqrt((x^2-a^(1/3))^3)-1/16*a^(2/3)*x*sqrt(x^2-a^(1/3))+1/16*a*log(x+sqrt(x^2-a^(1/3))),or(not(number(a)),a>0))",
-//177+
-	"f(x^3*sqrt(a+x^6+3*a^(1/3)*x^4+3*a^(2/3)*x^2),1/7*sqrt((x^2+a^(1/3))^7)-1/5*a^(1/3)*sqrt((x^2+a^(1/3))^5),or(not(number(a)),a>0))",
-//177-
-	"f(x^3*sqrt(-a-3*a^(1/3)*x^4+3*a^(2/3)*x^2+x^6),1/7*sqrt((x^2-a^(1/3))^7)+1/5*a^(1/3)*sqrt((x^2-a^(1/3))^5),or(not(number(a)),a>0))",
-//196
-	"f(1/(x-a)/sqrt(x^2-a^2),-sqrt(x^2-a^2)/a/(x-a))",
-//197
-	"f(1/(x+a)/sqrt(x^2-a^2),sqrt(x^2-a^2)/a/(x+a))",
-//200+
-	"f(sqrt(a-x^2),1/2*(x*sqrt(a-x^2)+a*arcsin(x/sqrt(abs(a)))))",
-//201		(seems to be handled somewhere else)
-//202
-	"f(1/x*1/sqrt(a-x^2),-1/sqrt(a)*log((sqrt(a)+sqrt(a-x^2))/x),or(not(number(a)),a>0))",
-//203
-	"f(sqrt(a-x^2)/x,sqrt(a-x^2)-sqrt(a)*log((sqrt(a)+sqrt(a-x^2))/x),or(not(number(a)),a>0))",
-//204
-	"f(x/sqrt(a-x^2),-sqrt(a-x^2))",
-//205
-	"f(x*sqrt(a-x^2),-1/3*sqrt((a-x^2)^3))",
-//210
-	"f(x^2*sqrt(a-x^2),-x/4*sqrt((a-x^2)^3)+1/8*a*(x*sqrt(a-x^2)+a*arcsin(x/sqrt(a))),or(not(number(a)),a>0))",
-//211
-	"f(x^3*sqrt(a-x^2),(-1/5*x^2-2/15*a)*sqrt((a-x^2)^3),or(not(number(a)),a>0))",
-//214
-	"f(x^2/sqrt(a-x^2),-x/2*sqrt(a-x^2)+a/2*arcsin(x/sqrt(a)),or(not(number(a)),a>0))",
-//215
-	"f(1/x^2*1/sqrt(a-x^2),-sqrt(a-x^2)/a/x,or(not(number(a)),a>0))",
-//216
-	"f(sqrt(a-x^2)/x^2,-sqrt(a-x^2)/x-arcsin(x/sqrt(a)),or(not(number(a)),a>0))",
-//217
-	"f(sqrt(a-x^2)/x^3,-1/2*sqrt(a-x^2)/x^2+1/2*log((sqrt(a)+sqrt(a-x^2))/x)/sqrt(a),or(not(number(a)),a>0))",
-//218
-	"f(sqrt(a-x^2)/x^4,-1/3*sqrt((a-x^2)^3)/a/x^3,or(not(number(a)),a>0))",
-// 273
-	"f(sqrt(a*x^2+b),x*sqrt(a*x^2+b)/2+b*log(x*sqrt(a)+sqrt(a*x^2+b))/2/sqrt(a),and(number(a),a>0))",
-// 274
-	"f(sqrt(a*x^2+b),x*sqrt(a*x^2+b)/2+b*arcsin(x*sqrt(-a/b))/2/sqrt(-a),and(number(a),a<0))",
-// 290
-	"f(sin(a*x),-cos(a*x)/a)",
-// 291
-	"f(cos(a*x),sin(a*x)/a)",
-// 292
-	"f(tan(a*x),-log(cos(a*x))/a)",
-// 293
-	"f(1/tan(a*x),log(sin(a*x))/a)",
-// 294
-	"f(1/cos(a*x),log(tan(pi/4+a*x/2))/a)",
-// 295
-	"f(1/sin(a*x),log(tan(a*x/2))/a)",
-// 296
-	"f(sin(a*x)^2,x/2-sin(2*a*x)/(4*a))",
-// 297
-	"f(sin(a*x)^3,-cos(a*x)*(sin(a*x)^2+2)/(3*a))",
-// 298
-	"f(sin(a*x)^4,3/8*x-sin(2*a*x)/(4*a)+sin(4*a*x)/(32*a))",
-// 302
-	"f(cos(a*x)^2,x/2+sin(2*a*x)/(4*a))",
-// 303
-	"f(cos(a*x)^3,sin(a*x)*(cos(a*x)^2+2)/(3*a))",
-// 304
-	"f(cos(a*x)^4,3/8*x+sin(2*a*x)/(4*a)+sin(4*a*x)/(32*a))",
-// 308
-	"f(1/sin(a*x)^2,-1/(a*tan(a*x)))",
-// 312
-	"f(1/cos(a*x)^2,tan(a*x)/a)",
-// 318
-	"f(sin(a*x)*cos(a*x),sin(a*x)^2/(2*a))",
-// 320
-	"f(sin(a*x)^2*cos(a*x)^2,-sin(4*a*x)/(32*a)+x/8)",
-// 326
-	"f(sin(a*x)/cos(a*x)^2,1/(a*cos(a*x)))",
-// 327
-	"f(sin(a*x)^2/cos(a*x),(log(tan(pi/4+a*x/2))-sin(a*x))/a)",
-// 328
-	"f(cos(a*x)/sin(a*x)^2,-1/(a*sin(a*x)))",
-// 329
-	"f(1/(sin(a*x)*cos(a*x)),log(tan(a*x))/a)",
-// 330
-	"f(1/(sin(a*x)*cos(a*x)^2),(1/cos(a*x)+log(tan(a*x/2)))/a)",
-// 331
-	"f(1/(sin(a*x)^2*cos(a*x)),(log(tan(pi/4+a*x/2))-1/sin(a*x))/a)",
-// 333
-	"f(1/(sin(a*x)^2*cos(a*x)^2),-2/(a*tan(2*a*x)))",
-// 335
-	"f(sin(a+b*x),-cos(a+b*x)/b)",
-// 336
-	"f(cos(a+b*x),sin(a+b*x)/b)",
-// 337+ (with the addition of b)
-	"f(1/(b+b*sin(a*x)),-tan(pi/4-a*x/2)/a/b)",
-// 337- (with the addition of b)
-	"f(1/(b-b*sin(a*x)),tan(pi/4+a*x/2)/a/b)",
-// 338 (with the addition of b)
-	"f(1/(b+b*cos(a*x)),tan(a*x/2)/a/b)",
-// 339 (with the addition of b)
-	"f(1/(b-b*cos(a*x)),-1/tan(a*x/2)/a/b)",
-// 340
-	"f(1/(a+b*sin(x)),1/sqrt(b^2-a^2)*log((a*tan(x/2)+b-sqrt(b^2-a^2))/(a*tan(x/2)+b+sqrt(b^2-a^2))),b^2-a^2)", // check that b^2-a^2 is not zero
-// 341
-	"f(1/(a+b*cos(x)),1/sqrt(b^2-a^2)*log((sqrt(b^2-a^2)*tan(x/2)+a+b)/(sqrt(b^2-a^2)*tan(x/2)-a-b)),b^2-a^2)", // check that b^2-a^2 is not zero
-// 389
-	"f(x*sin(a*x),sin(a*x)/a^2-x*cos(a*x)/a)",
-// 390
-	"f(x^2*sin(a*x),2*x*sin(a*x)/a^2-(a^2*x^2-2)*cos(a*x)/a^3)",
-// 393
-	"f(x*cos(a*x),cos(a*x)/a^2+x*sin(a*x)/a)",
-// 394
-	"f(x^2*cos(a*x),2*x*cos(a*x)/a^2+(a^2*x^2-2)*sin(a*x)/a^3)",
-// 441
-	"f(arcsin(a*x),x*arcsin(a*x)+sqrt(1-a^2*x^2)/a)",
-// 442
-	"f(arccos(a*x),x*arccos(a*x)+sqrt(1-a^2*x^2)/a)",
-// 443
-	"f(arctan(a*x),x*arctan(a*x)-1/2*log(1+a^2*x^2)/a)",
-// 485 (with addition of a)
-	"f(log(a*x),x*log(a*x)-x)",
-// 486 (with addition of a)
-	"f(x*log(a*x),x^2*log(a*x)/2-x^2/4)",
-// 487 (with addition of a)
-	"f(x^2*log(a*x),x^3*log(a*x)/3-1/9*x^3)",
-// 489
-	"f(log(x)^2,x*log(x)^2-2*x*log(x)+2*x)",
-// 493 (with addition of a)
-	"f(1/x*1/(a+log(x)),log(a+log(x)))",
-// 499
-	"f(log(a*x+b),(a*x+b)*log(a*x+b)/a-x)",
-// 500
-	"f(log(a*x+b)/x^2,a/b*log(x)-(a*x+b)*log(a*x+b)/b/x)",
-// 554
-	"f(sinh(x),cosh(x))",
-// 555
-	"f(cosh(x),sinh(x))",
-// 556
-	"f(tanh(x),log(cosh(x)))",
-// 560
-	"f(x*sinh(x),x*cosh(x)-sinh(x))",
-// 562
-	"f(x*cosh(x),x*sinh(x)-cosh(x))",
-// 566
-	"f(sinh(x)^2,sinh(2*x)/4-x/2)",
-// 569
-	"f(tanh(x)^2,x-tanh(x))",
-// 572
-	"f(cosh(x)^2,sinh(2*x)/4+x/2)",
-// ?
-	"f(x^3*exp(a*x^2),exp(a*x^2)*(x^2/a-1/(a^2))/2)",
-// ?
-	"f(x^3*exp(a*x^2+b),exp(a*x^2)*exp(b)*(x^2/a-1/(a^2))/2)",
-// ?
-	"f(exp(a*x^2),-i*sqrt(pi)*erf(i*sqrt(a)*x)/sqrt(a)/2)",
-// ?
-	"f(erf(a*x),x*erf(a*x)+exp(-a^2*x^2)/a/sqrt(pi))",
-
-// these are needed for the surface integral in the manual
-
-	"f(x^2*(1-x^2)^(3/2),(x*sqrt(1-x^2)*(-8*x^4+14*x^2-3)+3*arcsin(x))/48)",
-	"f(x^2*(1-x^2)^(5/2),(x*sqrt(1-x^2)*(48*x^6-136*x^4+118*x^2-15)+15*arcsin(x))/384)",
-	"f(x^4*(1-x^2)^(3/2),(-x*sqrt(1-x^2)*(16*x^6-24*x^4+2*x^2+3)+3*arcsin(x))/128)",
-
-	"f(x*exp(a*x),exp(a*x)*(a*x-1)/(a^2))",
-	"f(x*exp(a*x+b),exp(a*x+b)*(a*x-1)/(a^2))",
-
-	"f(x^2*exp(a*x),exp(a*x)*(a^2*x^2-2*a*x+2)/(a^3))",
-	"f(x^2*exp(a*x+b),exp(a*x+b)*(a^2*x^2-2*a*x+2)/(a^3))",
-
-	"f(x^3*exp(a*x),exp(a*x)*x^3/a-3/a*integral(x^2*exp(a*x),x))",
-	"f(x^3*exp(a*x+b),exp(a*x+b)*x^3/a-3/a*integral(x^2*exp(a*x+b),x))",
-
-	NULL,
-};
-
-/* Laguerre function
-
-The computation uses the following recurrence relation.
-
-	L(x,0,k) = 1
-
-	L(x,1,k) = -x + k + 1
-
-	n*L(x,n,k) = (2*(n-1)+1-x+k)*L(x,n-1,k) - (n-1+k)*L(x,n-2,k)
-
-In the "for" loop i = n-1 so the recurrence relation becomes
-
-	(i+1)*L(x,n,k) = (2*i+1-x+k)*L(x,n-1,k) - (i+k)*L(x,n-2,k)
-*/
+// L(x,n,m) = (n + m)! sum(k,0,n,(-x)^k / ((n - k)! (m + k)! k!))
 
 void
 eval_laguerre(void)
 {
-	// 1st arg
-	push(cadr(p1));
+	int k, m = 0, n;
+	p1 = cdr(p1);
+	push(car(p1));
 	eval();
-	// 2nd arg
-	push(caddr(p1));
+	negate();
+	p0 = pop();
+	p1 = cdr(p1);
+	push(car(p1));
 	eval();
-	// 3rd arg
-	push(cadddr(p1));
-	eval();
-	p2 = pop();
-	if (p2 == symbol(NIL))
-		push_integer(0);
-	else
-		push(p2);
-	laguerre();
+	n = pop_integer();
+	p1 = cdr(p1);
+	if (iscons(p1)) {
+		push(car(p1));
+		eval();
+		m = pop_integer();
+	}
+	if (n == ERR || m == ERR || n < 0 || m < 0)
+		stop("laguerre");
+	for (k = 0; k <= n; k++) {
+		push(p0);
+		push_integer(k);
+		power();
+		push_integer(n - k);
+		factorial();
+		push_integer(m + k);
+		factorial();
+		push_integer(k);
+		factorial();
+		multiply_factors(3);
+		divide();
+	}
+	add_terms(n + 1);
+	push_integer(n + m);
+	factorial();
+	multiply();
 }
 
-#undef X
-#undef N
-#undef K
-#undef Y
-#undef Y0
-#undef Y1
-
-#define X p1
-#define N p2
-#define K p3
-#define Y p4
-#define Y0 p5
-#define Y1 p6
+void
+eval_latex(void)
+{
+	push(cadr(p1));
+	eval();
+	latex();
+	push_string(outbuf);
+}
 
 void
-laguerre(void)
+latex(void)
 {
-	int n;
 	save();
-	K = pop();
-	N = pop();
-	X = pop();
-	push(N);
-	n = pop_integer();
-	if (n < 0) {
-		push_symbol(LAGUERRE);
-		push(X);
-		push(N);
-		push(K);
-		list(4);
-		restore();
-		return;
-	}
-	if (issymbol(X))
-		laguerre2(n);
-	else {
-		Y = X;			// do this when X is an expr
-		X = symbol(SPECX);
-		laguerre2(n);
-		X = Y;
-		push_symbol(SPECX);
-		push(X);
-		subst();
-		eval();
-	}
+	latex_nib();
 	restore();
 }
 
 void
-laguerre2(int n)
+latex_nib(void)
+{
+	outbuf_index = 0;
+	p1 = pop();
+	if (isstr(p1)) {
+		print_str("\\begin{verbatim}\n");
+		print_str(p1->u.str);
+		print_str("\n\\end{verbatim}");
+	} else {
+		print_str("\\begin{equation}\n");
+		latex_expr(p1);
+		print_str("\n\\end{equation}");
+	}
+	print_char('\0');
+}
+
+void
+latex_expr(struct atom *p)
+{
+	struct atom *q;
+	if (car(p) == symbol(ADD)) {
+		p = cdr(p);
+		q = car(p);
+		if (isnegativenumber(q) || (car(q) == symbol(MULTIPLY) && isnegativenumber(cadr(q))))
+			print_str("-");
+		latex_term(q);
+		p = cdr(p);
+		while (iscons(p)) {
+			q = car(p);
+			if (isnegativenumber(q) || (car(q) == symbol(MULTIPLY) && isnegativenumber(cadr(q))))
+				print_str("-");
+			else
+				print_str("+");
+			latex_term(q);
+			p = cdr(p);
+		}
+	} else {
+		if (isnegativenumber(p) || (car(p) == symbol(MULTIPLY) && isnegativenumber(cadr(p))))
+			print_str("-");
+		latex_term(p);
+	}
+}
+
+void
+latex_term(struct atom *p)
+{
+	int n = 0;
+	struct atom *q, *t;
+	if (car(p) == symbol(MULTIPLY)) {
+		// any denominators?
+		t = cdr(p);
+		while (iscons(t)) {
+			q = car(t);
+			if (car(q) == symbol(POWER) && isnegativenumber(caddr(q)))
+				break;
+			t = cdr(t);
+		}
+		if (iscons(t)) {
+			print_str("\\frac{");
+			latex_numerators(p);
+			print_str("}{");
+			latex_denominators(p);
+			print_str("}");
+			return;
+		}
+		// no denominators
+		p = cdr(p);
+		q = car(p);
+		if (isrational(q) && isminusone(q))
+			p = cdr(p); // skip -1
+		while (iscons(p)) {
+			if (++n > 1)
+				print_str("\\,"); // thin space between factors
+			latex_factor(car(p));
+			p = cdr(p);
+		}
+	} else
+		latex_factor(p);
+}
+
+void
+latex_numerators(struct atom *p)
+{
+	int n = 0;
+	char *s;
+	struct atom *q;
+	p = cdr(p);
+	q = car(p);
+	if (isrational(q)) {
+		if (!MEQUAL(q->u.q.a, 1)) {
+			s = mstr(q->u.q.a); // numerator
+			print_str(s);
+			n++;
+		}
+		p = cdr(p);
+	}
+	while (iscons(p)) {
+		q = car(p);
+		if (car(q) == symbol(POWER) && isnegativenumber(caddr(q))) {
+			p = cdr(p);
+			continue; // printed in denominator
+		}
+		if (n)
+			print_str("\\,"); // thin space between factors
+		latex_factor(q);
+		n++;
+		p = cdr(p);
+	}
+	if (n == 0)
+		print_str("1"); // there were no numerators
+}
+
+void
+latex_denominators(struct atom *p)
+{
+	int n = 0;
+	char *s;
+	struct atom *q;
+	p = cdr(p);
+	q = car(p);
+	if (isrational(q)) {
+		if (!MEQUAL(q->u.q.b, 1)) {
+			s = mstr(q->u.q.b); // denominator
+			print_str(s);
+			n++;
+		}
+		p = cdr(p);
+	}
+	while (iscons(p)) {
+		q = car(p);
+		if (car(q) != symbol(POWER) || !isnegativenumber(caddr(q))) {
+			p = cdr(p);
+			continue; // not a denominator
+		}
+		if (n)
+			print_str("\\,"); // thin space between factors
+		// example (-1)^(-1/4)
+		if (isminusone(cadr(q))) {
+			print_str("(-1)^{");
+			latex_number(caddr(q)); // -1/4 (sign not printed)
+			print_str("}");
+			n++;
+			p = cdr(p);
+			continue;
+		}
+		// example 1/y
+		if (isminusone(caddr(q))) {
+			latex_factor(cadr(q)); // y
+			n++;
+			p = cdr(p);
+			continue;
+		}
+		// example 1/y^2
+		latex_base(cadr(q)); // y
+		print_str("^{");
+		latex_number(caddr(q)); // -2 (sign not printed)
+		print_str("}");
+		n++;
+		p = cdr(p);
+	}
+	if (n == 0)
+		print_str("1"); // there were no denominators
+}
+
+void
+latex_factor(struct atom *p)
+{
+	switch (p->k) {
+	case RATIONAL:
+		latex_rational(p);
+		break;
+	case DOUBLE:
+		latex_double(p);
+		break;
+	case KSYM:
+	case USYM:
+		latex_symbol(p);
+		break;
+	case STR:
+		latex_string(p);
+		break;
+	case TENSOR:
+		latex_tensor(p);
+		break;
+	case CONS:
+		if (car(p) == symbol(POWER))
+			latex_power(p);
+		else if (car(p) == symbol(ADD) || car(p) == symbol(MULTIPLY))
+			latex_subexpr(p);
+		else
+			latex_function(p);
+		break;
+	}
+}
+
+void
+latex_number(struct atom *p)
+{
+	if (isrational(p))
+		latex_rational(p);
+	else
+		latex_double(p);
+}
+
+void
+latex_rational(struct atom *p)
+{
+	char *s;
+	if (MEQUAL(p->u.q.b, 1)) {
+		s = mstr(p->u.q.a);
+		print_str(s);
+		return;
+	}
+	print_str("\\frac{");
+	s = mstr(p->u.q.a);
+	print_str(s);
+	print_str("}{");
+	s = mstr(p->u.q.b);
+	print_str(s);
+	print_str("}");
+}
+
+void
+latex_double(struct atom *p)
+{
+	char *e, *s;
+	sprintf(tbuf, "%g", p->u.d);
+	s = tbuf;
+	if (*s == '-')
+		s++;
+	e = strchr(s, 'e');
+	if (e == NULL)
+		e = strchr(s, 'E');
+	if (e == NULL) {
+		if (strchr(s, '.') == NULL)
+			strcat(s, ".0");
+		print_str(s);
+		return;
+	}
+	*e = '\0';
+	print_str(s);
+	if (strchr(s, '.') == NULL)
+		print_str(".0");
+	print_str("\\times10^{");
+	s = e + 1;
+	if (*s == '+')
+		s++;
+	else if (*s == '-') {
+		s++;
+		print_str("-");
+	}
+	while (*s == '0')
+		s++; // skip leading zeroes
+	print_str(s);
+	print_str("}");
+}
+
+void
+latex_power(struct atom *p)
+{
+	// case (-1)^x
+	if (isminusone(cadr(p))) {
+		latex_imaginary(p);
+		return;
+	}
+	// case e^x
+	if (cadr(p) == symbol(EXP1)) {
+		print_str("\\operatorname{exp}\\left(");
+		latex_expr(caddr(p)); // x
+		print_str("\\right)");
+		return;
+	}
+	// example 1/y
+	if (isminusone(caddr(p))) {
+		print_str("\\frac{1}{");
+		latex_expr(cadr(p)); // y
+		print_str("}");
+		return;
+	}
+	// example 1/y^2
+	if (isnegativenumber(caddr(p))) {
+		print_str("\\frac{1}{");
+		latex_base(cadr(p)); // y
+		print_str("^{");
+		latex_number(caddr(p)); // -2 (sign not printed)
+		print_str("}}");
+		return;
+	}
+	// example y^x
+	latex_base(cadr(p)); // y
+	print_str("^{");
+	latex_exponent(caddr(p)); // x
+	print_str("}");
+}
+
+void
+latex_base(struct atom *p)
+{
+	if (isfraction(p) || isdouble(p) || car(p) == symbol(POWER))
+		latex_subexpr(p);
+	else
+		latex_factor(p);
+}
+
+void
+latex_exponent(struct atom *p)
+{
+	if (car(p) == symbol(POWER))
+		latex_subexpr(p);
+	else
+		latex_factor(p);
+}
+
+// case (-1)^x
+
+void
+latex_imaginary(struct atom *p)
+{
+	if (isimaginaryunit(p)) {
+		if (isimaginaryunit(binding[SYMBOL_J])) {
+			print_str("j");
+			return;
+		}
+		if (isimaginaryunit(binding[SYMBOL_I])) {
+			print_str("i");
+			return;
+		}
+	}
+	// example (-1)^(-1/4)
+	if (isnegativenumber(caddr(p))) {
+		print_str("\\frac{1}{(-1)^{");
+		latex_number(caddr(p)); // -1/4 (sign not printed)
+		print_str("}}");
+		return;
+	}
+	// example (-1)^x
+	print_str("(-1)^{");
+	latex_expr(caddr(p)); // x
+	print_str("}");
+}
+
+void
+latex_function(struct atom *p)
+{
+	// d(f(x),x)
+	if (car(p) == symbol(DERIVATIVE)) {
+		print_str("\\operatorname{d}\\left(");
+		latex_arglist(p);
+		print_str("\\right)");
+		return;
+	}
+	// n!
+	if (car(p) == symbol(FACTORIAL)) {
+		p = cadr(p);
+		if (isposint(p) || issymbol(p))
+			latex_expr(p);
+		else
+			latex_subexpr(p);
+		print_str("!");
+		return;
+	}
+	// A[1,2]
+	if (car(p) == symbol(INDEX)) {
+		p = cdr(p);
+		if (issymbol(car(p)))
+			latex_symbol(car(p));
+		else
+			latex_subexpr(car(p));
+		print_str("\\left[");
+		latex_arglist(p);
+		print_str("\\right]");
+		return;
+	}
+	if (car(p) == symbol(SETQ)) {
+		latex_expr(cadr(p));
+		print_str("=");
+		latex_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTEQ)) {
+		latex_expr(cadr(p));
+		print_str("=");
+		latex_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTGE)) {
+		latex_expr(cadr(p));
+		print_str("\\geq ");
+		latex_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTGT)) {
+		latex_expr(cadr(p));
+		print_str(" > ");
+		latex_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTLE)) {
+		latex_expr(cadr(p));
+		print_str("\\leq ");
+		latex_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTLT)) {
+		latex_expr(cadr(p));
+		print_str(" < ");
+		latex_expr(caddr(p));
+		return;
+	}
+	// default
+	if (issymbol(car(p)))
+		latex_symbol(car(p));
+	else
+		latex_subexpr(car(p));
+	print_str("\\left(");
+	latex_arglist(p);
+	print_str("\\right)");
+}
+
+void
+latex_arglist(struct atom *p)
+{
+	p = cdr(p);
+	if (iscons(p)) {
+		latex_expr(car(p));
+		p = cdr(p);
+		while (iscons(p)) {
+			print_str(",");
+			latex_expr(car(p));
+			p = cdr(p);
+		}
+	}
+}
+
+void
+latex_subexpr(struct atom *p)
+{
+	print_str("\\left(");
+	latex_expr(p);
+	print_str("\\right)");
+}
+
+void
+latex_symbol(struct atom *p)
+{
+	int n;
+	char *s;
+	if (iskeyword(p) || p == symbol(LAST) || p == symbol(NIL) || p == symbol(TRACE) || p == symbol(TTY)) {
+		print_str("\\operatorname{");
+		print_str(printname(p));
+		print_str("}");
+		return;
+	}
+	if (p == symbol(EXP1)) {
+		print_str("\\operatorname{exp}(1)");
+		return;
+	}
+	s = printname(p);
+	n = latex_symbol_scan(s);
+	if ((int) strlen(s) == n) {
+		latex_symbol_shipout(s, n);
+		return;
+	}
+	// symbol has subscript
+	latex_symbol_shipout(s, n);
+	s += n;
+	print_str("_{");
+	while (*s) {
+		n = latex_symbol_scan(s);
+		latex_symbol_shipout(s, n);
+		s += n;
+	}
+	print_str("}");
+}
+
+char *latex_greek_tab[46] = {
+	"Alpha","Beta","Gamma","Delta","Epsilon","Zeta","Eta","Theta","Iota",
+	"Kappa","Lambda","Mu","Nu","Xi","Pi","Rho","Sigma","Tau","Upsilon",
+	"Phi","Chi","Psi","Omega",
+	"alpha","beta","gamma","delta","epsilon","zeta","eta","theta","iota",
+	"kappa","lambda","mu","nu","xi","pi","rho","sigma","tau","upsilon",
+	"phi","chi","psi","omega",
+};
+
+int
+latex_symbol_scan(char *s)
+{
+	int i, n;
+	for (i = 0; i < 46; i++) {
+		n = (int) strlen(latex_greek_tab[i]);
+		if (strncmp(s, latex_greek_tab[i], n) == 0)
+			return n;
+	}
+	return 1;
+}
+
+void
+latex_symbol_shipout(char *s, int n)
 {
 	int i;
-	push_integer(1);
-	push_integer(0);
-	Y1 = pop();
-	for (i = 0; i < n; i++) {
-		Y0 = Y1;
-		Y1 = pop();
-		push_integer(2 * i + 1);
-		push(X);
-		subtract();
-		push(K);
-		add();
-		push(Y1);
-		multiply();
-		push_integer(i);
-		push(K);
-		add();
-		push(Y0);
-		multiply();
-		subtract();
-		push_integer(i + 1);
-		divide();
+	if (n == 1) {
+		print_char(*s);
+		return;
 	}
+	// greek
+	print_str("\\");
+	for (i = 0; i < n; i++)
+		print_char(*s++);
+	print_str(" ");
+}
+
+void
+latex_tensor(struct atom *p)
+{
+	int i, n, k = 0;
+	struct tensor *t;
+	t = p->u.tensor;
+	// if odd rank then vector
+	if (t->ndim % 2 == 1) {
+		print_str("\\begin{pmatrix}");
+		n = t->dim[0];
+		for (i = 0; i < n; i++) {
+			latex_tensor_matrix(t, 1, &k);
+			if (i < n - 1)
+				print_str("\\cr "); // row separator
+		}
+		print_str("\\end{pmatrix}");
+	} else
+		latex_tensor_matrix(t, 0, &k);
+}
+
+void
+latex_tensor_matrix(struct tensor *t, int d, int *k)
+{
+	int i, j, ni, nj;
+	if (d == t->ndim) {
+		latex_expr(t->elem[*k]);
+		*k = *k + 1;
+		return;
+	}
+	ni = t->dim[d];
+	nj = t->dim[d + 1];
+	print_str("\\begin{pmatrix}");
+	for (i = 0; i < ni; i++) {
+		for (j = 0; j < nj; j++) {
+			latex_tensor_matrix(t, d + 2, k);
+			if (j < nj - 1)
+				print_str(" & "); // column separator
+		}
+		if (i < ni - 1)
+			print_str("\\cr "); // row separator
+	}
+	print_str("\\end{pmatrix}");
+}
+
+void
+latex_string(struct atom *p)
+{
+	print_str("\\text{");
+	print_str(p->u.str);
+	print_str("}");
 }
 
 // Find the least common multiple of two expressions.
@@ -11519,18 +11840,16 @@ eval_lcm(void)
 void
 lcm(void)
 {
-	int x;
-	x = expanding;
+	expanding++;
 	save();
-	yylcm();
+	lcm_nib();
 	restore();
-	expanding = x;
+	expanding--;
 }
 
 void
-yylcm(void)
+lcm_nib(void)
 {
-	expanding = 1;
 	p2 = pop();
 	p1 = pop();
 	push(p1);
@@ -11540,7 +11859,7 @@ yylcm(void)
 	divide();
 	push(p2);
 	divide();
-	inverse();
+	reciprocate();
 }
 
 /* Return the leading coefficient of a polynomial.
@@ -11598,182 +11917,62 @@ leading(void)
 	restore();
 }
 
-/* Legendre function
-
-The computation uses the following recurrence relation.
-
-	P(x,0) = 1
-
-	P(x,1) = x
-
-	n*P(x,n) = (2*(n-1)+1)*x*P(x,n-1) - (n-1)*P(x,n-2)
-
-In the "for" loop we have i = n-1 so the recurrence relation becomes
-
-	(i+1)*P(x,n) = (2*i+1)*x*P(x,n-1) - i*P(x,n-2)
-
-For m > 0
-
-	P(x,n,m) = (-1)^m * (1-x^2)^(m/2) * d^m/dx^m P(x,n)
-*/
+// P(x,n,m) = 1/(2^n n!) (1 - x^2)^(m/2) d((x^2 - 1)^n,x,n + m)
 
 void
 eval_legendre(void)
 {
-	// 1st arg
-	push(cadr(p1));
+	int i, m = 0, n;
+	p1 = cdr(p1);
+	push(car(p1));
 	eval();
-	// 2nd arg
-	push(caddr(p1));
+	p0 = pop();
+	p1 = cdr(p1);
+	push(car(p1));
 	eval();
-	// 3rd arg (optional)
-	push(cadddr(p1));
-	eval();
-	p2 = pop();
-	if (p2 == symbol(NIL))
-		push_integer(0);
-	else
-		push(p2);
-	legendre();
-}
-
-#undef X
-#undef N
-#undef M
-#undef Y
-#undef Y0
-#undef Y1
-
-#define X p1
-#define N p2
-#define M p3
-#define Y p4
-#define Y0 p5
-#define Y1 p6
-
-void
-legendre(void)
-{
-	save();
-	legendre_nib();
-	restore();
-}
-
-void
-legendre_nib(void)
-{
-	int m, n;
-	M = pop();
-	N = pop();
-	X = pop();
-	push(N);
 	n = pop_integer();
-	push(M);
-	m = pop_integer();
-	if (n < 0 || m < 0) {
-		push_symbol(LEGENDRE);
-		push(X);
-		push(N);
-		push(M);
-		list(4);
-		return;
-	}
-	if (issymbol(X))
-		legendre2(n, m);
-	else {
-		Y = X;			// do this when X is an expr
-		X = symbol(SPECX);
-		legendre2(n, m);
-		X = Y;
-		push_symbol(SPECX);
-		push(X);
-		subst();
+	p1 = cdr(p1);
+	if (iscons(p1)) {
+		push(car(p1));
 		eval();
+		m = pop_integer();
 	}
-	legendre3(m);
-}
-
-void
-legendre2(int n, int m)
-{
-	int i;
+	if (n == ERR || m == ERR || n < 0 || abs(m) > n)
+		stop("legendre");
+	push_integer(2);
+	push_integer(-n);
+	power();
+	push_integer(n);
+	factorial();
+	divide();
 	push_integer(1);
-	push_integer(0);
-	Y1 = pop();
-	//	i=1	Y0 = 0
-	//		Y1 = 1
-	//		((2*i+1)*x*Y1 - i*Y0) / i = x
-	//
-	//	i=2	Y0 = 1
-	//		Y1 = x
-	//		((2*i+1)*x*Y1 - i*Y0) / i = -1/2 + 3/2*x^2
-	//
-	//	i=3	Y0 = x
-	//		Y1 = -1/2 + 3/2*x^2
-	//		((2*i+1)*x*Y1 - i*Y0) / i = -3/2*x + 5/2*x^3
-	for (i = 0; i < n; i++) {
-		Y0 = Y1;
-		Y1 = pop();
-		push_integer(2 * i + 1);
-		push(X);
-		multiply();
-		push(Y1);
-		multiply();
-		push_integer(i);
-		push(Y0);
-		multiply();
-		subtract();
-		push_integer(i + 1);
-		divide();
-	}
-	for (i = 0; i < m; i++) {
-		push(X);
-		derivative();
-	}
-}
-
-// tos = tos * (-1)^m * (1-x^2)^(m/2)
-
-void
-legendre3(int m)
-{
-	if (m == 0)
-		return;
-	if (car(X) == symbol(COS)) {
-		push(cadr(X));
-		sine();
-		square();
-	} else if (car(X) == symbol(SIN)) {
-		push(cadr(X));
-		cosine();
-		square();
-	} else {
-		push_integer(1);
-		push(X);
-		square();
-		subtract();
-	}
+	push_symbol(SPECX);
+	push_integer(2);
+	power();
+	subtract();
 	push_integer(m);
 	push_rational(1, 2);
 	multiply();
 	power();
-	multiply();
-	if (m % 2)
-		negate();
+	push_symbol(SPECX);
+	push_integer(2);
+	power();
+	push_integer(-1);
+	add();
+	push_integer(n);
+	power();
+	for (i = 0; i < n + m; i++) {
+		push_symbol(SPECX);
+		derivative();
+	}
+	multiply_factors(3);
+	push_symbol(SPECX);
+	push(p0);
+	subst();
+	eval();
 }
 
-// Create a list from n things on the stack.
-
-void
-list(int n)
-{
-	int i;
-	push(symbol(NIL));
-	for (i = 0; i < n; i++)
-		cons();
-}
-
-// natural logarithm
+// natural log
 
 void
 eval_log(void)
@@ -11787,21 +11986,54 @@ void
 logarithm(void)
 {
 	save();
-	yylog();
+	log_nib();
 	restore();
 }
 
 void
-yylog(void)
+log_nib(void)
 {
-	double d;
+	int h, i;
 	p1 = pop();
-	if (p1 == symbol(EXP1)) {
-		push_integer(1);
+	// log(0), log(0.0) unchanged
+	if (iszero(p1)) {
+		push_symbol(LOG);
+		push(p1);
+		list(2);
 		return;
 	}
+	if (isdouble(p1)) {
+		if (p1->u.d > 0.0)
+			push_double(log(p1->u.d));
+		else {
+			push_double(log(-p1->u.d));
+			push(imaginaryunit);
+			push_double(M_PI);
+			multiply();
+			add();
+		}
+		return;
+	}
+	// log(z) -> log(mag(z)) + i arg(z)
+	if (isdoublez(p1)) {
+		push(p1);
+		mag();
+		logarithm();
+		push(imaginaryunit);
+		push(p1);
+		arg();
+		multiply();
+		add();
+		return;
+	}
+	// log(1) -> 0
 	if (equaln(p1, 1)) {
 		push_integer(0);
+		return;
+	}
+	// log(e) -> 1
+	if (p1 == symbol(EXP1)) {
+		push_integer(1);
 		return;
 	}
 	if (isnegativenumber(p1)) {
@@ -11814,23 +12046,30 @@ yylog(void)
 		add();
 		return;
 	}
-	if (isdouble(p1)) {
-		d = log(p1->u.d);
-		push_double(d);
+	// log(10) -> log(2) + log(5)
+	if (isrational(p1)) {
+		h = tos;
+		push(p1);
+		factor_factor();
+		for (i = h; i < tos; i++) {
+			p2 = stack[i];
+			if (car(p2) == symbol(POWER)) {
+				push(caddr(p2)); // exponent
+				push_symbol(LOG);
+				push(cadr(p2)); // base
+				list(2);
+				multiply();
+			} else {
+				push_symbol(LOG);
+				push(p2);
+				list(2);
+			}
+			stack[i] = pop();
+		}
+		add_terms(tos - h);
 		return;
 	}
-	// rational number and not an integer?
-	if (isfraction(p1)) {
-		push(p1);
-		numerator();
-		logarithm();
-		push(p1);
-		denominator();
-		logarithm();
-		subtract();
-		return;
-	}
-	// log(a ^ b) --> b log(a)
+	// log(a ^ b) -> b log(a)
 	if (car(p1) == symbol(POWER)) {
 		push(caddr(p1));
 		push(cadr(p1));
@@ -11838,170 +12077,22 @@ yylog(void)
 		multiply();
 		return;
 	}
-	// log(a * b) --> log(a) + log(b)
+	// log(a * b) -> log(a) + log(b)
 	if (car(p1) == symbol(MULTIPLY)) {
-		push_integer(0);
+		h = tos;
 		p1 = cdr(p1);
 		while (iscons(p1)) {
 			push(car(p1));
 			logarithm();
-			add();
 			p1 = cdr(p1);
 		}
+		add_terms(tos - h);
 		return;
 	}
 	push_symbol(LOG);
 	push(p1);
 	list(2);
 }
-
-// Bignum addition and subtraction
-
-unsigned int *
-madd(unsigned int *a, unsigned int *b)
-{
-	if (MSIGN(a) == MSIGN(b))
-		return madd_nib(a, b);	// same sign, add together
-	else
-		return msub_nib(a, b);	// opposite sign, find difference
-}
-
-unsigned int *
-msub(unsigned int *a, unsigned int *b)
-{
-	if (MSIGN(a) == MSIGN(b))
-		return msub_nib(a, b);	// same sign, find difference
-	else
-		return madd_nib(a, b);	// opposite sign, add together
-}
-
-unsigned int *
-madd_nib(unsigned int *a, unsigned int *b)
-{
-	int i, sign;
-	unsigned int c, *x;
-	sign = MSIGN(a);
-	if (MLENGTH(a) < MLENGTH(b)) {
-		x = a;
-		a = b;
-		b = x;
-	}
-	x = mnew(MLENGTH(a) + 1);
-	c = 0;
-	for (i = 0; i < MLENGTH(b); i++) {
-		x[i] = a[i] + b[i] + c;
-		if (c)
-			if (a[i] >= x[i])
-				c = 1;
-			else
-				c = 0;
-		else
-			if (a[i] > x[i])
-				c = 1;
-			else
-				c = 0;
-	}
-	for (i = MLENGTH(b); i < MLENGTH(a); i++) {
-		x[i] = a[i] + c;
-		if (a[i] > x[i])
-			c = 1;
-		else
-			c = 0;
-	}
-	x[MLENGTH(a)] = c;
-	for (i = MLENGTH(a); i > 0; i--)
-		if (x[i])
-			break;
-	MLENGTH(x) = i + 1;
-	MSIGN(x) = sign;
-	return x;
-}
-
-unsigned int *
-msub_nib(unsigned int *a, unsigned int *b)
-{
-	int i, sign = 0;
-	unsigned int c, *x;
-	switch (add_ucmp(a, b)) {
-	case 0:
-		return mint(0);
-	case 1:
-		sign = MSIGN(a);	/* |a| > |b| */
-		break;
-	case -1:
-		sign = -MSIGN(a);	/* |a| < |b| */
-		x = a;
-		a = b;
-		b = x;
-		break;
-	}
-	x = mnew(MLENGTH(a));
-	c = 0;
-	for (i = 0; i < MLENGTH(b); i++) {
-		x[i] = a[i] - b[i] - c;
-		if (c)
-			if (a[i] <= x[i])
-				c = 1;
-			else
-				c = 0;
-		else
-			if (a[i] < x[i])
-				c = 1;
-			else
-				c = 0;
-	}
-	for (i = MLENGTH(b); i < MLENGTH(a); i++) {
-		x[i] = a[i] - c;
-		if (a[i] < x[i])
-			c = 1;
-		else
-			c = 0;
-	}
-	for (i = MLENGTH(a) - 1; i > 0; i--)
-		if (x[i])
-			break;
-	MLENGTH(x) = i + 1;
-	MSIGN(x) = sign;
-	return x;
-}
-
-// unsigned compare
-
-int
-add_ucmp(unsigned int *a, unsigned int *b)
-{
-	int i;
-	if (MLENGTH(a) < MLENGTH(b))
-		return -1;
-	if (MLENGTH(a) > MLENGTH(b))
-		return 1;
-	for (i = MLENGTH(a) - 1; i > 0; i--)
-		if (a[i] != b[i])
-			break;
-	if (a[i] < b[i])
-		return -1;
-	if (a[i] > b[i])
-		return 1;
-	return 0;
-}
-
-/* Magnitude of complex z
-
-	z		mag(z)
-	-		------
-
-	a		a
-
-	-a		a
-
-	(-1)^a		1
-
-	exp(a + i b)	exp(a)
-
-	a b		mag(a) mag(b)
-
-	a + i b		sqrt(a^2 + b^2)
-*/
 
 void
 eval_mag(void)
@@ -12011,6 +12102,8 @@ eval_mag(void)
 	mag();
 }
 
+// use numerator and denominator to handle (a+i*b)/(c+i*d)
+
 void
 mag(void)
 {
@@ -12018,112 +12111,183 @@ mag(void)
 	p1 = pop();
 	push(p1);
 	numerator();
-	yymag();
+	save();
+	mag_nib();
+	restore();
 	push(p1);
 	denominator();
-	yymag();
+	save();
+	mag_nib();
+	restore();
 	divide();
 	restore();
 }
 
+#undef RE
+#undef IM
+
+#define RE p3
+#define IM p4
+
 void
-yymag(void)
+mag_nib(void)
 {
-	save();
+	int h;
 	p1 = pop();
-	if (isnegativenumber(p1)) {
+	if (isnum(p1)) {
 		push(p1);
-		negate();
-	} else if (car(p1) == symbol(POWER) && equaln(cadr(p1), -1))
+		absval();
+		return;
+	}
+	if (car(p1) == symbol(POWER) && equaln(cadr(p1), -1)) {
 		// -1 to a power
 		push_integer(1);
-	else if (car(p1) == symbol(POWER) && cadr(p1) == symbol(EXP1)) {
+		return;
+	}
+	if (car(p1) == symbol(POWER) && cadr(p1) == symbol(EXP1)) {
 		// exponential
 		push(caddr(p1));
 		real();
 		exponential();
-	} else if (car(p1) == symbol(MULTIPLY)) {
+		return;
+	}
+	if (car(p1) == symbol(MULTIPLY)) {
 		// product
-		push_integer(1);
 		p1 = cdr(p1);
+		h = tos;
 		while (iscons(p1)) {
 			push(car(p1));
 			mag();
-			multiply();
 			p1 = cdr(p1);
 		}
-	} else if (car(p1) == symbol(ADD)) {
+		multiply_factors(tos - h);
+		return;
+	}
+	if (car(p1) == symbol(ADD)) {
 		// sum
 		push(p1);
 		rect(); // convert polar terms, if any
 		p1 = pop();
 		push(p1);
 		real();
-		push_integer(2);
-		power();
+		RE = pop();
 		push(p1);
 		imag();
-		push_integer(2);
-		power();
+		IM = pop();
+		push(RE);
+		push(RE);
+		multiply();
+		push(IM);
+		push(IM);
+		multiply();
 		add();
 		push_rational(1, 2);
 		power();
-		simplify_trig();
-	} else
-		// default (all real)
-		push(p1);
-	restore();
+		return;
+	}
+	// real
+	push(p1);
 }
 
-/*	The starting point for a symbolic computation is in run.c
+int doc_type;
+int doc_state;
+char *infile;
+char inbuf[1000];
 
-	Input is scanned in scan.c
-
-	Expression evaluation is done in eval.c
-
-	Output is formatted in display.c
-*/
+#define DOC_LATEX 1
+#define DOC_MATHML 2
+#define DOC_MATHJAX 3
 
 int
 main(int argc, char *argv[])
 {
-	static char buf[1000];
-	init();
-	clear();
-	if (argc > 1)
-		run_script(argv[1]);
-	for (;;) {
-		printf("? ");
-		fgets(buf, sizeof buf, stdin);
-		run(buf);
+	int i;
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--latex") == 0)
+			doc_type = DOC_LATEX;
+		else if (strcmp(argv[i], "--mathml") == 0)
+			doc_type = DOC_MATHML;
+		else if (strcmp(argv[i], "--mathjax") == 0)
+			doc_type = DOC_MATHJAX;
+		else
+			infile = argv[i];
 	}
+	begin_document();
+	if (infile)
+		run_infile();
+	if (isatty(fileno(stdout)))
+		run_stdin();
+	end_document();
 	return 0;
 }
 
 void
-run_script(char *filename)
+run_stdin(void)
+{
+	for (;;) {
+		prompt();
+		fgets(inbuf, sizeof inbuf, stdin);
+		echo();
+		run(inbuf);
+	}
+}
+
+void
+prompt(void)
+{
+	switch (doc_type) {
+	case DOC_LATEX:
+		printf("%%? ");
+		break;
+	case DOC_MATHML:
+	case DOC_MATHJAX:
+		printf("<!--? ");
+		break;
+	default:
+		printf("? ");
+		break;
+	}
+}
+
+void
+echo(void)
+{
+	switch (doc_type) {
+	case DOC_LATEX:
+		printbuf(inbuf, BLUE);
+		break;
+	case DOC_MATHML:
+	case DOC_MATHJAX:
+		printf("-->\n");
+		printbuf(inbuf, BLUE);
+		break;
+	default:
+		break;
+	}
+}
+
+void
+run_infile(void)
 {
 	int fd, n;
 	char *buf;
-	fd = open(filename, O_RDONLY, 0);
+	fd = open(infile, O_RDONLY, 0);
 	if (fd == -1) {
-		printf("cannot open %s\n", filename);
+		fprintf(stderr, "cannot open %s\n", infile);
 		exit(1);
 	}
 	// get file size
 	n = lseek(fd, 0, SEEK_END);
 	if (n == -1) {
-		printf("lseek kaput\n");
+		fprintf(stderr, "lseek err\n");
 		exit(1);
 	}
 	lseek(fd, 0, SEEK_SET);
 	buf = malloc(n + 1);
-	if (buf == NULL) {
-		printf("malloc %d kaput\n", n + 1);
-		exit(1);
-	}
+	if (buf == NULL)
+		malloc_kaput();
 	if (read(fd, buf, n) != n) {
-		printf("read kaput\n");
+		fprintf(stderr, "read err\n");
 		exit(1);
 	}
 	close(fd);
@@ -12133,717 +12297,907 @@ run_script(char *filename)
 }
 
 void
-printstr(char *s)
+printbuf(char *s, int color)
 {
-	while (*s)
-		printchar(*s++);
-}
-
-void
-printchar(int c)
-{
-	fputc(c, stdout);
-}
-
-void
-printchar_nowrap(int c)
-{
-	printchar(c);
-}
-
-void
-eval_draw(void)
-{
-	push(symbol(NIL));
-}
-
-void
-eval_sample(void)
-{
-}
-
-void
-clear_display(void)
-{
+	switch (doc_type) {
+	case DOC_LATEX:
+		if (doc_state == 0) {
+			fputs("\\begin{verbatim}\n", stdout);
+			doc_state = 1;
+		}
+		fputs(s, stdout);
+		break;
+	case DOC_MATHML:
+	case DOC_MATHJAX:
+		switch (color) {
+		case BLACK:
+			if (doc_state != 1) {
+				fputs("<p style='color:black;font-family:courier;font-size:20pt'>\n", stdout);
+				doc_state = 1;
+			}
+			break;
+		case BLUE:
+			if (doc_state != 2) {
+				fputs("<p style='color:blue;font-family:courier;font-size:20pt'>\n", stdout);
+				doc_state = 2;
+			}
+			break;
+		case RED:
+			if (doc_state != 3) {
+				fputs("<p style='color:red;font-family:courier;font-size:20pt'>\n", stdout);
+				doc_state = 3;
+			}
+			break;
+		}
+		while (*s) {
+			if (*s == '\n')
+				fputs("<br>\n", stdout);
+			else if (*s == '&')
+				fputs("&amp;", stdout);
+			else if (*s == '<')
+				fputs("&lt;", stdout);
+			else if (*s == '>')
+				fputs("&gt;", stdout);
+			else
+				fputc(*s, stdout);
+			s++;
+		}
+		fputc('\n', stdout);
+		break;
+	default:
+		fputs(s, stdout);
+		break;
+	}
 }
 
 void
 cmdisplay(void)
 {
-	display();
+	switch (doc_type) {
+	case DOC_LATEX:
+		latex();
+		if (doc_state)
+			fputs("\\end{verbatim}\n\n", stdout);
+		fputs(outbuf, stdout);
+		fputs("\n\n", stdout);
+		break;
+	case DOC_MATHML:
+		mathml();
+		fputs("<p style='font-size:20pt'>\n", stdout);
+		fputs(outbuf, stdout);
+		fputs("\n\n", stdout);
+		break;
+	case DOC_MATHJAX:
+		mathjax();
+		fputs("<p style='font-size:20pt'>\n", stdout);
+		fputs(outbuf, stdout);
+		fputs("\n\n", stdout);
+		break;
+	default:
+		display();
+		break;
+	}
+	doc_state = 0;
 }
 
-// Bignum compare
-//
-//	returns
-//
-//	-1		a < b
-//
-//	0		a = b
-//
-//	1		a > b
-
-int
-mcmp(unsigned int *a, unsigned int *b)
+void
+begin_document(void)
 {
-	int i;
-	if (MSIGN(a) == -1 && MSIGN(b) == 1)
-		return -1;
-	if (MSIGN(a) == 1 && MSIGN(b) == -1)
-		return 1;
-	// same sign
-	if (MLENGTH(a) < MLENGTH(b)) {
-		if (MSIGN(a) == 1)
-			return -1;
-		else
-			return 1;
-	}
-	if (MLENGTH(a) > MLENGTH(b)) {
-		if (MSIGN(a) == 1)
-			return 1;
-		else
-			return -1;
-	}
-	// same length
-	for (i = MLENGTH(a) - 1; i > 0; i--)
-		if (a[i] != b[i])
-			break;
-	if (a[i] < b[i]) {
-		if (MSIGN(a) == 1)
-			return -1;
-		else
-			return 1;
-	}
-	if (a[i] > b[i]) {
-		if (MSIGN(a) == 1)
-			return 1;
-		else
-			return -1;
-	}
-	return 0;
-}
-
-int
-mcmpint(unsigned int *a, int n)
-{
-	int t;
-	unsigned int *b;
-	b = mint(n);
-	t = mcmp(a, b);
-	mfree(b);
-	return t;
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Bignum GCD
-//
-//	Uses the binary GCD algorithm.
-//
-//	See "The Art of Computer Programming" p. 338.
-//
-//	mgcd always returns a positive value
-//
-//	mgcd(0, 0) = 0
-//
-//	mgcd(u, 0) = |u|
-//
-//	mgcd(0, v) = |v|
-//
-//-----------------------------------------------------------------------------
-
-unsigned int *
-mgcd(unsigned int *u, unsigned int *v)
-{
-	int i, k, n;
-	unsigned int *t;
-	if (MZERO(u)) {
-		t = mcopy(v);
-		MSIGN(t) = 1;
-		return t;
-	}
-	if (MZERO(v)) {
-		t = mcopy(u);
-		MSIGN(t) = 1;
-		return t;
-	}
-	u = mcopy(u);
-	v = mcopy(v);
-	MSIGN(u) = 1;
-	MSIGN(v) = 1;
-	k = 0;
-	while ((u[0] & 1) == 0 && (v[0] & 1) == 0) {
-		mshiftright(u);
-		mshiftright(v);
-		k++;
-	}
-	if (u[0] & 1) {
-		t = mcopy(v);
-		MSIGN(t) *= -1;
-	} else
-		t = mcopy(u);
-	while (1) {
-		while ((t[0] & 1) == 0)
-			mshiftright(t);
-		if (MSIGN(t) == 1) {
-			mfree(u);
-			u = mcopy(t);
-		} else {
-			mfree(v);
-			v = mcopy(t);
-			MSIGN(v) *= -1;
-		}
-		mfree(t);
-		t = msub(u, v);
-		if (MZERO(t)) {
-			mfree(t);
-			mfree(v);
-			n = (k / 32) + 1;
-			v = mnew(n);
-			MSIGN(v) = 1;
-			MLENGTH(v) = n;
-			for (i = 0; i < n; i++)
-				v[i] = 0;
-			mp_set_bit(v, k);
-			t = mmul(u, v);
-			mfree(u);
-			mfree(v);
-			return t;
-		}
+	switch (doc_type) {
+	case DOC_LATEX:
+		begin_latex();
+		break;
+	case DOC_MATHML:
+		begin_mathml();
+		break;
+	case DOC_MATHJAX:
+		begin_mathjax();
+		break;
+	default:
+		break;
 	}
 }
 
 void
-new_string(char *s)
+end_document(void)
+{
+	switch (doc_type) {
+	case DOC_LATEX:
+		end_latex();
+		break;
+	case DOC_MATHML:
+		end_mathml();
+		break;
+	case DOC_MATHJAX:
+		end_mathjax();
+		break;
+	default:
+		break;
+	}
+}
+
+void
+begin_latex(void)
+{
+	fputs(
+	"\\documentclass[12pt]{article}\n"
+	"\\usepackage{amsmath,amsfonts,amssymb}\n"
+	"\\usepackage[margin=2cm]{geometry}\n"
+	"\\begin{document}\n\n",
+	stdout);
+}
+
+void
+end_latex(void)
+{
+	if (doc_state)
+		fputs("\\end{verbatim}\n\n", stdout);
+	fputs("\\end{document}\n", stdout);
+}
+
+void
+begin_mathml(void)
+{
+	fputs("<html>\n<head>\n</head>\n<body>\n\n", stdout);
+}
+
+void
+end_mathml(void)
+{
+	fputs("</body>\n</html>\n", stdout);
+}
+
+void
+begin_mathjax(void)
+{
+	fputs(
+	"<!DOCTYPE html>\n"
+	"<html>\n"
+	"<head>\n"
+	"<script src='https://polyfill.io/v3/polyfill.min.js?features=es6'></script>\n"
+	"<script type='text/javascript' id='MathJax-script' async\n"
+	"src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js'></script>\n"
+	"</head>\n"
+	"<body>\n\n",
+	stdout);
+}
+
+void
+end_mathjax(void)
+{
+	fputs("</body>\n</html>\n", stdout);
+}
+
+void
+eval_draw(void)
+{
+	push_symbol(NIL);
+}
+
+void
+eval_exit(void)
+{
+	end_document();
+	exit(0);
+}
+
+void
+eval_mathjax(void)
+{
+	push(cadr(p1));
+	eval();
+	mathjax();
+	push_string(outbuf);
+}
+
+void
+mathjax(void)
 {
 	save();
-	p1 = alloc();
-	p1->k = STR;
-	p1->u.str = strdup(s);
-	push(p1);
+	mathjax_nib();
 	restore();
 }
 
 void
-out_of_memory(void)
+mathjax_nib(void)
 {
-	stop("out of memory");
-}
-
-void
-push_zero_matrix(int i, int j)
-{
-	push(alloc_tensor(i * j));
-	stack[tos - 1]->u.tensor->ndim = 2;
-	stack[tos - 1]->u.tensor->dim[0] = i;
-	stack[tos - 1]->u.tensor->dim[1] = j;
-}
-
-void
-push_identity_matrix(int n)
-{
-	int i;
-	push_zero_matrix(n, n);
-	for (i = 0; i < n; i++)
-		stack[tos - 1]->u.tensor->elem[i * n + i] = one;
-}
-
-void
-push_cars(U *p)
-{
-	while (iscons(p)) {
-		push(car(p));
-		p = cdr(p);
-	}
-}
-
-void
-peek(void)
-{
-	save();
+	outbuf_index = 0;
 	p1 = pop();
-	push(p1);
-	print(p1);
+	if (isstr(p1))
+		mml_string(p1, 0);
+	else {
+		print_str("$$\n");
+		latex_expr(p1);
+		print_str("\n$$");
+	}
+	print_char('\0');
+}
+
+#define MML_MINUS "<mo rspace='0'>-</mo>"
+#define MML_MINUS_1 "<mo>(</mo><mo rspace='0'>-</mo><mn>1</mn><mo>)</mo>"
+#define MML_LP "<mrow><mo>(</mo>"
+#define MML_RP "<mo>)</mo></mrow>"
+#define MML_LB "<mrow><mo>[</mo>"
+#define MML_RB "<mo>]</mo></mrow>"
+
+void
+eval_mathml(void)
+{
+	push(cadr(p1));
+	eval();
+	mathml();
+	push_string(outbuf);
+}
+
+void
+mathml(void)
+{
+	save();
+	mathml_nib();
 	restore();
 }
 
 void
-peek2(void)
+mathml_nib(void)
 {
-	print_lisp(stack[tos - 2]);
-	print_lisp(stack[tos - 1]);
-}
-
-int
-equal(U *p1, U *p2)
-{
-	if (cmp_expr(p1, p2) == 0)
-		return 1;
-	else
-		return 0;
-}
-
-int
-lessp(U *p1, U *p2)
-{
-	if (cmp_expr(p1, p2) < 0)
-		return 1;
-	else
-		return 0;
-}
-
-int
-sign(int n)
-{
-	if (n < 0)
-		return -1;
-	else if (n > 0)
-		return 1;
-	else
-		return 0;
-}
-
-int
-cmp_expr(U *p1, U *p2)
-{
-	int n;
-	if (p1 == p2)
-		return 0;
-	if (p1 == symbol(NIL))
-		return -1;
-	if (p2 == symbol(NIL))
-		return 1;
-	if (isnum(p1) && isnum(p2))
-		return sign(compare_numbers(p1, p2));
-	if (isnum(p1))
-		return -1;
-	if (isnum(p2))
-		return 1;
-	if (isstr(p1) && isstr(p2))
-		return sign(strcmp(p1->u.str, p2->u.str));
+	outbuf_index = 0;
+	p1 = pop();
 	if (isstr(p1))
-		return -1;
-	if (isstr(p2))
-		return 1;
-	if (issymbol(p1) && issymbol(p2))
-		return sign(strcmp(get_printname(p1), get_printname(p2)));
-	if (issymbol(p1))
-		return -1;
-	if (issymbol(p2))
-		return 1;
-	if (istensor(p1) && istensor(p2))
-		return compare_tensors(p1, p2);
-	if (istensor(p1))
-		return -1;
-	if (istensor(p2))
-		return 1;
-	while (iscons(p1) && iscons(p2)) {
-		n = cmp_expr(car(p1), car(p2));
-		if (n != 0)
-			return n;
-		p1 = cdr(p1);
-		p2 = cdr(p2);
+		mml_string(p1, 0);
+	else {
+		print_str("<math xmlns='http://www.w3.org/1998/Math/MathML' display='block'>");
+		mml_expr(p1);
+		print_str("</math>");
 	}
-	if (iscons(p2))
-		return -1;
-	if (iscons(p1))
-		return 1;
-	return 0;
+	print_char('\0');
 }
 
-int
-length(U *p)
+void
+mml_expr(struct atom *p)
+{
+	struct atom *q;
+	if (car(p) == symbol(ADD)) {
+		p = cdr(p);
+		q = car(p);
+		if (isnegativenumber(q) || (car(q) == symbol(MULTIPLY) && isnegativenumber(cadr(q))))
+			print_str(MML_MINUS);
+		mml_term(q);
+		p = cdr(p);
+		while (iscons(p)) {
+			q = car(p);
+			if (isnegativenumber(q) || (car(q) == symbol(MULTIPLY) && isnegativenumber(cadr(q))))
+				mml_mo("-");
+			else
+				mml_mo("+");
+			mml_term(q);
+			p = cdr(p);
+		}
+	} else {
+		if (isnegativenumber(p) || (car(p) == symbol(MULTIPLY) && isnegativenumber(cadr(p))))
+			print_str(MML_MINUS);
+		mml_term(p);
+	}
+}
+
+void
+mml_term(struct atom *p)
+{
+	struct atom *q, *t;
+	if (car(p) == symbol(MULTIPLY)) {
+		// any denominators?
+		t = cdr(p);
+		while (iscons(t)) {
+			q = car(t);
+			if (car(q) == symbol(POWER) && isnegativenumber(caddr(q)))
+				break;
+			t = cdr(t);
+		}
+		if (iscons(t)) {
+			print_str("<mfrac>");
+			print_str("<mrow>");
+			mml_numerators(p);
+			print_str("</mrow>");
+			print_str("<mrow>");
+			mml_denominators(p);
+			print_str("</mrow>");
+			print_str("</mfrac>");
+			return;
+		}
+		// no denominators
+		p = cdr(p);
+		q = car(p);
+		if (isrational(q) && isminusone(q))
+			p = cdr(p); // skip -1
+		while (iscons(p)) {
+			mml_factor(car(p));
+			p = cdr(p);
+		}
+	} else
+		mml_factor(p);
+}
+
+void
+mml_numerators(struct atom *p)
 {
 	int n = 0;
-	while (iscons(p)) {
+	char *s;
+	struct atom *q;
+	p = cdr(p);
+	q = car(p);
+	if (isrational(q)) {
+		if (!MEQUAL(q->u.q.a, 1)) {
+			s = mstr(q->u.q.a); // numerator
+			mml_mn(s);
+			n++;
+		}
 		p = cdr(p);
-		n++;
 	}
-	return n;
-}
-
-U *
-unique(U *p)
-{
-	save();
-	p1 = symbol(NIL);
-	p2 = symbol(NIL);
-	unique_f(p);
-	if (p2 != symbol(NIL))
-		p1 = symbol(NIL);
-	p = p1;
-	restore();
-	return p;
+	while (iscons(p)) {
+		q = car(p);
+		if (car(q) == symbol(POWER) && isnegativenumber(caddr(q))) {
+			p = cdr(p);
+			continue; // printed in denominator
+		}
+		mml_factor(q);
+		n++;
+		p = cdr(p);
+	}
+	if (n == 0)
+		mml_mn("1"); // there were no numerators
 }
 
 void
-unique_f(U *p)
+mml_denominators(struct atom *p)
 {
-	if (isstr(p)) {
-		if (p1 == symbol(NIL))
-			p1 = p;
-		else if (p != p1)
-			p2 = p;
+	int n = 0;
+	char *s;
+	struct atom *q;
+	p = cdr(p);
+	q = car(p);
+	if (isrational(q)) {
+		if (!MEQUAL(q->u.q.b, 1)) {
+			s = mstr(q->u.q.b); // denominator
+			mml_mn(s);
+			n++;
+		}
+		p = cdr(p);
+	}
+	while (iscons(p)) {
+		q = car(p);
+		if (car(q) != symbol(POWER) || !isnegativenumber(caddr(q))) {
+			p = cdr(p);
+			continue; // not a denominator
+		}
+		// example (-1)^(-1/4)
+		if (isminusone(cadr(q))) {
+			print_str("<msup>");
+			print_str("<mrow>");
+			print_str(MML_MINUS_1); // (-1)
+			print_str("</mrow>");
+			print_str("<mrow>");
+			mml_number(caddr(q)); // -1/4 (sign not printed)
+			print_str("</mrow>");
+			print_str("</msup>");
+			n++;
+			p = cdr(p);
+			continue;
+		}
+		// example 1/y
+		if (isminusone(caddr(q))) {
+			mml_factor(cadr(q)); // y
+			n++;
+			p = cdr(p);
+			continue;
+		}
+		// example 1/y^2
+		print_str("<msup>");
+		print_str("<mrow>");
+		mml_base(cadr(q)); // y
+		print_str("</mrow>");
+		print_str("<mrow>");
+		mml_number(caddr(q)); // -2 (sign not printed)
+		print_str("</mrow>");
+		print_str("</msup>");
+		n++;
+		p = cdr(p);
+	}
+	if (n == 0)
+		mml_mn("1"); // there were no denominators
+}
+
+void
+mml_factor(struct atom *p)
+{
+	switch (p->k) {
+	case RATIONAL:
+		mml_rational(p);
+		break;
+	case DOUBLE:
+		mml_double(p);
+		break;
+	case KSYM:
+	case USYM:
+		mml_symbol(p);
+		break;
+	case STR:
+		mml_string(p, 1);
+		break;
+	case TENSOR:
+		mml_tensor(p);
+		break;
+	case CONS:
+		if (car(p) == symbol(POWER))
+			mml_power(p);
+		else if (car(p) == symbol(ADD) || car(p) == symbol(MULTIPLY))
+			mml_subexpr(p);
+		else
+			mml_function(p);
+		break;
+	}
+}
+
+void
+mml_number(struct atom *p)
+{
+	if (isrational(p))
+		mml_rational(p);
+	else
+		mml_double(p);
+}
+
+void
+mml_rational(struct atom *p)
+{
+	char *s;
+	if (MEQUAL(p->u.q.b, 1)) {
+		s = mstr(p->u.q.a);
+		mml_mn(s);
 		return;
 	}
-	while (iscons(p)) {
-		unique_f(car(p));
-		if (p2 != symbol(NIL))
+	print_str("<mfrac>");
+	s = mstr(p->u.q.a);
+	mml_mn(s);
+	s = mstr(p->u.q.b);
+	mml_mn(s);
+	print_str("</mfrac>");
+}
+
+void
+mml_double(struct atom *p)
+{
+	char *e, *s;
+	sprintf(tbuf, "%g", p->u.d);
+	s = tbuf;
+	if (*s == '-')
+		s++;
+	e = strchr(s, 'e');
+	if (e == NULL)
+		e = strchr(s, 'E');
+	if (e == NULL) {
+		if (strchr(s, '.') == NULL)
+			strcat(s, ".0");
+		mml_mn(s);
+		return;
+	}
+	*e = '\0';
+	print_str("<mn>");
+	print_str(s);
+	if (strchr(s, '.') == NULL)
+		print_str(".0");
+	print_str("</mn>");
+	mml_mo("&times;");
+	print_str("<msup>");
+	mml_mn("10");
+	print_str("<mrow>");
+	s = e + 1;
+	if (*s == '+')
+		s++;
+	else if (*s == '-') {
+		s++;
+		print_str(MML_MINUS);
+	}
+	while (*s == '0')
+		s++; // skip leading zeroes
+	mml_mn(s);
+	print_str("</mrow>");
+	print_str("</msup>");
+}
+
+void
+mml_power(struct atom *p)
+{
+	// (-1)^x
+	if (isminusone(cadr(p))) {
+		mml_imaginary(p);
+		return;
+	}
+	// e^x
+	if (cadr(p) == symbol(EXP1)) {
+		mml_mi("exp");
+		print_str(MML_LP);
+		mml_expr(caddr(p)); // x
+		print_str(MML_RP);
+		return;
+	}
+	// example 1/y
+	if (isminusone(caddr(p))) {
+		print_str("<mfrac>");
+		mml_mn("1"); // 1
+		print_str("<mrow>");
+		mml_expr(cadr(p)); // y
+		print_str("</mrow>");
+		print_str("</mfrac>");
+		return;
+	}
+	// example 1/y^2
+	if (isnegativenumber(caddr(p))) {
+		print_str("<mfrac>");
+		mml_mn("1"); // 1
+		print_str("<msup>");
+		print_str("<mrow>");
+		mml_base(cadr(p)); // y
+		print_str("</mrow>");
+		print_str("<mrow>");
+		mml_number(caddr(p)); // -2 (sign not printed)
+		print_str("</mrow>");
+		print_str("</msup>");
+		print_str("</mfrac>");
+		return;
+	}
+	// example y^x
+	print_str("<msup>");
+	print_str("<mrow>");
+	mml_base(cadr(p)); // y
+	print_str("</mrow>");
+	print_str("<mrow>");
+	mml_exponent(caddr(p)); // x
+	print_str("</mrow>");
+	print_str("</msup>");
+}
+
+void
+mml_base(struct atom *p)
+{
+	if (isfraction(p) || isdouble(p) || car(p) == symbol(POWER))
+		mml_subexpr(p);
+	else
+		mml_factor(p);
+}
+
+void
+mml_exponent(struct atom *p)
+{
+	if (car(p) == symbol(POWER))
+		mml_subexpr(p);
+	else
+		mml_factor(p);
+}
+
+// case (-1)^x
+
+void
+mml_imaginary(struct atom *p)
+{
+	if (isimaginaryunit(p)) {
+		if (isimaginaryunit(binding[SYMBOL_J])) {
+			mml_mi("j");
 			return;
+		}
+		if (isimaginaryunit(binding[SYMBOL_I])) {
+			mml_mi("i");
+			return;
+		}
+	}
+	// example (-1)^(-1/4)
+	if (isnegativenumber(caddr(p))) {
+		print_str("<mfrac>");
+		mml_mn("1");
+		print_str("<msup>");
+		print_str("<mrow>");
+		print_str(MML_MINUS_1); // (-1)
+		print_str("</mrow>");
+		print_str("<mrow>");
+		mml_number(caddr(p)); // -1/4 (sign not printed)
+		print_str("</mrow>");
+		print_str("</msup>");
+		print_str("</mfrac>");
+		return;
+	}
+	// example (-1)^x
+	print_str("<msup>");
+	print_str("<mrow>");
+	print_str(MML_MINUS_1); // (-1)
+	print_str("</mrow>");
+	print_str("<mrow>");
+	mml_expr(caddr(p)); // x
+	print_str("</mrow>");
+	print_str("</msup>");
+}
+
+void
+mml_function(struct atom *p)
+{
+	// d(f(x),x)
+	if (car(p) == symbol(DERIVATIVE)) {
+		print_str("<mi mathvariant='normal'>d</mi>");
+		print_str(MML_LP);
+		mml_arglist(p);
+		print_str(MML_RP);
+		return;
+	}
+	// n!
+	if (car(p) == symbol(FACTORIAL)) {
+		p = cadr(p);
+		if (isposint(p) || issymbol(p))
+			mml_expr(p);
+		else
+			mml_subexpr(p);
+		mml_mo("!");
+		return;
+	}
+	// A[1,2]
+	if (car(p) == symbol(INDEX)) {
 		p = cdr(p);
+		if (issymbol(car(p)))
+			mml_symbol(car(p));
+		else
+			mml_subexpr(car(p));
+		print_str(MML_LB);
+		mml_arglist(p);
+		print_str(MML_RB);
+		return;
+	}
+	if (car(p) == symbol(SETQ)) {
+		mml_expr(cadr(p));
+		mml_mo("=");
+		mml_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTEQ)) {
+		mml_expr(cadr(p));
+		mml_mo("=");
+		mml_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTGE)) {
+		mml_expr(cadr(p));
+		mml_mo("&ge;");
+		mml_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTGT)) {
+		mml_expr(cadr(p));
+		mml_mo("&gt;");
+		mml_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTLE)) {
+		mml_expr(cadr(p));
+		mml_mo("&le;");
+		mml_expr(caddr(p));
+		return;
+	}
+	if (car(p) == symbol(TESTLT)) {
+		mml_expr(cadr(p));
+		mml_mo("&lt");
+		mml_expr(caddr(p));
+		return;
+	}
+	// default
+	if (issymbol(car(p)))
+		mml_symbol(car(p));
+	else
+		mml_subexpr(car(p));
+	print_str(MML_LP);
+	mml_arglist(p);
+	print_str(MML_RP);
+}
+
+void
+mml_arglist(struct atom *p)
+{
+	p = cdr(p);
+	if (iscons(p)) {
+		mml_expr(car(p));
+		p = cdr(p);
+		while(iscons(p)) {
+			mml_mo(",");
+			mml_expr(car(p));
+			p = cdr(p);
+		}
 	}
 }
 
 void
-ssqrt(void)
+mml_subexpr(struct atom *p)
 {
-	push_rational(1, 2);
-	power();
+	print_str(MML_LP);
+	mml_expr(p);
+	print_str(MML_RP);
 }
 
 void
-yyexpand(void)
+mml_symbol(struct atom *p)
 {
-	int x;
-	x = expanding;
-	expanding = 1;
-	eval();
-	expanding = x;
+	int n;
+	char *s;
+	if (iskeyword(p) || p == symbol(LAST) || p == symbol(NIL) || p == symbol(TRACE) || p == symbol(TTY)) {
+		mml_mi(printname(p));
+		return;
+	}
+	if (p == symbol(EXP1)) {
+		mml_mi("exp");
+		print_str(MML_LP);
+		mml_mn("1");
+		print_str(MML_RP);
+		return;
+	}
+	s = printname(p);
+	n = mml_symbol_scan(s);
+	if ((int) strlen(s) == n) {
+		mml_symbol_shipout(s, n);
+		return;
+	}
+	// print symbol with subscript
+	print_str("<msub>");
+	mml_symbol_shipout(s, n);
+	s += n;
+	print_str("<mrow>");
+	while (*s) {
+		n = mml_symbol_scan(s);
+		mml_symbol_shipout(s, n);
+		s += n;
+	}
+	print_str("</mrow>");
+	print_str("</msub>");
 }
 
-void
-exponential(void)
-{
-	push_symbol(EXP1);
-	swap();
-	power();
-}
-
-void
-square(void)
-{
-	push_integer(2);
-	power();
-}
+char *mml_greek_tab[46] = {
+	"Alpha","Beta","Gamma","Delta","Epsilon","Zeta","Eta","Theta","Iota",
+	"Kappa","Lambda","Mu","Nu","Xi","Pi","Rho","Sigma","Tau","Upsilon",
+	"Phi","Chi","Psi","Omega",
+	"alpha","beta","gamma","delta","epsilon","zeta","eta","theta","iota",
+	"kappa","lambda","mu","nu","xi","pi","rho","sigma","tau","upsilon",
+	"phi","chi","psi","omega",
+};
 
 int
-sort_stack_cmp(const void *p1, const void *p2)
+mml_symbol_scan(char *s)
 {
-	return cmp_expr(*((U **) p1), *((U **) p2));
+	int i, n;
+	for (i = 0; i < 46; i++) {
+		n = (int) strlen(mml_greek_tab[i]);
+		if (strncmp(s, mml_greek_tab[i], n) == 0)
+			return n;
+	}
+	return 1;
 }
 
 void
-sort_stack(int n)
-{
-	qsort(stack + tos - n, n, sizeof (U *), sort_stack_cmp);
-}
-
-// Bignum modular power (x^n mod m)
-
-// could do indexed bit test instead of shift right
-
-unsigned int *
-mmodpow(unsigned int *x, unsigned int *n, unsigned int *m)
-{
-	unsigned int *y, *z;
-	x = mcopy(x);
-	n = mcopy(n);
-	y = mint(1);
-	while (1) {
-		if (n[0] & 1) {
-			z = mmul(y, x);
-			mfree(y);
-			y = mmod(z, m);
-			mfree(z);
-		}
-		mshiftright(n);
-		if (MZERO(n))
-			break;
-		z = mmul(x, x);
-		mfree(x);
-		x = mmod(z, m);
-		mfree(z);
-	}
-	mfree(x);
-	mfree(n);
-	return y;
-}
-
-// Bignum multiplication and division
-
-unsigned int *
-mmul(unsigned int *a, unsigned int *b)
-{
-	int alen, blen, i, n;
-	unsigned int *t, *x;
-	if (MZERO(a) || MZERO(b))
-		return mint(0);
-	if (MLENGTH(a) == 1 && a[0] == 1) {
-		t = mcopy(b);
-		MSIGN(t) *= MSIGN(a);
-		return t;
-	}
-	if (MLENGTH(b) == 1 && b[0] == 1) {
-		t = mcopy(a);
-		MSIGN(t) *= MSIGN(b);
-		return t;
-	}
-	alen = MLENGTH(a);
-	blen = MLENGTH(b);
-	n = alen + blen;
-	x = mnew(n);
-	t = mnew(alen + 1);
-	for (i = 0; i < n; i++)
-		x[i] = 0;
-	/* sum of partial products */
-	for (i = 0; i < blen; i++) {
-		mulf(t, a, alen, b[i]);
-		addf(x + i, t, alen + 1);
-	}
-	mfree(t);
-	/* length of product */
-	for (i = n - 1; i > 0; i--)
-		if (x[i])
-			break;
-	MLENGTH(x) = i + 1;
-	MSIGN(x) = MSIGN(a) * MSIGN(b);
-	return x;
-}
-
-unsigned int *
-mdiv(unsigned int *a, unsigned int *b)
-{
-	int alen, blen, i, n;
-	unsigned int c, *t, *x, *y;
-	uint64_t jj, kk;
-	if (MZERO(b))
-		stop("divide by zero");
-	if (MZERO(a))
-		return mint(0);
-	alen = MLENGTH(a);
-	blen = MLENGTH(b);
-	n = alen - blen;
-	if (n < 0)
-		return mint(0);
-	x = mnew(alen + 1);
-	for (i = 0; i < alen; i++)
-		x[i] = a[i];
-	x[i] = 0;
-	y = mnew(n + 1);
-	t = mnew(blen + 1);
-	/* Add 1 here to round up in case the remaining words are non-zero. */
-	kk = (uint64_t) b[blen - 1] + 1;
-	for (i = 0; i <= n; i++) {
-		y[n - i] = 0;
-		for (;;) {
-			/* estimate the partial quotient */
-			jj = (uint64_t) x[alen - i - 0] << 32 | x[alen - i - 1];
-			c = (uint32_t) (jj / kk); // compiler warns w/o cast
-			if (c == 0) {
-				if (ge(x + n - i, b, blen)) { /* see note 1 */
-					y[n - i]++;
-					subf(x + n - i, b, blen);
-				}
-				break;
-			}
-			y[n - i] += c;
-			mulf(t, b, blen, c);
-			subf(x + n - i, t, blen + 1);
-		}
-	}
-	mfree(t);
-	mfree(x);
-	/* length of quotient */
-	for (i = n; i > 0; i--)
-		if (y[i])
-			break;
-	if (i == 0 && y[0] == 0) {
-		mfree(y);
-		y = mint(0);
-	} else {
-		MLENGTH(y) = i + 1;
-		MSIGN(y) = MSIGN(a) * MSIGN(b);
-	}
-	return y;
-}
-
-// a = a + b
-
-void
-addf(unsigned int *a, unsigned int *b, int len)
+mml_symbol_shipout(char *s, int n)
 {
 	int i;
-	long long t = 0; /* can be signed or unsigned */
-	for (i = 0; i < len; i++) {
-		t += (long long) a[i] + b[i];
-		a[i] = (unsigned int) t;
-		t >>= 32;
-	}
-}
-
-// a = a - b
-
-void
-subf(unsigned int *a, unsigned int *b, int len)
-{
-	int i;
-	long long t = 0; /* must be signed */
-	for (i = 0; i < len; i++) {
-		t += (long long) a[i] - b[i];
-		a[i] = (unsigned int) t;
-		t >>= 32;
-	}
-}
-
-// a = b * c
-
-// 0xffffffff + 0xffffffff * 0xffffffff == 0xffffffff00000000
-
-void
-mulf(unsigned int *a, unsigned int *b, int len, unsigned int c)
-{
-	int i;
-	uint64_t t = 0; /* must be unsigned */
-	for (i = 0; i < len; i++) {
-		t += (uint64_t) b[i] * c;
-		a[i] = (unsigned int) t;
-		t >>= 32;
-	}
-	a[i] = (unsigned int) t;
-}
-
-unsigned int *
-mmod(unsigned int *a, unsigned int *b)
-{
-	int alen, blen, i, n;
-	unsigned int c, *t, *x, *y;
-	uint64_t jj, kk;
-	if (MZERO(b))
-		stop("divide by zero");
-	if (MZERO(a))
-		return mint(0);
-	alen = MLENGTH(a);
-	blen = MLENGTH(b);
-	n = alen - blen;
-	if (n < 0)
-		return mcopy(a);
-	x = mnew(alen + 1);
-	for (i = 0; i < alen; i++)
-		x[i] = a[i];
-	x[i] = 0;
-	y = mnew(n + 1);
-	t = mnew(blen + 1);
-	kk = (uint64_t) b[blen - 1] + 1;
-	for (i = 0; i <= n; i++) {
-		y[n - i] = 0;
-		for (;;) {
-			/* estimate the partial quotient */
-			jj = (uint64_t) x[alen - i - 0] << 32 | x[alen - i - 1];
-			c = (uint32_t) (jj / kk); // compiler warns w/o cast
-			if (c == 0) {
-				if (ge(x + n - i, b, blen)) { /* see note 1 */
-					y[n - i]++;
-					subf(x + n - i, b, blen);
-				}
-				break;
-			}
-			y[n - i] += c;
-			mulf(t, b, blen, c);
-			subf(x + n - i, t, blen + 1);
-		}
-	}
-	mfree(t);
-	mfree(y);
-	/* length of remainder */
-	for (i = blen - 1; i > 0; i--)
-		if (x[i])
-			break;
-	if (i == 0 && x[0] == 0) {
-		mfree(x);
-		x = mint(0);
-	} else {
-		MLENGTH(x) = i + 1;
-		MSIGN(x) = MSIGN(a);
-	}
-	return x;
-}
-
-// return both quotient and remainder of a/b
-
-void
-mdivrem(unsigned int **q, unsigned int **r, unsigned int *a, unsigned int *b)
-{
-	int alen, blen, i, n;
-	unsigned int c, *t, *x, *y;
-	uint64_t jj, kk;
-	if (MZERO(b))
-		stop("divide by zero");
-	if (MZERO(a)) {
-		*q = mint(0);
-		*r = mint(0);
+	if (n == 1) {
+		print_str("<mi>");
+		print_char(*s);
+		print_str("</mi>");
 		return;
 	}
-	alen = MLENGTH(a);
-	blen = MLENGTH(b);
-	n = alen - blen;
-	if (n < 0) {
-		*q = mint(0);
-		*r = mcopy(a);
-		return;
-	}
-	x = mnew(alen + 1);
-	for (i = 0; i < alen; i++)
-		x[i] = a[i];
-	x[i] = 0;
-	y = mnew(n + 1);
-	t = mnew(blen + 1);
-	kk = (uint64_t) b[blen - 1] + 1;
-	for (i = 0; i <= n; i++) {
-		y[n - i] = 0;
-		for (;;) {
-			/* estimate the partial quotient */
-			jj = (uint64_t) x[alen - i - 0] << 32 | x[alen - i - 1];
-			c = (uint32_t) (jj / kk); // compiler warns w/o cast
-			if (c == 0) {
-				if (ge(x + n - i, b, blen)) { /* see note 1 */
-					y[n - i]++;
-					subf(x + n - i, b, blen);
-				}
-				break;
-			}
-			y[n - i] += c;
-			mulf(t, b, blen, c);
-			subf(x + n - i, t, blen + 1);
-		}
-	}
-	mfree(t);
-	/* length of quotient */
-	for (i = n; i > 0; i--)
-		if (y[i])
-			break;
-	if (i == 0 && y[0] == 0) {
-		mfree(y);
-		y = mint(0);
+	// greek
+	if (*s >= 'A' && *s <= 'Z') {
+		print_str("<mi mathvariant='normal'>&"); // upper case
+		for (i = 0; i < n; i++)
+			print_char(*s++);
+		print_str(";</mi>");
 	} else {
-		MLENGTH(y) = i + 1;
-		MSIGN(y) = MSIGN(a) * MSIGN(b);
+		print_str("<mi>&");
+		for (i = 0; i < n; i++)
+			print_char(*s++);
+		print_str(";</mi>");
 	}
-	/* length of remainder */
-	for (i = blen - 1; i > 0; i--)
-		if (x[i])
-			break;
-	if (i == 0 && x[0] == 0) {
-		mfree(x);
-		x = mint(0);
-	} else {
-		MLENGTH(x) = i + 1;
-		MSIGN(x) = MSIGN(a);
-	}
-	*q = y;
-	*r = x;
 }
 
-void mod(void);
+void
+mml_tensor(struct atom *p)
+{
+	int i, n, k = 0;
+	struct tensor *t;
+	t = p->u.tensor;
+	// if odd rank then vector
+	if (t->ndim % 2 == 1) {
+		print_str(MML_LP);
+		print_str("<mtable>");
+		n = t->dim[0];
+		for (i = 0; i < n; i++) {
+			print_str("<mtr><mtd>");
+			mml_matrix(t, 1, &k);
+			print_str("</mtd></mtr>");
+		}
+		print_str("</mtable>");
+		print_str(MML_RP);
+	} else
+		mml_matrix(t, 0, &k);
+}
+
+void
+mml_matrix(struct tensor *t, int d, int *k)
+{
+	int i, j, ni, nj;
+	if (d == t->ndim) {
+		mml_expr(t->elem[*k]);
+		*k = *k + 1;
+		return;
+	}
+	ni = t->dim[d];
+	nj = t->dim[d + 1];
+	print_str(MML_LP);
+	print_str("<mtable>");
+	for (i = 0; i < ni; i++) {
+		print_str("<mtr>");
+		for (j = 0; j < nj; j++) {
+			print_str("<mtd>");
+			mml_matrix(t, d + 2, k);
+			print_str("</mtd>");
+		}
+		print_str("</mtr>");
+	}
+	print_str("</mtable>");
+	print_str(MML_RP);
+}
+
+void
+mml_string(struct atom *p, int mathmode)
+{
+	char *s = p->u.str;
+	if (mathmode)
+		print_str("<mtext>&nbsp;");
+	while (*s) {
+		switch (*s) {
+		case '\n':
+			print_str("<br>");
+			break;
+		case '&':
+			print_str("&amp;");
+			break;
+		case '<':
+			print_str("&lt;");
+			break;
+		case '>':
+			print_str("&gt;");
+			break;
+		default:
+			print_char(*s);
+			break;
+		}
+		s++;
+	}
+	if (mathmode)
+		print_str("</mtext>");
+}
+
+void
+mml_mi(char *s)
+{
+	print_str("<mi>");
+	print_str(s);
+	print_str("</mi>");
+}
+
+void
+mml_mn(char *s)
+{
+	print_str("<mn>");
+	print_str(s);
+	print_str("</mn>");
+}
+
+void
+mml_mo(char *s)
+{
+	print_str("<mo>");
+	print_str(s);
+	print_str("</mo>");
+}
 
 void
 eval_mod(void)
@@ -12852,877 +13206,661 @@ eval_mod(void)
 	eval();
 	push(caddr(p1));
 	eval();
-	mod();
+	smod();
 }
 
 void
-mod(void)
+smod(void)
 {
-	int n;
 	save();
-	p2 = pop();
-	p1 = pop();
-	if (iszero(p2))
-		stop("mod function: divide by zero");
-	if (!isnum(p1) || !isnum(p2)) {
-		push_symbol(MOD);
-		push(p1);
-		push(p2);
-		list(3);
-		restore();
-		return;
-	}
-	if (isdouble(p1)) {
-		push(p1);
-		n = pop_integer();
-		if (n == (int) 0x80000000)
-			stop("mod function: cannot convert float value to integer");
-		push_integer(n);
-		p1 = pop();
-	}
-	if (isdouble(p2)) {
-		push(p2);
-		n = pop_integer();
-		if (n == (int) 0x80000000)
-			stop("mod function: cannot convert float value to integer");
-		push_integer(n);
-		p2 = pop();
-	}
-	if (!isinteger(p1) || !isinteger(p2))
-		stop("mod function: integer arguments expected");
-	p3 = alloc();
-	p3->k = NUM;
-	p3->u.q.a = mmod(p1->u.q.a, p2->u.q.a);
-	p3->u.q.b = mint(1);
-	push(p3);
+	smod_nib();
 	restore();
 }
 
-// Bignum power
-
-unsigned int *
-mpow(unsigned int *a, unsigned int n)
+void
+smod_nib(void)
 {
-	unsigned int *aa, *t;
-	a = mcopy(a);
-	aa = mint(1);
-	for (;;) {
-		if (n & 1) {
-			t = mmul(aa, a);
-			mfree(aa);
-			aa = t;
-		}
-		n >>= 1;
-		if (n == 0)
-			break;
-		t = mmul(a, a);
-		mfree(a);
-		a = t;
+	p2 = pop();
+	p1 = pop();
+	if (iszero(p2))
+		stop("mod: divide by zero");
+	if (isnum(p1) && isnum(p2)) {
+		smod_numbers();
+		return;
 	}
-	mfree(a);
-	return aa;
+	push_symbol(MOD);
+	push(p1);
+	push(p2);
+	list(3);
 }
 
-// Bignum prime test (returns 1 if prime, 0 if not)
-
-// Uses Algorithm P (probabilistic primality test) from p. 395 of
-// "The Art of Computer Programming, Volume 2" by Donald E. Knuth.
-
-int mprimef(unsigned int *, unsigned int *, int);
-
-int
-mprime(unsigned int *n)
+void
+smod_numbers(void)
 {
-	int i, k;
-	unsigned int *q;
-	// 1?
-	if (MLENGTH(n) == 1 && n[0] == 1)
-		return 0;
-	// 2?
-	if (MLENGTH(n) == 1 && n[0] == 2)
-		return 1;
-	// even?
-	if ((n[0] & 1) == 0)
-		return 0;
-	// n = 1 + (2 ^ k) q
-	q = mcopy(n);
-	k = 0;
-	do {
-		mshiftright(q);
-		k++;
-	} while ((q[0] & 1) == 0);
-	// try 25 times
-	for (i = 0; i < 25; i++)
-		if (mprimef(n, q, k) == 0)
-			break;
-	mfree(q);
-	if (i < 25)
-		return 0;
-	else
-		return 1;
+	double d1, d2;
+	if (isrational(p1) && isrational(p2)) {
+		smod_rationals();
+		return;
+	}
+	push(p1);
+	d1 = pop_double();
+	push(p2);
+	d2 = pop_double();
+	push_double(fmod(d1, d2));
 }
 
-//-----------------------------------------------------------------------------
-//
-//	This is the actual implementation of Algorithm P.
-//
-//	Input:		n		The number in question.
-//
-//			q		n = 1 + (2 ^ k) q
-//
-//			k
-//
-//	Output:		1		when n is probably prime
-//
-//			0		when n is definitely not prime
-//
-//-----------------------------------------------------------------------------
-
-int
-mprimef(unsigned int *n, unsigned int *q, int k)
+void
+smod_rationals(void)
 {
-	int i, j;
-	unsigned int *t, *x, *y;
-	// generate x
-	t = mcopy(n);
-	while (1) {
-		for (i = 0; i < MLENGTH(t); i++)
-			t[i] = rand();
-		x = mmod(t, n);
-		if (!MZERO(x) && !MEQUAL(x, 1))
-			break;
-		mfree(x);
+	if (isinteger(p1) && isinteger(p2)) {
+		push_rational_number(p1->sign, mmod(p1->u.q.a, p2->u.q.a), mint(1));
+		return;
 	}
-	mfree(t);
-	// exponentiate
-	y = mmodpow(x, q, n);
-	// done?
-	if (MEQUAL(y, 1)) {
-		mfree(x);
-		mfree(y);
-		return 1;
-	}
-	j = 0;
-	while (1) {
-		// y = n - 1?
-		t = msub(n, y);
-		if (MEQUAL(t, 1)) {
-			mfree(t);
-			mfree(x);
-			mfree(y);
-			return 1;
-		}
-		mfree(t);
-		if (++j == k) {
-			mfree(x);
-			mfree(y);
-			return 0;
-		}
-		// y = (y ^ 2) mod n
-		t = mmul(y, y);
-		mfree(y);
-		y = mmod(t, n);
-		mfree(t);
-		// y = 1?
-		if (MEQUAL(y, 1)) {
-			mfree(x);
-			mfree(y);
-			return 0;
-		}
-	}
+	push(p1);
+	push(p1);
+	push(p2);
+	divide();
+	absval();
+	sfloor();
+	push(p2);
+	multiply();
+	if (p1->sign == p2->sign)
+		negate();
+	add();
 }
 
-//-----------------------------------------------------------------------------
-//
-//	Bignum root
-//
-//	Returns null pointer if not perfect root.
-//
-//	The sign of the radicand is ignored.
-//
-//-----------------------------------------------------------------------------
+#undef TFACT
+#undef BASE1
+#undef BASE2
+#undef EXPO1
+#undef EXPO2
+#undef COEF
+#undef NUMER
+#undef DENOM
 
-unsigned int *
-mroot(unsigned int *n, unsigned int index)
+#define TFACT p0
+#define BASE1 p3
+#define BASE2 p4
+#define EXPO1 p5
+#define EXPO2 p6
+#define COEF p7
+#define NUMER p8
+#define DENOM p9
+
+void
+eval_multiply(void)
 {
-	int i, j, k;
-	unsigned int m, *x, *y;
-	if (index == 0)
-		stop("root index is zero");
-	// count number of bits
-	k = 32 * (MLENGTH(n) - 1);
-	m = n[MLENGTH(n) - 1];
-	while (m) {
-		m >>= 1;
-		k++;
+	int h = tos;
+	p1 = cdr(p1);
+	while (iscons(p1)) {
+		push(car(p1));
+		eval();
+		p1 = cdr(p1);
 	}
-	if (k == 0)
-		return mint(0);
-	// initial guess
-	k = (k - 1) / index;
-	j = k / 32 + 1;
-	x = mnew(j);
-	MSIGN(x) = 1;
-	MLENGTH(x) = j;
-	for (i = 0; i < j; i++)
-		x[i] = 0;
-	while (k >= 0) {
-		mp_set_bit(x, k);
-		y = mpow(x, index);
-		switch (mcmp(y, n)) {
-		case -1:
-			break;
-		case 0:
-			mfree(y);
-			return x;
-		case 1:
-			mp_clr_bit(x, k);
-			break;
-		}
-		mfree(y);
-		k--;
-	}
-	mfree(x);
-	return 0;
+	multiply_factors(tos - h);
 }
-
-// bignum scanner
-
-unsigned int *maddf(unsigned int *, int);
-unsigned int *mmulf(unsigned int *, int);
-
-unsigned int *
-mscan(char *s)
-{
-	int sign;
-	unsigned int *a, *b, *c;
-	sign = 1;
-	if (*s == '-') {
-		sign = -1;
-		s++;
-	}
-	a = mint(0);
-	while (*s) {
-		b = mmulf(a, 10);
-		c = maddf(b, *s - '0');
-		mfree(a);
-		mfree(b);
-		a = c;
-		s++;
-	}
-	if (!MZERO(a))
-		MSIGN(a) *= sign;
-	return a;
-}
-
-unsigned int *
-maddf(unsigned int *a, int n)
-{
-	unsigned int *b, *c;
-	b = mint(n);
-	c = madd(a, b);
-	mfree(b);
-	return c;
-}
-
-unsigned int *
-mmulf(unsigned int *a, int n)
-{
-	unsigned int *b, *c;
-	b = mint(n);
-	c = mmul(a, b);
-	mfree(b);
-	return c;
-}
-
-// Convert bignum to string
-
-char *
-mstr(unsigned int *a)
-{
-	int k, n, r, sign;
-	char c;
-	static char *str;
-	static int len;
-	if (str == NULL) {
-		str = (char *) malloc(1000);
-		len = 1000;
-	}
-	// estimate string size
-	n = 10 * MLENGTH(a) + 2;
-	if (n > len) {
-		free(str);
-		str = (char *) malloc(n);
-		len = n;
-	}
-	sign = MSIGN(a);
-	a = mcopy(a);
-	k = len - 1;
-	str[k] = 0;
-	for (;;) {
-		k -= 9;
-		r = divby1billion(a);
-		c = str[k + 9];
-		sprintf(str + k, "%09d", r);
-		str[k + 9] = c;
-		if (MZERO(a))
-			break;
-	}
-	// remove leading zeroes
-	while (str[k] == '0')
-		k++;
-	if (str[k] == 0)
-		k--; // leave one leading zero
-	// sign
-	if (sign == -1) {
-		k--;
-		str[k] = '-';
-	}
-	mfree(a);
-	return str + k;
-}
-
-// Returns remainder as function value, quotient returned in a.
-
-int
-divby1billion(unsigned int *a)
-{
-	int i;
-	uint64_t kk = 0;
-	for (i = MLENGTH(a) - 1; i >= 0; i--) {
-		kk = kk << 32 | a[i];
-		a[i] = (uint32_t) (kk / 1000000000); // compiler warns w/o cast
-		kk -= (uint64_t) 1000000000 * a[i];
-	}
-	// length of quotient
-	for (i = MLENGTH(a) - 1; i > 0; i--)
-		if (a[i])
-			break;
-	MLENGTH(a) = i + 1;
-	return (int) kk; // compiler warns w/o cast
-}
-
-// Symbolic multiplication
 
 void
 multiply(void)
 {
-	check_esc_flag();
-	if (isnum(stack[tos - 2]) && isnum(stack[tos - 1]))
-		multiply_numbers();
-	else {
-		save();
-		yymultiply();
-		restore();
+	multiply_factors(2);
+}
+
+void
+multiply_factors(int n)
+{
+	save();
+	multiply_factors_nib(n);
+	restore();
+}
+
+void
+multiply_factors_nib(int n)
+{
+	int h;
+	if (n < 2)
+		return;
+	h = tos - n;
+	flatten_factors(h);
+	pop_tensor_factor(h);
+	multiply_scalar_factors(h);
+	if (istensor(TFACT)) {
+		push(TFACT);
+		inner();
 	}
 }
 
 void
-yymultiply(void)
+multiply_scalar_factors(int h)
 {
-	int h, i, n;
-	// pop operands
-	p2 = pop();
-	p1 = pop();
-	h = tos;
-	// is either operand zero?
-	if (p1->k != TENSOR && p2->k != TENSOR && (iszero(p1) || iszero(p2))) {
-		push(zero);
+	int n;
+	if (tos - h < 2)
+		return;
+	COEF = one;
+	combine_numerical_factors(h);
+	if (iszero(COEF) || h == tos) {
+		tos = h;
+		push(COEF);
 		return;
 	}
-	// is either operand a sum?
-	if (expanding && isadd(p1)) {
-		p1 = cdr(p1);
-		push(zero);
-		while (iscons(p1)) {
-			push(car(p1));
-			push(p2);
-			multiply();
-			add();
-			p1 = cdr(p1);
-		}
-		return;
+	combine_factors(h);
+	normalize_power_factors(h);
+	combine_numerical_factors(h);
+	reduce_radical_factors(h);
+	if (isdouble(COEF) || !isplusone(COEF))
+		push(COEF);
+	if (expanding)
+		expand_sum_factors(h); // success leaves one expr on stack
+	n = tos - h;
+	switch (n) {
+	case 0:
+		push_integer(1); // all factors canceled
+		break;
+	case 1:
+		break;
+	default:
+		sort_factors(n);
+		list(n);
+		push_symbol(MULTIPLY);
+		swap();
+		cons();
+		break;
 	}
-	if (expanding && isadd(p2)) {
-		p2 = cdr(p2);
-		push(zero);
-		while (iscons(p2)) {
-			push(p1);
-			push(car(p2));
-			multiply();
-			add();
-			p2 = cdr(p2);
-		}
-		return;
-	}
-	// scalar times tensor?
-	if (!istensor(p1) && istensor(p2)) {
-		push(p1);
-		push(p2);
-		scalar_times_tensor();
-		return;
-	}
-	// tensor times scalar?
-	if (istensor(p1) && !istensor(p2)) {
-		push(p1);
-		push(p2);
-		tensor_times_scalar();
-		return;
-	}
-	// adjust operands
-	if (car(p1) == symbol(MULTIPLY))
-		p1 = cdr(p1);
-	else {
-		push(p1);
-		list(1);
-		p1 = pop();
-	}
-	if (car(p2) == symbol(MULTIPLY))
-		p2 = cdr(p2);
-	else {
-		push(p2);
-		list(1);
-		p2 = pop();
-	}
-	// handle numerical coefficients
-	if (isnum(car(p1)) && isnum(car(p2))) {
-		push(car(p1));
-		push(car(p2));
-		multiply_numbers();
-		p1 = cdr(p1);
-		p2 = cdr(p2);
-	} else if (isnum(car(p1))) {
-		push(car(p1));
-		p1 = cdr(p1);
-	} else if (isnum(car(p2))) {
-		push(car(p2));
-		p2 = cdr(p2);
-	} else
-		push(one);
-	parse_p1();
-	parse_p2();
-	while (iscons(p1) && iscons(p2)) {
-		if (caar(p1) == symbol(OPERATOR) && caar(p2) == symbol(OPERATOR)) {
-			push_symbol(OPERATOR);
-			push(cdar(p1));
-			push(cdar(p2));
-			append();
-			cons();
-			p1 = cdr(p1);
-			p2 = cdr(p2);
-			parse_p1();
-			parse_p2();
-			continue;
-		}
-		switch (cmp_expr(p3, p4)) {
-		case -1:
-			push(car(p1));
-			p1 = cdr(p1);
-			parse_p1();
-			break;
-		case 1:
-			push(car(p2));
-			p2 = cdr(p2);
-			parse_p2();
-			break;
-		case 0:
-			combine_factors(h);
-			p1 = cdr(p1);
-			p2 = cdr(p2);
-			parse_p1();
-			parse_p2();
-			break;
-		default:
-			stop("internal error 2");
-			break;
-		}
-	}
-	// push remaining factors, if any
-	while (iscons(p1)) {
-		push(car(p1));
-		p1 = cdr(p1);
-	}
-	while (iscons(p2)) {
-		push(car(p2));
-		p2 = cdr(p2);
-	}
-	// normalize radical factors
-	// example: 2*2(-1/2) -> 2^(1/2)
-	// must be done after merge because merge may produce radical
-	// example: 2^(1/2-a)*2^a -> 2^(1/2)
-	normalize_radical_factors(h);
-	// this hack should not be necessary, unless power returns a multiply
-	//for (i = h; i < tos; i++) {
-	//	if (car(stack[i]) == symbol(MULTIPLY)) {
-	//		multiply_all(tos - h);
-	//		return;
-	//	}
-	//}
-	if (expanding) {
-		for (i = h; i < tos; i++) {
-			if (isadd(stack[i])) {
-				multiply_all(tos - h);
-				return;
+}
+
+void
+flatten_factors(int h)
+{
+	int i, n = tos - h;
+	struct atom **s = stack + h;
+	for (i = 0; i < n; i++) {
+		p1 = s[i];
+		if (car(p1) == symbol(MULTIPLY)) {
+			s[i] = cadr(p1);
+			p1 = cddr(p1);
+			while (iscons(p1)) {
+				push(car(p1));
+				p1 = cdr(p1);
 			}
 		}
 	}
-	// n is the number of result factors on the stack
-	n = tos - h;
-	if (n == 1)
-		return;
-	// discard integer 1
-	if (isrational(stack[h]) && equaln(stack[h], 1)) {
-		if (n == 2) {
-			p7 = pop();
-			pop();
-			push(p7);
-		} else {
-			stack[h] = symbol(MULTIPLY);
-			list(n);
+}
+
+void
+pop_tensor_factor(int h)
+{
+	int i, j, n = tos - h;
+	struct atom **s = stack + h;
+	TFACT = symbol(NIL);
+	for (i = 0; i < n; i++) {
+		p1 = s[i];
+		if (istensor(p1)) {
+			if (istensor(TFACT))
+				stop("tensor * tensor not supported, use dot or outer instead");
+			TFACT = p1;
+			// remove the factor
+			for (j = i + 1; j < n; j++)
+				s[j - 1] = s[j];
+			i--;
+			n--;
+			tos--;
 		}
-		return;
 	}
-	list(n);
-	p7 = pop();
-	push_symbol(MULTIPLY);
-	push(p7);
-	cons();
 }
-
-// Decompose a factor into base and power.
-//
-// input:	car(p1)		factor
-//
-// output:	p3		factor's base
-//
-//		p5		factor's power (possibly 1)
 
 void
-parse_p1(void)
+combine_numerical_factors(int h)
 {
-	p3 = car(p1);
-	p5 = one;
-	if (car(p3) == symbol(POWER)) {
-		p5 = caddr(p3);
-		p3 = cadr(p3);
+	int i, j, n = tos - h;
+	struct atom **s = stack + h;
+	p1 = COEF;
+	for (i = 0; i < n; i++) {
+		p2 = s[i];
+		if (isnum(p2)) {
+			multiply_numbers();
+			p1 = pop();
+			// remove the factor
+			for (j = i + 1; j < n; j++)
+				s[j - 1] = s[j];
+			i--;
+			n--;
+			tos--;
+		}
 	}
+	COEF = p1;
+	if (iszero(COEF))
+		tos = h; // pop all
 }
 
-// Decompose a factor into base and power.
-//
-// input:	car(p2)		factor
-//
-// output:	p4		factor's base
-//
-//		p6		factor's power (possibly 1)
-
-void
-parse_p2(void)
-{
-	p4 = car(p2);
-	p6 = one;
-	if (car(p4) == symbol(POWER)) {
-		p6 = caddr(p4);
-		p4 = cadr(p4);
-	}
-}
+// factors that have the same base are combined by adding exponents
 
 void
 combine_factors(int h)
 {
-	push(p4);
-	push(p5);
-	push(p6);
+	int i, j, n = tos - h;
+	struct atom **s = stack + h;
+	sort_factors_provisional(n);
+	for (i = 0; i < n - 1; i++) {
+		if (combine_adjacent_factors(s + i)) {
+			// remove the factor
+			for (j = i + 2; j < n; j++)
+				s[j - 1] = s[j];
+			i--;
+			n--;
+			tos--;
+		}
+	}
+}
+
+void
+sort_factors_provisional(int n)
+{
+	qsort(stack + tos - n, n, sizeof (struct atom *), sort_factors_provisional_func);
+}
+
+int
+sort_factors_provisional_func(const void *q1, const void *q2)
+{
+	return cmp_factors_provisional(*((struct atom **) q1), *((struct atom **) q2));
+}
+
+int
+cmp_factors_provisional(struct atom *p1, struct atom *p2)
+{
+	if (car(p1) == symbol(POWER))
+		p1 = cadr(p1); // p1 = base
+	if (car(p2) == symbol(POWER))
+		p2 = cadr(p2); // p2 = base
+	return cmp_expr(p1, p2);
+}
+
+int
+combine_adjacent_factors(struct atom **s)
+{
+	p1 = s[0];
+	p2 = s[1];
+	if (car(p1) == symbol(POWER)) {
+		BASE1 = cadr(p1);
+		EXPO1 = caddr(p1);
+	} else {
+		BASE1 = p1;
+		EXPO1 = one;
+	}
+	if (car(p2) == symbol(POWER)) {
+		BASE2 = cadr(p2);
+		EXPO2 = caddr(p2);
+	} else {
+		BASE2 = p2;
+		EXPO2 = one;
+	}
+	if (!equal(BASE1, BASE2))
+		return 0;
+	if (isdouble(BASE2))
+		BASE1 = BASE2; // if mixed rational and double, use double
+	push_symbol(POWER);
+	push(BASE1);
+	push(EXPO1);
+	push(EXPO2);
 	add();
-	power();
-	p7 = pop();
-	if (isnum(p7)) {
-		push(stack[h]);
-		push(p7);
-		multiply_numbers();
-		stack[h] = pop();
-	} else if (car(p7) == symbol(MULTIPLY)) {
-		// power can return number * factor (i.e. -1 * i)
-		if (isnum(cadr(p7)) && cdddr(p7) == symbol(NIL)) {
-			push(stack[h]);
-			push(cadr(p7));
-			multiply_numbers();
-			stack[h] = pop();
-			push(caddr(p7));
-		} else
-			push(p7);
-	} else
-		push(p7);
+	list(3);
+	s[0] = pop();
+	return 1;
+}
+
+void
+factor_factors_maybe(int h)
+{
+	int i, n = tos - h;
+	struct atom **s = stack + h;
+	// is there at least one power with a numerical base?
+	for (i = 0; i < n; i++) {
+		p1 = s[i];
+		if (car(p1) == symbol(POWER) && isnum(cadr(p1)) && !isminusone(cadr(p1)))
+			break;
+	}
+	if (i == n)
+		return; // no
+	// factor factors
+	for (i = 0; i < n; i++) {
+		push(s[i]);
+		factor_factor();
+		s[i] = pop(); // trick: fill hole with one of the factors
+	}
+}
+
+void
+normalize_power_factors(int h)
+{
+	int i, n = tos - h;
+	struct atom **s = stack + h;
+	for (i = 0; i < n; i++) {
+		p1 = s[i];
+		if (car(p1) == symbol(POWER)) {
+			push(cadr(p1));
+			push(caddr(p1));
+			power();
+			p1 = pop();
+			if (car(p1) == symbol(MULTIPLY)) {
+				s[i] = cadr(p1);
+				p1 = cddr(p1);
+				while (iscons(p1)) {
+					push(car(p1));
+					p1 = cdr(p1);
+				}
+			} else
+				s[i] = p1;
+		}
+	}
+}
+
+void
+expand_sum_factors(int h)
+{
+	int i, j, n = tos - h;
+	struct atom **s = stack + h;
+	if (n < 2)
+		return;
+	// search for a sum factor
+	for (i = 0; i < n; i++) {
+		p2 = s[i];
+		if (car(p2) == symbol(ADD))
+			break;
+	}
+	if (i == n)
+		return; // no sum factors
+	// remove the sum factor
+	for (j = i + 1; j < n; j++)
+		s[j - 1] = s[j];
+	n--;
+	tos--;
+	if (n > 1) {
+		sort_factors(n);
+		list(n);
+		push_symbol(MULTIPLY);
+		swap();
+		cons();
+	}
+	p1 = pop(); // p1 is the multiplier
+	p2 = cdr(p2); // p2 is the sum factor
+	while (iscons(p2)) {
+		push(p1);
+		push(car(p2));
+		multiply();
+		p2 = cdr(p2);
+	}
+	add_terms(tos - h);
+}
+
+void
+sort_factors(int n)
+{
+	qsort(stack + tos - n, n, sizeof (struct atom *), sort_factors_func);
+}
+
+int
+sort_factors_func(const void *q1, const void *q2)
+{
+	return cmp_factors(*((struct atom **) q1), *((struct atom **) q2));
+}
+
+int
+cmp_factors(struct atom *p1, struct atom *p2)
+{
+	int a, b, c;
+	struct atom *base1, *base2, *expo1, *expo2;
+	a = order_factor(p1);
+	b = order_factor(p2);
+	if (a < b)
+		return -1;
+	if (a > b)
+		return 1;
+	if (car(p1) == symbol(POWER)) {
+		base1 = cadr(p1);
+		expo1 = caddr(p1);
+	} else {
+		base1 = p1;
+		expo1 = one;
+	}
+	if (car(p2) == symbol(POWER)) {
+		base2 = cadr(p2);
+		expo2 = caddr(p2);
+	} else {
+		base2 = p2;
+		expo2 = one;
+	}
+	c = cmp_expr(base1, base2);
+	if (c == 0)
+		c = cmp_expr(expo2, expo1); // swapped to reverse sort order
+	return c;
+}
+
+//  1	number
+//  2	number to power (root)
+//  3	-1 to power (imaginary)
+//  4	other factor (symbol, power, func, etc)
+//  5	exponential
+//  6	derivative
+
+int
+order_factor(struct atom *p)
+{
+	if (isnum(p))
+		return 1;
+	if (p == symbol(EXP1))
+		return 5;
+	if (car(p) == symbol(DERIVATIVE) || car(p) == symbol(SYMBOL_D))
+		return 6;
+	if (car(p) == symbol(POWER)) {
+		p = cadr(p); // p = base
+		if (equaln(p, -1))
+			return 3;
+		if (isnum(p))
+			return 2;
+		if (p == symbol(EXP1))
+			return 5;
+		if (car(p) == symbol(DERIVATIVE) || car(p) == symbol(SYMBOL_D))
+			return 6;
+	}
+	return 4;
+}
+
+// multiply numbers p1 and p2
+
+void
+multiply_numbers(void)
+{
+	double d1, d2;
+	if (isrational(p1) && isrational(p2)) {
+		multiply_rationals();
+		return;
+	}
+	push(p1);
+	d1 = pop_double();
+	push(p2);
+	d2 = pop_double();
+	push_double(d1 * d2);
+}
+
+void
+multiply_rationals(void)
+{
+	int sign;
+	uint32_t *a, *b, *c;
+	if (iszero(p1) || iszero(p2)) {
+		push_integer(0);
+		return;
+	}
+	if (p1->sign == p2->sign)
+		sign = MPLUS;
+	else
+		sign = MMINUS;
+	if (isinteger(p1) && isinteger(p2)) {
+		push_rational_number(sign, mmul(p1->u.q.a, p2->u.q.a), mint(1));
+		return;
+	}
+	a = mmul(p1->u.q.a, p2->u.q.a);
+	b = mmul(p1->u.q.b, p2->u.q.b);
+	c = mgcd(a, b);
+	push_rational_number(sign, mdiv(a, c), mdiv(b, c));
+	mfree(a);
+	mfree(b);
+	mfree(c);
+}
+
+// for example, 2 / sqrt(2) -> sqrt(2)
+
+void
+reduce_radical_factors(int h)
+{
+	int i, j, k = 0, n = tos - h;
+	double a, b, c;
+	struct atom **s = stack + h;
+	if (iszero(COEF))
+		return;
+	if (isdouble(COEF)) {
+		c = COEF->u.d;
+		for (i = 0; i < n; i++) {
+			p1 = s[i];
+			if (isradical(p1)) {
+				k++;
+				push(cadr(p1)); // base
+				a = pop_double();
+				push(caddr(p1)); // exponent
+				b = pop_double();
+				c = c * pow(a, b); // a > 0 by isradical above
+				// remove the factor
+				for (j = i + 1; j < n; j++)
+					s[j - 1] = s[j];
+				i--;
+				n--;
+				tos--;
+			}
+		}
+		if (k) {
+			push_double(c);
+			COEF = pop();
+		}
+		return;
+	}
+	if (isplusone(COEF) || isminusone(COEF))
+		return; // COEF has no factors, no cancellation is possible
+	for (i = 0; i < n; i++)
+		if (isradical(s[i]))
+			break;
+	if (i == n)
+		return; // no radicals
+	push(COEF);
+	absval();
+	p1 = pop();
+	push(p1);
+	numerator();
+	NUMER = pop();
+	push(p1);
+	denominator();
+	DENOM = pop();
+	for (; i < n; i++) {
+		p1 = s[i];
+		if (!isradical(p1))
+			continue;
+		BASE1 = cadr(p1);
+		EXPO1 = caddr(p1);
+		if (EXPO1->sign == MMINUS) {
+			push(NUMER);
+			push(BASE1);
+			smod();
+			p2 = pop();
+			if (iszero(p2)) {
+				push(NUMER);
+				push(BASE1);
+				divide();
+				NUMER = pop();
+				push_symbol(POWER);
+				push(BASE1);
+				push_integer(1);
+				push(EXPO1);
+				add();
+				list(3);
+				s[i] = pop();
+				k++;
+			}
+		} else {
+			push(DENOM);
+			push(BASE1);
+			smod();
+			p2 = pop();
+			if (iszero(p2)) {
+				push(DENOM);
+				push(BASE1);
+				divide();
+				DENOM = pop();
+				push_symbol(POWER);
+				push(BASE1);
+				push_integer(-1);
+				push(EXPO1);
+				add();
+				list(3);
+				s[i] = pop();
+				k++;
+			}
+		}
+	}
+	if (k) {
+		push(NUMER);
+		push(DENOM);
+		divide();
+		if (COEF->sign == MMINUS)
+			negate();
+		COEF = pop();
+	}
 }
 
 void
 multiply_noexpand(void)
 {
-	int x;
-	x = expanding;
+	int t = expanding;
 	expanding = 0;
 	multiply();
-	expanding = x;
-}
-
-// multiply n factors on stack
-
-void
-multiply_all(int n)
-{
-	int h, i;
-	if (n == 1)
-		return;
-	if (n == 0) {
-		push(one);
-		return;
-	}
-	h = tos - n;
-	push(stack[h]);
-	for (i = 1; i < n; i++) {
-		push(stack[h + i]);
-		multiply();
-	}
-	stack[h] = pop();
-	tos = h + 1;
+	expanding = t;
 }
 
 void
-multiply_all_noexpand(int n)
+multiply_factors_noexpand(int n)
 {
-	int x;
-	x = expanding;
+	int t = expanding;
 	expanding = 0;
-	multiply_all(n);
-	expanding = x;
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Symbolic division
-//
-//	Input:		Dividend and divisor on stack
-//
-//	Output:		Quotient on stack
-//
-//-----------------------------------------------------------------------------
-
-void
-divide(void)
-{
-	if (isnum(stack[tos - 2]) && isnum(stack[tos - 1]))
-		divide_numbers();
-	else {
-		inverse();
-		multiply();
-	}
-}
-
-void
-inverse(void)
-{
-	if (isnum(stack[tos - 1]))
-		invert_number();
-	else {
-		push_integer(-1);
-		power();
-	}
-}
-
-void
-reciprocate(void)
-{
-	if (isnum(stack[tos - 1]))
-		invert_number();
-	else {
-		push_integer(-1);
-		power();
-	}
+	multiply_factors(n);
+	expanding = t;
 }
 
 void
 negate(void)
 {
-	if (isnum(stack[tos - 1]))
-		negate_number();
-	else {
-		push_integer(-1);
-		multiply();
-	}
-}
-
-void
-negate_expand(void)
-{
-	int x;
-	x = expanding;
-	expanding = 1;
-	negate();
-	expanding = x;
+	push_integer(-1);
+	multiply();
 }
 
 void
 negate_noexpand(void)
 {
-	int x;
-	x = expanding;
+	int t = expanding;
 	expanding = 0;
 	negate();
-	expanding = x;
+	expanding = t;
 }
-
-//-----------------------------------------------------------------------------
-//
-//	Normalize radical factors
-//
-//	Input:		stack[h]	Coefficient factor, possibly 1
-//
-//			stack[h + 1]	Second factor
-//
-//			stack[tos - 1]	Last factor
-//
-//	Output:		Reduced coefficent and normalized radicals (maybe)
-//
-//	Example:	2*2^(-1/2) -> 2^(1/2)
-//
-//	(power number number) is guaranteed to have the following properties:
-//
-//	1. Base is an integer
-//
-//	2. Absolute value of exponent < 1
-//
-//	These properties are assured by the power function.
-//
-//-----------------------------------------------------------------------------
-
-#undef A
-#undef B
-#undef BASE
-#undef EXPO
-#undef TMP
-
-#define A p1
-#define B p2
-#define BASE p3
-#define EXPO p4
-#define TMP p5
 
 void
-normalize_radical_factors(int h)
+reciprocate(void)
 {
-	int i;
-	// if coeff is 1 or floating then don't bother
-	if (isplusone(stack[h]) || isminusone(stack[h]) || isdouble(stack[h]))
-		return;
-	// if no radicals then don't bother
-	for (i = h + 1; i < tos; i++)
-		if (is_radical_number(stack[i]))
-			break;
-	if (i == tos)
-		return;
-	// ok, try to simplify
-	save();
-	// numerator
-	push(stack[h]);
-	mp_numerator();
-	A = pop();
-	for (i = h + 1; i < tos; i++) {
-		if (isplusone(A) || isminusone(A))
-			break;
-		if (!is_radical_number(stack[i]))
-			continue;
-		BASE = cadr(stack[i]);
-		EXPO = caddr(stack[i]);
-		// exponent must be negative
-		if (!isnegativenumber(EXPO))
-			continue;
-		// numerator divisible by BASE?
-		push(A);
-		push(BASE);
-		divide();
-		TMP = pop();
-		if (!isinteger(TMP))
-			continue;
-		// reduce numerator
-		A = TMP;
-		// invert radical
-		push_symbol(POWER);
-		push(BASE);
-		push(one);
-		push(EXPO);
-		add();
-		list(3);
-		stack[i] = pop();
-	}
-	// denominator
-	push(stack[h]);
-	mp_denominator();
-	B = pop();
-	for (i = h + 1; i < tos; i++) {
-		if (isplusone(B))
-			break;
-		if (!is_radical_number(stack[i]))
-			continue;
-		BASE = cadr(stack[i]);
-		EXPO = caddr(stack[i]);
-		// exponent must be positive
-		if (isnegativenumber(EXPO))
-			continue;
-		// denominator divisible by BASE?
-		push(B);
-		push(BASE);
-		divide();
-		TMP = pop();
-		if (!isinteger(TMP))
-			continue;
-		// reduce denominator
-		B = TMP;
-		// invert radical
-		push_symbol(POWER);
-		push(BASE);
-		push(EXPO);
-		push(one);
-		subtract();
-		list(3);
-		stack[i] = pop();
-	}
-	// reconstitute the coefficient
-	push(A);
-	push(B);
-	divide();
-	stack[h] = pop();
-	restore();
+	push_integer(-1);
+	power();
 }
 
-// don't include i
-
-int
-is_radical_number(U *p)
+void
+divide(void)
 {
-	// don't use i
-	if (car(p) == symbol(POWER) && isnum(cadr(p)) && isnum(caddr(p)) && !isminusone(cadr(p)))
-		return 1;
-	else
-		return 0;
+	reciprocate();
+	multiply();
 }
-
-//-----------------------------------------------------------------------------
-//
-//	> a*hilbert(2)
-//	((a,1/2*a),(1/2*a,1/3*a))
-//
-//	Note that "a" is presumed to be a scalar. Is this correct?
-//
-//	Yes, because "*" has no meaning if "a" is a tensor.
-//	To multiply tensors, "dot" or "outer" should be used.
-//
-//	> dot(a,hilbert(2))
-//	dot(a,((1,1/2),(1/2,1/3)))
-//
-//	In this case "a" could be a scalar or tensor so the result is not
-//	expanded.
-//
-//-----------------------------------------------------------------------------
 
 // find the roots of a polynomial numerically
 
@@ -13767,13 +13905,11 @@ eval_nroots(void)
 	for (i = 0; i < n; i++) {
 		push(stack[h + i]);
 		real();
-		yyfloat();
-		eval();
+		sfloat();
 		p1 = pop();
 		push(stack[h + i]);
 		imag();
-		yyfloat();
-		eval();
+		sfloat();
 		p2 = pop();
 		if (!isdouble(p1) || !isdouble(p2))
 			stop("nroots: coefficients?");
@@ -13795,12 +13931,12 @@ eval_nroots(void)
 		push(imaginaryunit);
 		multiply();
 		add();
-		divpoly_FIXME(k);
+		nroots_divpoly(k);
 	}
 	// now make n equal to the number of roots
 	n = tos - h;
 	if (n > 1) {
-		sort_stack(n);
+		sort(n);
 		p1 = alloc_tensor(n);
 		p1->u.tensor->ndim = 1;
 		p1->u.tensor->dim[0] = n;
@@ -13905,7 +14041,7 @@ compute_fa(int n)
 // divide the polynomial by x - a
 
 void
-divpoly_FIXME(int n)
+nroots_divpoly(int n)
 {
 	int k;
 	for (k = n - 1; k > 0; k--) {
@@ -13931,42 +14067,33 @@ eval_numerator(void)
 void
 numerator(void)
 {
-	int h;
 	save();
-	p1 = pop();
-	if (car(p1) == symbol(ADD)) {
-		push(p1);
-		rationalize();
-		p1 = pop();
-	}
-	if (car(p1) == symbol(MULTIPLY)) {
-		h = tos;
-		p1 = cdr(p1);
-		while (iscons(p1)) {
-			push(car(p1));
-			numerator();
-			p1 = cdr(p1);
-		}
-		multiply_all(tos - h);
-	} else if (isrational(p1)) {
-		push(p1);
-		mp_numerator();
-	} else if (car(p1) == symbol(POWER) && isnegativeterm(caddr(p1)))
-		push(one);
-	else
-		push(p1);
+	numerator_nib();
 	restore();
 }
 
-// Outer product of tensors
+void
+numerator_nib(void)
+{
+	p1 = pop();
+	if (isrational(p1)) {
+		push_rational_number(p1->sign, mcopy(p1->u.q.a), mint(1));
+		return;
+	}
+	while (cross_expr(p1)) {
+		push(p1);
+		cancel_factor();
+		p1 = pop();
+	}
+	push(p1);
+}
 
 void
 eval_outer(void)
 {
-	p1 = cdr(p1);
-	push(car(p1));
+	push(cadr(p1));
 	eval();
-	p1 = cdr(p1);
+	p1 = cddr(p1);
 	while (iscons(p1)) {
 		push(car(p1));
 		eval();
@@ -13979,101 +14106,67 @@ void
 outer(void)
 {
 	save();
+	outer_nib();
+	restore();
+}
+
+void
+outer_nib(void)
+{
+	int i, j, k, n, ncol, ndim, nrow;
+	struct atom **a, **b, **c;
 	p2 = pop();
 	p1 = pop();
-	if (istensor(p1) && istensor(p2))
-		yyouter();
-	else {
+	if (!istensor(p1) && !istensor(p2)) {
 		push(p1);
 		push(p2);
-		if (istensor(p1))
-			tensor_times_scalar();
-		else if (istensor(p2))
-			scalar_times_tensor();
-		else
-			multiply();
+		multiply();
+		return;
 	}
-	restore();
-}
-
-void
-yyouter(void)
-{
-	int i, j, k, ndim, nelem;
+	if (istensor(p1) && !istensor(p2)) {
+		p3 = p1;
+		p1 = p2;
+		p2 = p3;
+	}
+	if (!istensor(p1) && istensor(p2)) {
+		push(p2);
+		copy_tensor();
+		p2 = pop();
+		n = p2->u.tensor->nelem;
+		for (i = 0; i < n; i++) {
+			push(p1);
+			push(p2->u.tensor->elem[i]);
+			multiply();
+			p2->u.tensor->elem[i] = pop();
+		}
+		push(p2);
+		return;
+	}
 	ndim = p1->u.tensor->ndim + p2->u.tensor->ndim;
 	if (ndim > MAXDIM)
-		stop("outer: rank of result exceeds maximum");
-	nelem = p1->u.tensor->nelem * p2->u.tensor->nelem;
-	p3 = alloc_tensor(nelem);
+		stop("rank exceeds max");
+	nrow = p1->u.tensor->nelem;
+	ncol = p2->u.tensor->nelem;
+	p3 = alloc_tensor(nrow * ncol);
+	a = p1->u.tensor->elem;
+	b = p2->u.tensor->elem;
+	c = p3->u.tensor->elem;
+	for (i = 0; i < nrow; i++)
+		for (j = 0; j < ncol; j++) {
+			push(a[i]);
+			push(b[j]);
+			multiply();
+			c[i * ncol + j] = pop();
+		}
+	// add dim info
 	p3->u.tensor->ndim = ndim;
-	for (i = 0; i < p1->u.tensor->ndim; i++)
-		p3->u.tensor->dim[i] = p1->u.tensor->dim[i];
-	j = i;
-	for (i = 0; i < p2->u.tensor->ndim; i++)
-		p3->u.tensor->dim[j + i] = p2->u.tensor->dim[i];
 	k = 0;
-	for (i = 0; i < p1->u.tensor->nelem; i++)
-		for (j = 0; j < p2->u.tensor->nelem; j++) {
-			push(p1->u.tensor->elem[i]);
-			push(p2->u.tensor->elem[j]);
-			multiply();
-			p3->u.tensor->elem[k++] = pop();
-		}
+	for (i = 0; i < p1->u.tensor->ndim; i++)
+		p3->u.tensor->dim[k++] = p1->u.tensor->dim[i];
+	for (i = 0; i < p2->u.tensor->ndim; i++)
+		p3->u.tensor->dim[k++] = p2->u.tensor->dim[i];
 	push(p3);
 }
-
-/* Partition a term
-
-	Input stack:
-
-		term (factor or product of factors)
-
-		free variable
-
-	Output stack:
-
-		constant expression
-
-		variable expression
-*/
-
-void
-partition(void)
-{
-	save();
-	p2 = pop();
-	p1 = pop();
-	push_integer(1);
-	p3 = pop();
-	p4 = p3;
-	p1 = cdr(p1);
-	while (iscons(p1)) {
-		if (find(car(p1), p2)) {
-			push(p4);
-			push(car(p1));
-			multiply();
-			p4 = pop();
-		} else {
-			push(p3);
-			push(car(p1));
-			multiply();
-			p3 = pop();
-		}
-		p1 = cdr(p1);
-	}
-	push(p3);
-	push(p4);
-	restore();
-}
-
-/* Convert complex z to polar form
-
-	Input:		push	z
-
-	Output:		Result on stack
-
-	polar(z) = mag(z) * exp(i * arg(z))
-*/
 
 void
 eval_polar(void)
@@ -14101,7 +14194,7 @@ polar(void)
 
 // Factor using the Pollard rho method
 
-unsigned int *global_n;
+uint32_t *global_n;
 
 void
 factor_number(void)
@@ -14117,13 +14210,9 @@ factor_number(void)
 	}
 	global_n = mcopy(p1->u.q.a);
 	h = tos;
+	if (p1->sign == MMINUS)
+		push_integer(-1);
 	factor_a();
-	if (tos - h > 1) {
-		list(tos - h);
-		push_symbol(MULTIPLY);
-		swap();
-		cons();
-	}
 	restore();
 }
 
@@ -14135,14 +14224,10 @@ void
 factor_a(void)
 {
 	int k;
-	if (MSIGN(global_n) == -1) {
-		MSIGN(global_n) = 1;
-		push_integer(-1);
-	}
 	for (k = 0; k < 10000; k++) {
 		try_kth_prime(k);
 		// if n is 1 then we're done
-		if (MLENGTH(global_n) == 1 && global_n[0] == 1) {
+		if (MEQUAL(global_n, 1)) {
 			mfree(global_n);
 			return;
 		}
@@ -14154,21 +14239,22 @@ void
 try_kth_prime(int k)
 {
 	int count;
-	unsigned int *d, *q, *r;
+	uint32_t *d, *q, *r;
 	d = mint(primetab[k]);
 	count = 0;
 	while (1) {
 		// if n is 1 then we're done
-		if (MLENGTH(global_n) == 1 && global_n[0] == 1) {
+		if (MEQUAL(global_n, 1)) {
 			if (count)
 				push_factor(d, count);
 			else
 				mfree(d);
 			return;
 		}
-		mdivrem(&q, &r, global_n, d);
+		q = mdiv(global_n, d);
+		r = mmod(global_n, d);
 		// continue looping while remainder is zero
-		if (MLENGTH(r) == 1 && r[0] == 0) {
+		if (MZERO(r)) {
 			count++;
 			mfree(r);
 			mfree(global_n);
@@ -14196,7 +14282,7 @@ int
 factor_b(void)
 {
 	int k, l;
-	unsigned int *g, *k1, *t, *x, *xprime;
+	uint32_t *g, *k1, *t, *x, *xprime;
 	k1 = mint(1);
 	x = mint(5);
 	xprime = mint(2);
@@ -14211,16 +14297,18 @@ factor_b(void)
 			return 0;
 		}
 		while (1) {
-			if (esc_flag) {
+			if (interrupt) {
 				mfree(k1);
 				mfree(global_n);
 				mfree(x);
 				mfree(xprime);
-				stop(NULL);
+				stop("Interrupt");
 			}
 			// g = gcd(x' - x, n)
-			t = msub(xprime, x);
-			MSIGN(t) = 1;
+			if (mcmp(xprime, x) < 0)
+				t = msub(x, xprime);
+			else
+				t = msub(xprime, x);
 			g = mgcd(t, global_n);
 			mfree(t);
 			if (MEQUAL(g, 1)) {
@@ -14267,298 +14355,889 @@ factor_b(void)
 }
 
 void
-push_factor(unsigned int *d, int count)
+push_factor(uint32_t *d, int count)
 {
-	p1 = alloc();
-	p1->k = NUM;
-	p1->u.q.a = d;
-	p1->u.q.b = mint(1);
-	push(p1);
-	if (count > 1) {
+	if (count < 2)
+		push_rational_number(MPLUS, d, mint(1));
+	else {
 		push_symbol(POWER);
-		swap();
-		p1 = alloc();
-		p1->k = NUM;
-		p1->u.q.a = mint(count);
-		p1->u.q.b = mint(1);
-		push(p1);
+		push_rational_number(MPLUS, d, mint(1));
+		push_rational_number(MPLUS, mint(count), mint(1));
 		list(3);
 	}
 }
 
-/* Power function
-
-	Input:		push	Base
-
-			push	Exponent
-
-	Output:		Result on stack
-*/
-
 void
 eval_power(void)
 {
-	push(cadr(p1));
+	int t;
+	push(caddr(p1)); // exponent
 	eval();
-	push(caddr(p1));
-	eval();
-	power();
+	p2 = pop();
+	if (isnegativenumber(p2)) {
+		// don't expand in denominators
+		t = expanding;
+		expanding = 0;
+		push(cadr(p1)); // base
+		eval();
+		push(p2);
+		power();
+		expanding = t;
+	} else {
+		push(cadr(p1)); // base
+		eval();
+		push(p2);
+		power();
+	}
 }
+
+#undef BASE
+#undef EXPO
+
+#define BASE p1
+#define EXPO p2
 
 void
 power(void)
 {
 	save();
-	yypower();
+	power_nib();
 	restore();
 }
 
 void
-yypower(void)
+power_nib(void)
 {
-	int i, n;
-	p2 = pop();
-	p1 = pop();
-	// both base and exponent are rational numbers?
-	if (isrational(p1) && isrational(p2)) {
-		push(p1);
-		push(p2);
-		qpow();
-		return;
-	}
-	// both base and exponent are either rational or double?
-	if (isnum(p1) && isnum(p2)) {
-		push(p1);
-		push(p2);
-		dpow();
-		return;
-	}
-	if (istensor(p1)) {
+	int h;
+	EXPO = pop();
+	BASE = pop();
+	if (istensor(BASE)) {
 		power_tensor();
 		return;
 	}
-	if (p1 == symbol(EXP1) && car(p2) == symbol(LOG)) {
-		push(cadr(p2));
+	if (iszero(BASE) && isnegativenumber(EXPO))
+		stop("divide by zero");
+	if (BASE == symbol(EXP1) && isdouble(EXPO)) {
+		push_double(M_E);
+		BASE = pop();
+	}
+	if (BASE == symbol(PI) && isdouble(EXPO)) {
+		push_double(M_PI);
+		BASE = pop();
+	}
+	if (power_precheck())
+		return;
+	// BASE and EXPO numerical?
+	if (isnum(BASE) && isnum(EXPO)) {
+		power_numbers();
 		return;
 	}
-	if (p1 == symbol(EXP1) && isdouble(p2)) {
-		push_double(exp(p2->u.d));
+	// BASE = e ?
+	if (BASE == symbol(EXP1)) {
+		power_natural_number();
 		return;
 	}
-	//	1 ^ a		->	1
-	//	a ^ 0		->	1
-	if (equal(p1, one) || iszero(p2)) {
-		push(one);
+	// do this before checking for (a + b)^n
+	if (iscomplexnumber(BASE)) {
+		power_complex_number();
 		return;
 	}
-	//	a ^ 1		->	a
-	if (equal(p2, one)) {
-		push(p1);
+	// (a + b)^n -> (a + b) * (a + b) ...
+	if (car(BASE) == symbol(ADD)) {
+		power_sum();
 		return;
 	}
-	//	(a * b) ^ c	->	(a ^ c) * (b ^ c)
-	if (car(p1) == symbol(MULTIPLY)) {
-		p1 = cdr(p1);
-		push(car(p1));
-		push(p2);
-		power();
-		p1 = cdr(p1);
-		while (iscons(p1)) {
-			push(car(p1));
-			push(p2);
+	// (a * b) ^ c -> (a ^ c) * (b ^ c)
+	if (car(BASE) == symbol(MULTIPLY)) {
+		h = tos;
+		p3 = cdr(BASE);
+		while (iscons(p3)) {
+			push(car(p3));
+			push(EXPO);
 			power();
-			multiply();
-			p1 = cdr(p1);
+			p3 = cdr(p3);
 		}
+		multiply_factors(tos - h);
 		return;
 	}
-	//	(a ^ b) ^ c	->	a ^ (b * c)
-	if (car(p1) == symbol(POWER)) {
-		push(cadr(p1));
-		push(caddr(p1));
-		push(p2);
+	// (a^b)^c -> a^(b * c)
+	if (car(BASE) == symbol(POWER)) {
+		push(cadr(BASE));
+		push(caddr(BASE));
+		push(EXPO);
+		expanding++; // expand products of exponents
 		multiply();
+		expanding--;
 		power();
 		return;
 	}
-	//	(a + b) ^ n	->	(a + b) * (a + b) ...
-	if (expanding && isadd(p1) && isnum(p2)) {
-		push(p2);
-		n = pop_integer();
-		if (n > 0) {
-			push(p1);
-			for (i = 1; i < n; i++) {
-				push(p1);
-				multiply();
-			}
-			return;
-		}
-	}
-	//	sin(x) ^ 2n -> (1 - cos(x) ^ 2) ^ n
-	if (trigmode == 1 && car(p1) == symbol(SIN) && iseveninteger(p2)) {
-		push_integer(1);
-		push(cadr(p1));
-		cosine();
-		push_integer(2);
-		power();
-		subtract();
-		push(p2);
-		push_rational(1, 2);
-		multiply();
-		power();
-		return;
-	}
-	//	cos(x) ^ 2n -> (1 - sin(x) ^ 2) ^ n
-	if (trigmode == 2 && car(p1) == symbol(COS) && iseveninteger(p2)) {
-		push_integer(1);
-		push(cadr(p1));
-		sine();
-		push_integer(2);
-		power();
-		subtract();
-		push(p2);
-		push_rational(1, 2);
-		multiply();
-		power();
-		return;
-	}
-	// complex number? (just number, not expression)
-	if (iscomplexnumber(p1)) {
-		// integer power?
-		// n will be negative here, positive n already handled
-		if (isinteger(p2)) {
-			//               /        \  n
-			//         -n   |  a - ib  |
-			// (a + ib)   = | -------- |
-			//              |   2   2  |
-			//               \ a + b  /
-			push(p1);
-			conjugate();
-			p3 = pop();
-			push(p3);
-			push(p3);
-			push(p1);
-			multiply();
-			divide();
-			push(p2);
-			negate();
-			power();
-			return;
-		}
-		// noninteger or floating power?
-		if (isnum(p2)) {
-#if 1			// use polar form
-			push(p1);
-			mag();
-			push(p2);
-			power();
-			push_integer(-1);
-			push(p1);
-			arg();
-			push(p2);
-			multiply();
-			push_symbol(PI);
-			divide();
-			power();
-			multiply();
-#else			// use exponential form
-			push(p1);
-			mag();
-			push(p2);
-			power();
-			push_symbol(E);
-			push(p1);
-			arg();
-			push(p2);
-			multiply();
-			push(imaginaryunit);
-			multiply();
-			power();
-			multiply();
-#endif
-			return;
-		}
-	}
-	if (simplify_polar())
-		return;
+	// none of the above
 	push_symbol(POWER);
-	push(p1);
-	push(p2);
+	push(BASE);
+	push(EXPO);
 	list(3);
 }
 
-// exp(n/2 i pi) ?
-
-// p2 is the exponent expression
-
-// clobbers p3
-
 int
-simplify_polar(void)
+power_precheck(void)
 {
-	int n;
-	n = isquarterturn(p2);
-	switch(n) {
-	case 0:
-		break;
-	case 1:
-		push_integer(1);
-		return 1;
-	case 2:
-		push_integer(-1);
-		return 1;
-	case 3:
-		push(imaginaryunit);
-		return 1;
-	case 4:
-		push(imaginaryunit);
-		negate();
+	// 1^expr = expr^0 = 1
+	if (equaln(BASE, 1) || equaln(EXPO, 0)) {
+		if (isdouble(BASE) || isdouble(EXPO))
+			push_double(1.0);
+		else
+			push_integer(1);
 		return 1;
 	}
-	if (car(p2) == symbol(ADD)) {
-		p3 = cdr(p2);
-		while (iscons(p3)) {
-			n = isquarterturn(car(p3));
-			if (n)
-				break;
-			p3 = cdr(p3);
+	// expr^1 = expr
+	if (equaln(EXPO, 1)) {
+		push(BASE);
+		return 1;
+	}
+	// 0^expr
+	if (equaln(BASE, 0)) {
+		if (isnum(EXPO)) {
+			if (isdouble(BASE) || isdouble(EXPO))
+				push_double(0.0);
+			else
+				push_integer(0);
+		} else {
+			push_symbol(POWER);
+			push(BASE);
+			push(EXPO);
+			list(3);
 		}
-		switch (n) {
-		case 0:
-			return 0;
-		case 1:
-			push_integer(1);
-			break;
-		case 2:
-			push_integer(-1);
-			break;
-		case 3:
-			push(imaginaryunit);
-			break;
-		case 4:
-			push(imaginaryunit);
-			negate();
-			break;
-		}
-		push(p2);
-		push(car(p3));
-		subtract();
-		exponential();
-		multiply();
 		return 1;
 	}
 	return 0;
 }
 
-//-----------------------------------------------------------------------------
+// BASE = e
+
+void
+power_natural_number(void)
+{
+	double x, y;
+	// exp(x + i y) = exp(x) (cos(y) + i sin(y))
+	if (isdoublez(EXPO)) {
+		if (car(EXPO) == symbol(ADD)) {
+			x = cadr(EXPO)->u.d;
+			y = cadaddr(EXPO)->u.d;
+		} else {
+			x = 0.0;
+			y = cadr(EXPO)->u.d;
+		}
+		push_double(exp(x));
+		push_double(y);
+		scos();
+		push(imaginaryunit);
+		push_double(y);
+		ssin();
+		multiply();
+		add();
+		multiply();
+		return;
+	}
+	// e^log(expr) -> expr
+	if (car(EXPO) == symbol(LOG)) {
+		push(cadr(EXPO));
+		return;
+	}
+	if (simplify_polar_expr())
+		return;
+	// none of the above
+	push_symbol(POWER);
+	push(BASE);
+	push(EXPO);
+	list(3);
+}
+
+int
+simplify_polar_expr(void)
+{
+	if (car(EXPO) == symbol(ADD)) {
+		p3 = cdr(EXPO);
+		while (iscons(p3)) {
+			if (simplify_polar_term(car(p3))) {
+				push(EXPO);
+				push(car(p3));
+				subtract();
+				exponential();
+				multiply();
+				return 1;
+			}
+			p3 = cdr(p3);
+		}
+		return 0;
+	}
+	return simplify_polar_term(EXPO);
+}
+
+int
+simplify_polar_term(struct atom *p)
+{
+	int n;
+	double d;
+	if (car(p) != symbol(MULTIPLY))
+		return 0;
+	// exp(i pi) -> -1
+	if (length(p) == 3 && isimaginaryunit(cadr(p)) && caddr(p) == symbol(PI)) {
+		push_integer(-1);
+		return 1;
+	}
+	if (length(p) != 4 || !isnum(cadr(p)) || !isimaginaryunit(caddr(p)) || cadddr(p) != symbol(PI))
+		return 0;
+	p = cadr(p); // coeff
+	if (isdouble(p)) {
+		d = p->u.d;
+		if (floor(d) == d) {
+			if (fmod(d, 2.0) == 0.0)
+				push_double(1.0);
+			else
+				push_double(-1.0);
+			return 1;
+		}
+		if (floor(d) + 0.5 == d) {
+			n = (int) (d / 0.5) % 4;
+			if (n == 1 || n == -3) {
+				push_symbol(MULTIPLY);
+				push_double(1.0);
+				push(imaginaryunit);
+				list(3);
+			} else {
+				push_symbol(MULTIPLY);
+				push_double(-1.0);
+				push(imaginaryunit);
+				list(3);
+			}
+			return 1;
+		}
+		return 0;
+	}
+	if (MEQUAL(p->u.q.b, 1)) {
+		if (p->u.q.a[0] % 2 == 0)
+			push_integer(1);
+		else
+			push_integer(-1);
+		return 1;
+	}
+	if (MEQUAL(p->u.q.b, 2)) {
+		n = p->u.q.a[0] % 4;
+		if ((n == 1 && p->sign == MPLUS) || (n == 3 && p->sign == MMINUS))
+			push(imaginaryunit);
+		else {
+			push_symbol(MULTIPLY);
+			push_integer(-1);
+			push(imaginaryunit);
+			list(3);
+		}
+		return 1;
+	}
+	return 0;
+}
+
+// (a + b)^n -> (a + b) * (a + b) ...
+
+void
+power_sum(void)
+{
+	int h, i, m, n;
+	if (expanding == 0 || !isnum(EXPO) || isnegativenumber(EXPO)) {
+		push_symbol(POWER);
+		push(BASE);
+		push(EXPO);
+		list(3);
+		return;
+	}
+	push(EXPO);
+	n = pop_integer();
+	if (n == ERR) {
+		// expo exceeds int max
+		push_symbol(POWER);
+		push(BASE);
+		push(EXPO);
+		list(3);
+		return;
+	}
+	// square the sum first (prevents infinite loop through multiply)
+	h = tos;
+	p3 = cdr(BASE);
+	while (iscons(p3)) {
+		p4 = cdr(BASE);
+		while (iscons(p4)) {
+			push(car(p3));
+			push(car(p4));
+			multiply();
+			p4 = cdr(p4);
+		}
+		p3 = cdr(p3);
+	}
+	add_terms(tos - h);
+	// continue up to power m
+	m = abs(n);
+	for (i = 2; i < m; i++) {
+		push(BASE);
+		multiply();
+	}
+	if (n < 0) {
+		push_symbol(POWER);
+		swap();
+		push_integer(-1);
+		list(3);
+	}
+}
+
+// convert (-1)^(a/b) to c*(-1)^(x) where c=1 or c=-1 and -1/2 < (x) <= 1/2
 //
+// r = a mod b (remainder of a/b)
+//
+// q = (a/b - r) mod 2
+//
+// s = sign of a/b
+//
+// case			c	x
+//
+// s=1 q=0 r/b <= 1/2	1	r/b
+// s=1 q=0 r/b > 1/2	-1	-(b - r)/b
+//
+// s=1 q=1 r/b <= 1/2	-1	r/b
+// s=1 q=1 r/b > 1/2	1	-(b - r)/b
+//
+// s=-1 q=0 r/b < 1/2	1	-r/b
+// s=-1 q=0 r/b >= 1/2	-1	(b - r)/b
+//
+// s=-1 q=1 r/b < 1/2	-1	-r/b
+// s=-1 q=1 r/b >= 1/2	1	(b - r)/b
+//
+// q=1 flips sign of c
+//
+// s=-1 flips sign of x
+
+void
+power_imaginary_unit(void)
+{
+	int c, s;
+	uint32_t *a, *b, *q, *r, *t;
+	double theta, x, y;
+	if (!isnum(EXPO)) {
+		push_symbol(POWER);
+		push_integer(-1);
+		push(EXPO);
+		list(3);
+		if (isdouble(BASE)) {
+			// BASE = -1.0, keep double
+			push_symbol(MULTIPLY);
+			swap();
+			push_double(1.0);
+			swap();
+			list(3);
+		}
+		return;
+	}
+	if (equalq(EXPO, 1, 2)) {
+		push(imaginaryunit);
+		if (isdouble(BASE)) {
+			// BASE = -1.0, keep double
+			push_symbol(MULTIPLY);
+			swap();
+			push_double(1.0);
+			swap();
+			list(3);
+		}
+		return;
+	}
+	if (isdouble(EXPO)) {
+		theta = EXPO->u.d * M_PI; // pi is the polar angle for -1
+		x = cos(theta);
+		y = sin(theta);
+		if (fabs(x) < 1e-12)
+			x = 0.0;
+		if (fabs(y) < 1e-12)
+			y = 0.0;
+		push_double(x);
+		push_double(y);
+		push(imaginaryunit);
+		multiply();
+		add();
+		return;
+	}
+	// integer exponent?
+	if (isinteger(EXPO)) {
+		if (EXPO->u.q.a[0] % 2 == 1) {
+			// odd exponent
+			if (isdouble(BASE))
+				push_double(-1.0); // BASE = -1.0, keep double
+			else
+				push_integer(-1);
+		} else {
+			// even exponent
+			if (isdouble(BASE))
+				push_double(1.0); // BASE = -1.0, keep double
+			else
+				push_integer(1);
+		}
+		return;
+	}
+	a = EXPO->u.q.a;
+	b = EXPO->u.q.b;
+	q = mdiv(a, b);
+	r = mmod(a, b);
+	t = madd(r, r);
+	switch (mcmp(t, b)) {
+	case -1:
+		a = mcopy(r);
+		c = 1;
+		s = 1;
+		break;
+	case 0:
+		if (EXPO->sign == MPLUS) {
+			a = mcopy(r);
+			c = 1;
+			s = 1;
+		} else {
+			a = msub(b, r);
+			c = -1;
+			s = -1;
+		}
+		break;
+	case 1:
+		a = msub(b, r);
+		c = -1;
+		s = -1;
+		break;
+	}
+	if (q[0] % 2 == 1)
+		c *= -1;
+	if (EXPO->sign == MMINUS)
+		s *= -1;
+	b = mcopy(b);
+	push_symbol(POWER);
+	push_integer(-1);
+	if (s == 1)
+		push_rational_number(MPLUS, a, b);
+	else
+		push_rational_number(MMINUS, a, b);
+	list(3);
+	if (c == -1) {
+		push_symbol(MULTIPLY);
+		swap();
+		if (isdouble(BASE))
+			push_double(-1.0); // BASE = -1.0, keep double
+		else
+			push_integer(-1);
+		swap();
+		list(3);
+	} else if (isdouble(BASE)) {
+		// BASE = -1.0, keep double
+		push_symbol(MULTIPLY);
+		swap();
+		push_double(1.0);
+		swap();
+		list(3);
+	}
+	mfree(q);
+	mfree(r);
+	mfree(t);
+}
+
+#undef R
+#undef X
+#undef Y
+#undef PX
+#undef PY
+
+#define R p3
+#define X p4
+#define Y p5
+#define PX p6
+#define PY p7
+
+// BASE is rectangular complex numerical
+
+void
+power_complex_number(void)
+{
+	int n;
+	if (!isnum(EXPO)) {
+		push_symbol(POWER);
+		push(BASE);
+		push(EXPO);
+		list(3);
+		return;
+	}
+	// lisp(2+3*i) = (add 2 (multiply 3 (power -1 1/2)))
+	// lisp(1+i) = (add 1 (power -1 1/2))
+	// lisp(3*i) = (multiply 3 (power -1 1/2))
+	// lisp(i) = (power -1 1/2)
+	if (car(BASE) == symbol(ADD)) {
+		X = cadr(BASE);
+		if (caaddr(BASE) == symbol(MULTIPLY))
+			Y = cadaddr(BASE);
+		else
+			Y = one;
+	} else if (car(BASE) == symbol(MULTIPLY)) {
+		X = zero;
+		Y = cadr(BASE);
+	} else {
+		X = zero;
+		Y = one;
+	}
+	if (isdouble(X) || isdouble(Y) || isdouble(EXPO)) {
+		power_complex_double();
+		return;
+	}
+	if (!isinteger(EXPO)) {
+		power_complex_rational();
+		return;
+	}
+	push(EXPO);
+	n = pop_integer();
+	if (n == ERR) {
+		// exponent exceeds int max
+		push_symbol(POWER);
+		push(BASE);
+		push(EXPO);
+		list(3);
+		return;
+	}
+	if (n > 0)
+		power_complex_plus(n);
+	else if (n < 0)
+		power_complex_minus(-n);
+	else
+		push_integer(1);
+}
+
+void
+power_complex_plus(int n)
+{
+	int i;
+	PX = X;
+	PY = Y;
+	for (i = 1; i < n; i++) {
+		push(PX);
+		push(X);
+		multiply();
+		push(PY);
+		push(Y);
+		multiply();
+		subtract();
+		push(PX);
+		push(Y);
+		multiply();
+		push(PY);
+		push(X);
+		multiply();
+		add();
+		PY = pop();
+		PX = pop();
+	}
+	// X + i*Y
+	push(PX);
+	push(imaginaryunit);
+	push(PY);
+	multiply();
+	add();
+}
+
+//
+//               /        \  n
+//         -n   |  X - iY  |
+// (X + iY)   = | -------- |
+//              |   2   2  |
+//               \ X + Y  /
+
+// X and Y are rational numbers
+
+void
+power_complex_minus(int n)
+{
+	int i;
+	// R = X^2 + Y^2
+	push(X);
+	push(X);
+	multiply();
+	push(Y);
+	push(Y);
+	multiply();
+	add();
+	R = pop();
+	// X = X / R
+	push(X);
+	push(R);
+	divide();
+	X = pop();
+	// Y = -Y / R
+	push(Y);
+	negate();
+	push(R);
+	divide();
+	Y = pop();
+	PX = X;
+	PY = Y;
+	for (i = 1; i < n; i++) {
+		push(PX);
+		push(X);
+		multiply();
+		push(PY);
+		push(Y);
+		multiply();
+		subtract();
+		push(PX);
+		push(Y);
+		multiply();
+		push(PY);
+		push(X);
+		multiply();
+		add();
+		PY = pop();
+		PX = pop();
+	}
+	// X + i*Y
+	push(PX);
+	push(imaginaryunit);
+	push(PY);
+	multiply();
+	add();
+}
+
+void
+power_complex_double(void)
+{
+	double expo, r, theta, x, y;
+	push(EXPO);
+	expo = pop_double();
+	push(X);
+	x = pop_double();
+	push(Y);
+	y = pop_double();
+	r = hypot(x, y);
+	theta = atan2(y, x);
+	r = pow(r, expo);
+	theta = expo * theta;
+	x = r * cos(theta);
+	y = r * sin(theta);
+	push_double(x);
+	push_double(y);
+	push(imaginaryunit);
+	multiply();
+	add();
+}
+
+// X and Y are rational, EXPO is rational and not an integer
+
+void
+power_complex_rational(void)
+{
+	// calculate sqrt(X^2 + Y^2) ^ (1/2 * EXPO)
+	push(X);
+	push(X);
+	multiply();
+	push(Y);
+	push(Y);
+	multiply();
+	add();
+	push_rational(1, 2);
+	push(EXPO);
+	multiply();
+	power();
+	// calculate (-1) ^ (EXPO * arctan(Y, X) / pi)
+	push(Y);
+	push(X);
+	arctan();
+	push_symbol(PI);
+	divide();
+	push(EXPO);
+	multiply();
+	EXPO = pop();
+	power_imaginary_unit();
+	// result = sqrt(X^2 + Y^2) ^ (1/2 * EXPO) * (-1) ^ (EXPO * arctan(Y, X) / pi)
+	multiply();
+}
+
+// BASE and EXPO are numerical (rational or double)
+
+void
+power_numbers(void)
+{
+	double base, expo;
+	if (iszero(BASE) && isnegativenumber(EXPO))
+		stop("divide by zero");
+	if (equaln(BASE, -1)) {
+		power_imaginary_unit();
+		return;
+	}
+	if (isnegativenumber(BASE)) {
+		power_imaginary_unit();
+		push(BASE);
+		negate();
+		BASE = pop();
+		power_numbers();
+		multiply();
+		return;
+	}
+	if (BASE->k == RATIONAL && EXPO->k == RATIONAL) {
+		power_rationals();
+		return;
+	}
+	push(BASE);
+	base = pop_double();
+	push(EXPO);
+	expo = pop_double();
+	push_double(pow(base, expo));
+}
+
+// BASE and EXPO are rational numbers, BASE is nonnegative
+
+void
+power_rationals(void)
+{
+	int i, j, h, n;
+	struct atom **s;
+	uint32_t *a, *b;
+	uint32_t *base_numer, *base_denom;
+	uint32_t *expo_numer, *expo_denom;
+	base_numer = BASE->u.q.a;
+	base_denom = BASE->u.q.b;
+	expo_numer = EXPO->u.q.a;
+	expo_denom = EXPO->u.q.b;
+	// if EXPO is -1 then return reciprocal of BASE
+	if (equaln(EXPO, -1)) {
+		a = mcopy(base_numer);
+		b = mcopy(base_denom);
+		push_rational_number(MPLUS, b, a); // reciprocate
+		return;
+	}
+	// if EXPO is integer then return BASE ^ EXPO
+	if (MEQUAL(expo_denom, 1)) {
+		a = mpow(base_numer, expo_numer);
+		b = mpow(base_denom, expo_numer);
+		if (EXPO->sign == MMINUS)
+			push_rational_number(MPLUS, b, a); // reciprocate
+		else
+			push_rational_number(MPLUS, a, b);
+		return;
+	}
+	h = tos;
+	s = stack + h;
+	// put factors on stack
+	push_symbol(POWER);
+	push(BASE);
+	push(EXPO);
+	list(3);
+	factor_factor();
+	// normalize factors
+	n = tos - h;
+	for (i = 0; i < n; i++) {
+		p3 = s[i];
+		if (car(p3) == symbol(POWER)) {
+			BASE = cadr(p3);
+			EXPO = caddr(p3);
+			power_rationals_nib();
+			s[i] = pop(); // trick: fill hole
+		}
+	}
+	// multiply rationals
+	p4 = one;
+	n = tos - h;
+	for (i = 0; i < n; i++) {
+		p3 = s[i];
+		if (p3->k == RATIONAL) {
+			push(p3);
+			push(p4);
+			multiply();
+			p4 = pop();
+			for (j = i + 1; j < n; j++)
+				s[j - 1] = s[j];
+			i--;
+			n--;
+			tos--;
+		}
+	}
+	// finalize
+	if (!equaln(p4, 1))
+		push(p4);
+	n = tos - h;
+	if (n > 1) {
+		sort_factors(n);
+		list(n);
+		push_symbol(MULTIPLY);
+		swap();
+		cons();
+	}
+}
+
+// BASE is an integer, EXPO is an integer or rational number
+
+void
+power_rationals_nib(void)
+{
+	uint32_t *a, *b, *base, *expo_numer, *expo_denom, *t;
+	base = BASE->u.q.a;
+	expo_numer = EXPO->u.q.a;
+	expo_denom = EXPO->u.q.b;
+	// integer power?
+	if (MEQUAL(expo_denom, 1)) {
+		a = mpow(base, expo_numer);
+		b = mint(1);
+		if (EXPO->sign == MMINUS)
+			push_rational_number(MPLUS, b, a); // reciprocate
+		else
+			push_rational_number(MPLUS, a, b);
+		return;
+	}
+	// evaluate whole part
+	if (mcmp(expo_numer, expo_denom) > 0) {
+		t = mdiv(expo_numer, expo_denom);
+		a = mpow(base, t);
+		b = mint(1);
+		mfree(t);
+		if (EXPO->sign == MMINUS)
+			push_rational_number(MPLUS, b, a); // reciprocate
+		else
+			push_rational_number(MPLUS, a, b);
+		// reduce EXPO to fractional part
+		a = mmod(expo_numer, expo_denom);
+		b = mcopy(expo_denom);
+		push_rational_number(EXPO->sign, a, b);
+		EXPO = pop();
+		expo_numer = EXPO->u.q.a;
+		expo_denom = EXPO->u.q.b;
+	}
+	if (MLENGTH(base) == 1) {
+		// base is a prime number from factor_factor()
+		push_symbol(POWER);
+		a = mcopy(base);
+		b = mint(1);
+		push_rational_number(MPLUS, a, b);
+		push(EXPO);
+		list(3);
+		return;
+	}
+	t = mroot(base, expo_denom);
+	if (t == NULL) {
+		push_symbol(POWER);
+		a = mcopy(base);
+		b = mint(1);
+		push_rational_number(MPLUS, a, b);
+		push(EXPO);
+		list(3);
+		return;
+	}
+	a = mpow(t, expo_numer);
+	b = mint(1);
+	mfree(t);
+	if (EXPO->sign == MMINUS)
+		push_rational_number(MPLUS, b, a); // reciprocate
+	else
+		push_rational_number(MPLUS, a, b);
+}
+
 //	Look up the nth prime
 //
 //	Input:		n on stack (0 < n < 10001)
 //
 //	Output:		nth prime on stack
-//
-//-----------------------------------------------------------------------------
 
 void
 eval_prime(void)
@@ -14574,7 +15253,7 @@ prime(void)
 	int n;
 	n = pop_integer();
 	if (n < 1 || n > MAXPRIMETAB)
-		stop("prime: Argument out of range.");
+		stop("prime: arg out of range");
 	n = primetab[n - 1];
 	push_integer(n);
 }
@@ -15832,28 +16511,97 @@ int primetab[10000] = {
 104683,104693,104701,104707,104711,104717,104723,104729,
 };
 
-// tty style printing
-
-int out_index, out_length;
-char *out_str;
-int char_count, last_char;
-
-char *power_str = "^";
-
 void
-print(U *p)
+eval_print(void)
 {
-	if (car(p) == symbol(SETQ)) {
-		print_expr(cadr(p));
-		printstr(" = ");
-		print_expr(caddr(p));
-	} else
-		print_expr(p);
-	print_char('\n');
+	p1 = cdr(p1);
+	while (iscons(p1)) {
+		push(car(p1));
+		push(car(p1));
+		eval();
+		print_result();
+		p1 = cdr(p1);
+	}
+	push_symbol(NIL);
 }
 
 void
-print_subexpr(U *p)
+print_result(void)
+{
+	save();
+	print_result_nib();
+	restore();
+}
+
+void
+print_result_nib(void)
+{
+	p2 = pop(); // result
+	p1 = pop(); // input
+	if (p2 == symbol(NIL))
+		return;
+	if (issymbol(p1))
+		prep_symbol_equals();
+	if (iszero(binding[TTY])) {
+		push(p2);
+		cmdisplay();
+		return;
+	}
+	print(p2);
+}
+
+void
+prep_symbol_equals(void)
+{
+	if (p1 == p2)
+		return; // A = A
+	if (iskeyword(p1))
+		return; // keyword like "float"
+	if (p1 == symbol(SYMBOL_I) && isimaginaryunit(p2))
+		return;
+	if (p1 == symbol(SYMBOL_J) && isimaginaryunit(p2))
+		return;
+	push_symbol(SETQ);
+	push(p1);
+	push(p2);
+	list(3);
+	p2 = pop();
+}
+
+void
+eval_string(void)
+{
+	push(cadr(p1));
+	eval();
+	p1 = pop();
+	print_nib(p1);
+	print_char('\0');
+	push_string(outbuf);
+}
+
+void
+print(struct atom *p)
+{
+	print_nib(p);
+	print_char('\n');
+	print_char('\0');
+	printbuf(outbuf, BLACK);
+}
+
+void
+print_nib(struct atom *p)
+{
+	outbuf_index = 0;
+	if (car(p) == symbol(SETQ)) {
+		print_expr(cadr(p));
+		print_str(" = ");
+		print_expr(caddr(p));
+	} else
+		print_expr(p);
+}
+
+void
+print_subexpr(struct atom *p)
 {
 	print_char('(');
 	print_expr(p);
@@ -15861,9 +16609,9 @@ print_subexpr(U *p)
 }
 
 void
-print_expr(U *p)
+print_expr(struct atom *p)
 {
-	if (isadd(p)) {
+	if (car(p) == symbol(ADD)) {
 		p = cdr(p);
 		if (sign_of_term(car(p)) == '-')
 			print_str("-");
@@ -15885,11 +16633,9 @@ print_expr(U *p)
 }
 
 int
-sign_of_term(U *p)
+sign_of_term(struct atom *p)
 {
-	if (car(p) == symbol(MULTIPLY) && isnum(cadr(p)) && lessp(cadr(p), zero))
-		return '-';
-	else if (isnum(p) && lessp(p, zero))
+	if (isnegativenumber(p) || (car(p) == symbol(MULTIPLY) && isnegativenumber(cadr(p))))
 		return '-';
 	else
 		return '+';
@@ -15902,10 +16648,10 @@ sign_of_term(U *p)
 #define B p4
 
 void
-print_a_over_b(U *p)
+print_a_over_b(struct atom *p)
 {
 	int flag, n, d;
-	U *p1, *p2;
+	struct atom *p1, *p2;
 	save();
 	// count numerators and denominators
 	n = 0;
@@ -15914,11 +16660,11 @@ print_a_over_b(U *p)
 	p2 = car(p1);
 	if (isrational(p2)) {
 		push(p2);
-		mp_numerator();
+		numerator();
 		absval();
 		A = pop();
 		push(p2);
-		mp_denominator();
+		denominator();
 		B = pop();
 		if (!isplusone(A))
 			n++;
@@ -15988,7 +16734,7 @@ print_a_over_b(U *p)
 }
 
 void
-print_term(U *p)
+print_term(struct atom *p)
 {
 	if (car(p) == symbol(MULTIPLY) && any_denominators(p)) {
 		print_a_over_b(p);
@@ -15997,10 +16743,8 @@ print_term(U *p)
 	if (car(p) == symbol(MULTIPLY)) {
 		p = cdr(p);
 		// coeff -1?
-		if (isminusone(car(p))) {
-//			print_char('-');
+		if (isminusone(car(p)))
 			p = cdr(p);
-		}
 		print_factor(car(p));
 		p = cdr(p);
 		while (iscons(p)) {
@@ -16023,7 +16767,7 @@ print_term(U *p)
 #define EXPO p2
 
 void
-print_denom(U *p, int d)
+print_denom(struct atom *p, int d)
 {
 	save();
 	BASE = cadr(p);
@@ -16031,7 +16775,7 @@ print_denom(U *p, int d)
 	// i.e. 1 / (2^(1/3))
 	if (d == 1 && !isminusone(EXPO))
 		print_char('(');
-	if (isfraction(BASE) || car(BASE) == symbol(ADD) || car(BASE) == symbol(MULTIPLY) || car(BASE) == symbol(POWER) || lessp(BASE, zero)) {
+	if (isfraction(BASE) || car(BASE) == symbol(ADD) || car(BASE) == symbol(MULTIPLY) || car(BASE) == symbol(POWER) || isnegativenumber(BASE)) {
 			print_char('(');
 			print_expr(BASE);
 			print_char(')');
@@ -16041,7 +16785,7 @@ print_denom(U *p, int d)
 		restore();
 		return;
 	}
-	print_str(power_str);
+	print_str("^");
 	push(EXPO);
 	negate();
 	EXPO = pop();
@@ -16057,29 +16801,37 @@ print_denom(U *p, int d)
 }
 
 void
-print_factor(U *p)
+print_factor(struct atom *p)
 {
 	if (isnum(p)) {
 		print_number(p);
 		return;
 	}
 	if (isstr(p)) {
-		//print_str("\"");
 		print_str(p->u.str);
-		//print_str("\"");
 		return;
 	}
 	if (istensor(p)) {
 		print_tensor(p);
 		return;
 	}
-	if (isadd(p) || car(p) == symbol(MULTIPLY)) {
+	if (car(p) == symbol(ADD) || car(p) == symbol(MULTIPLY)) {
 		print_str("(");
 		print_expr(p);
 		print_str(")");
 		return;
 	}
 	if (car(p) == symbol(POWER)) {
+		if (isimaginaryunit(p)) {
+			if (isimaginaryunit(binding[SYMBOL_J])) {
+				print_char('j');
+				return;
+			}
+			if (isimaginaryunit(binding[SYMBOL_I])) {
+				print_char('i');
+				return;
+			}
+		}
 		if (cadr(p) == symbol(EXP1)) {
 			print_str("exp(");
 			print_expr(caddr(p));
@@ -16096,7 +16848,7 @@ print_factor(U *p)
 				print_expr(cadr(p));
 			return;
 		}
-		if (isadd(cadr(p)) || caadr(p) == symbol(MULTIPLY) || caadr(p) == symbol(POWER) || isnegativenumber(cadr(p))) {
+		if (caadr(p) == symbol(ADD) || caadr(p) == symbol(MULTIPLY) || caadr(p) == symbol(POWER) || isnegativenumber(cadr(p))) {
 			print_str("(");
 			print_expr(cadr(p));
 			print_str(")");
@@ -16106,7 +16858,7 @@ print_factor(U *p)
 			print_str(")");
 		} else
 			print_factor(cadr(p));
-		print_str(power_str);
+		print_str("^");
 		if (iscons(caddr(p)) || isfraction(caddr(p)) || (isnum(caddr(p)) && lessp(caddr(p), zero))) {
 			print_str("(");
 			print_expr(caddr(p));
@@ -16115,21 +16867,6 @@ print_factor(U *p)
 			print_factor(caddr(p));
 		return;
 	}
-//	if (car(p) == _list) {
-//		print_str("{");
-//		p = cdr(p);
-//		if (iscons(p)) {
-//			print_expr(car(p));
-//			p = cdr(p);
-//		}
-//		while (iscons(p)) {
-//			print_str(",");
-//			print_expr(car(p));
-//			p = cdr(p);
-//		}
-//		print_str("}");
-//		return;
-//	}
 	if (car(p) == symbol(INDEX) && issymbol(cadr(p))) {
 		print_index_function(p);
 		return;
@@ -16139,10 +16876,6 @@ print_factor(U *p)
 		return;
 	}
 	if (iscons(p)) {
-		//if (car(p) == symbol(FORMAL) && cadr(p)->k == SYM) {
-		//	print_str(((struct symbol *) cadr(p))->name);
-		//	return;
-		//}
 		print_factor(car(p));
 		p = cdr(p);
 		print_str("(");
@@ -16162,14 +16895,12 @@ print_factor(U *p)
 		print_char('d');
 	else if (p == symbol(EXP1))
 		print_str("exp(1)");
-	else if (p == symbol(PI))
-		print_str("pi");
 	else
-		print_str(get_printname(p));
+		print_str(printname(p));
 }
 
 void
-print_index_function(U *p)
+print_index_function(struct atom *p)
 {
 	p = cdr(p);
 	if (caar(p) == symbol(ADD) || caar(p) == symbol(MULTIPLY) || caar(p) == symbol(POWER) || caar(p) == symbol(FACTORIAL))
@@ -16191,25 +16922,25 @@ print_index_function(U *p)
 }
 
 void
-print_factorial_function(U *p)
+print_factorial_function(struct atom *p)
 {
 	p = cadr(p);
-	if (car(p) == symbol(ADD) || car(p) == symbol(MULTIPLY) || car(p) == symbol(POWER) || car(p) == symbol(FACTORIAL))
-		print_subexpr(p);
-	else
+	if (isposint(p) || issymbol(p))
 		print_expr(p);
+	else
+		print_subexpr(p);
 	print_char('!');
 }
 
 void
-print_tensor(U *p)
+print_tensor(struct atom *p)
 {
 	int k = 0;
 	print_tensor_inner(p, 0, &k);
 }
 
 void
-print_tensor_inner(U *p, int j, int *k)
+print_tensor_inner(struct atom *p, int j, int *k)
 {
 	int i;
 	print_str("(");
@@ -16227,27 +16958,9 @@ print_tensor_inner(U *p, int j, int *k)
 }
 
 void
-print_str(char *s)
+print_function_definition(struct atom *p)
 {
-	while (*s)
-		print_char(*s++);
-}
-
-void
-print_char(int c)
-{
-	last_char = c;
-	char_count++;
-//	if (display_flag == 1)
-//		displaychar(c);
-//	else
-		printchar(c);
-}
-
-void
-print_function_definition(U *p)
-{
-	print_str(get_printname(p));
+	print_str(printname(p));
 	print_arg_list(cadr(get_binding(p)));
 	print_str("=");
 	print_expr(caddr(get_binding(p)));
@@ -16255,63 +16968,19 @@ print_function_definition(U *p)
 }
 
 void
-print_arg_list(U *p)
+print_arg_list(struct atom *p)
 {
 	print_str("(");
 	if (iscons(p)) {
-		print_str(get_printname(car(p)));
+		print_str(printname(car(p)));
 		p = cdr(p);
 		while (iscons(p)) {
 			print_str(",");
-			print_str(get_printname(car(p)));
+			print_str(printname(car(p)));
 			p = cdr(p);
 		}
 	}
 	print_str(")");
-}
-
-void
-print_lisp(U *p)
-{
-	print1(p);
-	print_str("\n");
-}
-
-void
-print1(U *p)
-{
-	switch (p->k) {
-	case CONS:
-		print_str("(");
-		print1(car(p));
-		p = cdr(p);
-		while (iscons(p)) {
-			print_str(" ");
-			print1(car(p));
-			p = cdr(p);
-		}
-		if (p != symbol(NIL)) {
-			print_str(" . ");
-			print1(p);
-		}
-		print_str(")");
-		break;
-	case STR:
-		//print_str("\"");
-		print_str(p->u.str);
-		//print_str("\"");
-		break;
-	case NUM:
-	case DOUBLE:
-		print_number(p);
-		break;
-	case SYM:
-		print_str(get_printname(p));
-		break;
-	default:
-		print_str("<tensor>");
-		break;
-	}
 }
 
 void
@@ -16321,7 +16990,7 @@ print_multiply_sign(void)
 }
 
 int
-is_denominator(U *p)
+is_denominator(struct atom *p)
 {
 	if (car(p) == symbol(POWER) && cadr(p) != symbol(EXP1) && isnegativeterm(caddr(p)))
 		return 1;
@@ -16329,17 +16998,11 @@ is_denominator(U *p)
 		return 0;
 }
 
-// don't consider the leading fraction
-
-// we want 2/3*a*b*c instead of 2*a*b*c/3
-
 int
-any_denominators(U *p)
+any_denominators(struct atom *p)
 {
-	U *q;
+	struct atom *q;
 	p = cdr(p);
-//	if (isfraction(car(p)))
-//		return 1;
 	while (iscons(p)) {
 		q = car(p);
 		if (is_denominator(q))
@@ -16349,527 +17012,232 @@ any_denominators(U *p)
 	return 0;
 }
 
-// 'product' function
+// sign has already been printed
 
-#undef I
-#undef X
+void
+print_number(struct atom *p)
+{
+	char *s;
+	switch (p->k) {
+	case RATIONAL:
+		s = mstr(p->u.q.a);
+		print_str(s);
+		s = mstr(p->u.q.b);
+		if (strcmp(s, "1") == 0)
+			break;
+		print_char('/');
+		print_str(s);
+		break;
+	case DOUBLE:
+		sprintf(tbuf, "%g", p->u.d);
+		s = tbuf;
+		if (*s == '+' || *s == '-')
+			s++;
+		if (isinf(p->u.d) || isnan(p->u.d)) {
+			print_str(s);
+			break;
+		}
+		if (strchr(tbuf, 'e') || strchr(tbuf, 'E'))
+			print_char('(');
+		while (*s && *s != 'e' && *s != 'E')
+			print_char(*s++);
+		if (!strchr(tbuf, '.'))
+			print_str(".0");
+		if (*s == 'e' || *s == 'E') {
+			s++;
+			print_str(" 10^");
+			if (*s == '-') {
+				print_str("(-");
+				s++;
+				while (*s == '0')
+					s++; // skip leading zeroes
+				print_str(s);
+				print_char(')');
+			} else {
+				if (*s == '+')
+					s++;
+				while (*s == '0')
+					s++; // skip leading zeroes
+				print_str(s);
+			}
+		}
+		if (strchr(tbuf, 'e') || strchr(tbuf, 'E'))
+			print_char(')');
+		break;
+	default:
+		break;
+	}
+}
 
-#define I p5
-#define X p6
+void
+eval_lisp(void)
+{
+	push(cadr(p1));
+	eval();
+	p1 = pop();
+	outbuf_index = 0;
+	print_lisp_nib(p1);
+	print_char('\0');
+	push_string(outbuf);
+}
+
+void
+print_lisp(struct atom *p)
+{
+	outbuf_index = 0;
+	print_lisp_nib(p);
+	print_char('\n');
+	print_char('\0');
+	printbuf(outbuf, BLACK);
+}
+
+void
+print_lisp_nib(struct atom *p)
+{
+	int i;
+	char *s;
+	switch (p->k) {
+	case CONS:
+		print_str("(");
+		print_lisp_nib(car(p));
+		p = cdr(p);
+		while (iscons(p)) {
+			print_str(" ");
+			print_lisp_nib(car(p));
+			p = cdr(p);
+		}
+		if (p != symbol(NIL)) {
+			print_str(" . ");
+			print_lisp_nib(p);
+		}
+		print_str(")");
+		break;
+	case STR:
+		print_str("\"");
+		print_str(p->u.str);
+		print_str("\"");
+		break;
+	case RATIONAL:
+		if (p->sign == MMINUS)
+			print_char('-');
+		s = mstr(p->u.q.a);
+		print_str(s);
+		s = mstr(p->u.q.b);
+		if (strcmp(s, "1") == 0)
+			break;
+		print_char('/');
+		print_str(s);
+		break;
+	case DOUBLE:
+		sprintf(tbuf, "%g", p->u.d);
+		if (isinf(p->u.d) || isnan(p->u.d)) {
+			print_str(tbuf);
+			break;
+		}
+		if (strchr(tbuf, 'e') || strchr(tbuf, 'E'))
+			print_str("(* ");
+		s = tbuf;
+		while (*s && *s != 'e' && *s != 'E')
+			print_char(*s++);
+		if (!strchr(tbuf, '.'))
+			print_str(".0");
+		if (*s == 'e' || *s == 'E') {
+			s++;
+			print_str(" (^ 10 ");
+			if (*s == '+')
+				s++;
+			else if (*s == '-')
+				print_char(*s++);
+			while (*s == '0')
+				s++; // skip leading zeroes
+			print_str(s);
+			print_char(')');
+		}
+		if (strchr(tbuf, 'e') || strchr(tbuf, 'E'))
+			print_char(')');
+		break;
+	case KSYM:
+	case USYM:
+		print_str(printname(p));
+		break;
+	case TENSOR:
+		print_str("(tensor");
+		sprintf(tbuf, " %d", p->u.tensor->ndim);
+		print_str(tbuf);
+		for (i = 0; i < p->u.tensor->ndim; i++) {
+			sprintf(tbuf, " %d", p->u.tensor->dim[i]);
+			print_str(tbuf);
+		}
+		for (i = 0; i < p->u.tensor->nelem; i++) {
+			print_str(" ");
+			print_lisp_nib(p->u.tensor->elem[i]);
+		}
+		print_str(")");
+		break;
+	default:
+		print_str("ERROR");
+		break;
+	}
+}
+
+void
+print_str(char *s)
+{
+	while (*s)
+		print_char(*s++);
+}
+
+void
+print_char(int c)
+{
+	if (outbuf_index == outbuf_length) {
+		outbuf_length += 10000;
+		outbuf = (char *) realloc(outbuf, outbuf_length);
+		if (outbuf == NULL)
+			malloc_kaput();
+	}
+	outbuf[outbuf_index++] = c;
+}
 
 void
 eval_product(void)
 {
-	int i, j, k;
-	// 1st arg (quoted)
-	X = cadr(p1);
-	if (!issymbol(X))
+	int h, j, k;
+	p1 = cdr(p1);
+	p2 = car(p1);
+	if (!issymbol(p2))
 		stop("product: 1st arg?");
-	// 2nd arg
-	push(caddr(p1));
+	p1 = cdr(p1);
+	push(car(p1));
 	eval();
 	j = pop_integer();
-	if (j == (int) 0x80000000)
+	if (j == ERR)
 		stop("product: 2nd arg?");
-	// 3rd arg
-	push(cadddr(p1));
+	p1 = cdr(p1);
+	push(car(p1));
 	eval();
 	k = pop_integer();
-	if (k == (int) 0x80000000)
+	if (k == ERR)
 		stop("product: 3rd arg?");
-	// 4th arg
-	p1 = caddddr(p1);
-	push_binding(X);
-	push_integer(1);
-	for (i = j; i <= k; i++) {
-		push_integer(i);
-		I = pop();
-		set_binding(X, I);
+	p1 = cadr(p1);
+	save_binding(p2);
+	h = tos;
+	for (;;) {
+		push_integer(j);
+		p3 = pop();
+		set_binding(p2, p3);
 		push(p1);
 		eval();
-		multiply();
-	}
-	p1 = pop();
-	pop_binding(X);
-	push(p1);
-}
-
-//	Add rational numbers
-//
-//	Input:		tos-2		addend
-//
-//			tos-1		addend
-//
-//	Output:		sum on stack
-
-void
-qadd(void)
-{
-	unsigned int *a, *ab, *b, *ba, *c;
-	save();
-	p2 = pop();
-	p1 = pop();
-	ab = mmul(p1->u.q.a, p2->u.q.b);
-	ba = mmul(p1->u.q.b, p2->u.q.a);
-	a = madd(ab, ba);
-	mfree(ab);
-	mfree(ba);
-	// zero?
-	if (MZERO(a)) {
-		mfree(a);
-		push(zero);
-		restore();
-		return;
-	}
-	b = mmul(p1->u.q.b, p2->u.q.b);
-	c = mgcd(a, b);
-	MSIGN(c) = MSIGN(b);
-	p1 = alloc();
-	p1->k = NUM;
-	p1->u.q.a = mdiv(a, c);
-	p1->u.q.b = mdiv(b, c);
-	mfree(a);
-	mfree(b);
-	mfree(c);
-	push(p1);
-	restore();
-}
-
-//	Divide rational numbers
-//
-//	Input:		tos-2		dividend
-//
-//			tos-1		divisor
-//
-//	Output:		quotient on stack
-
-void
-qdiv(void)
-{
-	unsigned int *aa, *bb, *c;
-	save();
-	p2 = pop();
-	p1 = pop();
-	// zero?
-	if (MZERO(p2->u.q.a))
-		stop("divide by zero");
-	if (MZERO(p1->u.q.a)) {
-		push(zero);
-		restore();
-		return;
-	}
-	aa = mmul(p1->u.q.a, p2->u.q.b);
-	bb = mmul(p1->u.q.b, p2->u.q.a);
-	c = mgcd(aa, bb);
-	MSIGN(c) = MSIGN(bb);
-	p1 = alloc();
-	p1->k = NUM;
-	p1->u.q.a = mdiv(aa, c);
-	p1->u.q.b = mdiv(bb, c);
-	mfree(aa);
-	mfree(bb);
-	mfree(c);
-	push(p1);
-	restore();
-}
-
-//	Multiply rational numbers
-//
-//	Input:		tos-2		multiplicand
-//
-//			tos-1		multiplier
-//
-//	Output:		product on stack
-
-void
-qmul(void)
-{
-	unsigned int *aa, *bb, *c;
-	save();
-	p2 = pop();
-	p1 = pop();
-	// zero?
-	if (MZERO(p1->u.q.a) || MZERO(p2->u.q.a)) {
-		push(zero);
-		restore();
-		return;
-	}
-	aa = mmul(p1->u.q.a, p2->u.q.a);
-	bb = mmul(p1->u.q.b, p2->u.q.b);
-	c = mgcd(aa, bb);
-	MSIGN(c) = MSIGN(bb);
-	p1 = alloc();
-	p1->k = NUM;
-	p1->u.q.a = mdiv(aa, c);
-	p1->u.q.b = mdiv(bb, c);
-	mfree(aa);
-	mfree(bb);
-	mfree(c);
-	push(p1);
-	restore();
-}
-
-// Rational power function
-
-#undef BASE
-#undef EXPO
-
-#define BASE p1
-#define EXPO p2
-
-void
-qpow(void)
-{
-	save();
-	qpowf();
-	restore();
-}
-
-void
-qpowf(void)
-{
-	int expo;
-	unsigned int a, b, *t, *x, *y;
-	EXPO = pop();
-	BASE = pop();
-	// if base is 1 or exponent is 0 then return 1
-	if (isplusone(BASE) || iszero(EXPO)) {
-		push_integer(1);
-		return;
-	}
-	// if base is zero then return 0
-	if (iszero(BASE)) {
-		if (isnegativenumber(EXPO))
-			stop("divide by zero");
-		push(zero);
-		return;
-	}
-	// if exponent is 1 then return base
-	if (isplusone(EXPO)) {
-		push(BASE);
-		return;
-	}
-	// if exponent is integer then power
-	if (isinteger(EXPO)) {
-		push(EXPO);
-		expo = pop_integer();
-		if (expo == (int) 0x80000000) {
-			// expo greater than 32 bits
-			push_symbol(POWER);
-			push(BASE);
-			push(EXPO);
-			list(3);
-			return;
-		}
-		x = mpow(BASE->u.q.a, abs(expo));
-		y = mpow(BASE->u.q.b, abs(expo));
-		if (expo < 0) {
-			t = x;
-			x = y;
-			y = t;
-			MSIGN(x) = MSIGN(y);
-			MSIGN(y) = 1;
-		}
-		p3 = alloc();
-		p3->k = NUM;
-		p3->u.q.a = x;
-		p3->u.q.b = y;
-		push(p3);
-		return;
-	}
-	// from here on out the exponent is NOT an integer
-	// if base is -1 then normalize polar angle
-	if (isminusone(BASE)) {
-		push(EXPO);
-		normalize_angle();
-		return;
-	}
-	// if base is negative then (-N)^M -> N^M * (-1)^M
-	if (isnegativenumber(BASE)) {
-		push(BASE);
-		negate();
-		push(EXPO);
-		qpow();
-		push_integer(-1);
-		push(EXPO);
-		qpow();
-		multiply();
-		return;
-	}
-	// if BASE is not an integer then power numerator and denominator
-	if (!isinteger(BASE)) {
-		push(BASE);
-		mp_numerator();
-		push(EXPO);
-		qpow();
-		push(BASE);
-		mp_denominator();
-		push(EXPO);
-		negate();
-		qpow();
-		multiply();
-		return;
-	}
-	// At this point BASE is a positive integer.
-	// If BASE is small then factor it.
-	if (is_small_integer(BASE)) {
-		push(BASE);
-		push(EXPO);
-		quickfactor();
-		return;
-	}
-	// At this point BASE is a positive integer and EXPO is not an integer.
-	if (MLENGTH(EXPO->u.q.a) > 1 || MLENGTH(EXPO->u.q.b) > 1) {
-		push_symbol(POWER);
-		push(BASE);
-		push(EXPO);
-		list(3);
-		return;
-	}
-	a = EXPO->u.q.a[0];
-	b = EXPO->u.q.b[0];
-	x = mroot(BASE->u.q.a, b);
-	if (x == 0) {
-		push_symbol(POWER);
-		push(BASE);
-		push(EXPO);
-		list(3);
-		return;
-	}
-	y = mpow(x, a);
-	mfree(x);
-	p3 = alloc();
-	p3->k = NUM;
-	if (MSIGN(EXPO->u.q.a) == -1) {
-		p3->u.q.a = mint(1);
-		p3->u.q.b = y;
-	} else {
-		p3->u.q.a = y;
-		p3->u.q.b = mint(1);
-	}
-	push(p3);
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Normalize the angle of unit imaginary, i.e. (-1) ^ N
-//
-//	Input:		N on stack (must be rational, not float)
-//
-//	Output:		Result on stack
-//
-//	Note:
-//
-//	n = q * d + r
-//
-//	Example:
-//						n	d	q	r
-//
-//	(-1)^(8/3)	->	 (-1)^(2/3)	8	3	2	2
-//	(-1)^(7/3)	->	 (-1)^(1/3)	7	3	2	1
-//	(-1)^(5/3)	->	-(-1)^(2/3)	5	3	1	2
-//	(-1)^(4/3)	->	-(-1)^(1/3)	4	3	1	1
-//	(-1)^(2/3)	->	 (-1)^(2/3)	2	3	0	2
-//	(-1)^(1/3)	->	 (-1)^(1/3)	1	3	0	1
-//
-//	(-1)^(-1/3)	->	-(-1)^(2/3)	-1	3	-1	2
-//	(-1)^(-2/3)	->	-(-1)^(1/3)	-2	3	-1	1
-//	(-1)^(-4/3)	->	 (-1)^(2/3)	-4	3	-2	2
-//	(-1)^(-5/3)	->	 (-1)^(1/3)	-5	3	-2	1
-//	(-1)^(-7/3)	->	-(-1)^(2/3)	-7	3	-3	2
-//	(-1)^(-8/3)	->	-(-1)^(1/3)	-8	3	-3	1
-//
-//-----------------------------------------------------------------------------
-
-#undef A
-#undef Q
-#undef R
-
-#define A p1
-#define Q p2
-#define R p3
-
-void
-normalize_angle(void)
-{
-	save();
-	A = pop();
-	// integer exponent?
-	if (isinteger(A)) {
-		if (A->u.q.a[0] & 1)
-			push_integer(-1); // odd exponent
+		if (j < k)
+			j++;
+		else if (j > k)
+			j--;
 		else
-			push_integer(1); // even exponent
-		restore();
-		return;
+			break;
 	}
-	// floor
-	push(A);
-	bignum_truncate();
-	Q = pop();
-	if (isnegativenumber(A)) {
-		push(Q);
-		push_integer(-1);
-		add();
-		Q = pop();
-	}
-	// remainder (always positive)
-	push(A);
-	push(Q);
-	subtract();
-	R = pop();
-	// remainder becomes new angle
-	push_symbol(POWER);
-	push_integer(-1);
-	push(R);
-	list(3);
-	// negate if quotient is odd
-	if (Q->u.q.a[0] & 1)
-		negate();
-	restore();
+	multiply_factors(tos - h);
+	restore_binding(p2);
 }
-
-int
-is_small_integer(U *p)
-{
-	if (isinteger(p) && MLENGTH(p->u.q.a) == 1 && (p->u.q.a[0] & 0x80000000) == 0)
-		return 1;
-	else
-		return 0;
-}
-
-//	Subtract rational numbers
-//
-//	Input:		tos-2		minuend
-//
-//			tos-1		subtrahend
-//
-//	Output:		difference on stack
-
-void
-qsub(void)
-{
-	unsigned int *a, *ab, *b, *ba, *c;
-	save();
-	p2 = pop();
-	p1 = pop();
-	ab = mmul(p1->u.q.a, p2->u.q.b);
-	ba = mmul(p1->u.q.b, p2->u.q.a);
-	a = msub(ab, ba);
-	mfree(ab);
-	mfree(ba);
-	// zero?
-	if (MZERO(a)) {
-		mfree(a);
-		push(zero);
-		restore();
-		return;
-	}
-	b = mmul(p1->u.q.b, p2->u.q.b);
-	c = mgcd(a, b);
-	MSIGN(c) = MSIGN(b);
-	p1 = alloc();
-	p1->k = NUM;
-	p1->u.q.a = mdiv(a, c);
-	p1->u.q.b = mdiv(b, c);
-	mfree(a);
-	mfree(b);
-	mfree(c);
-	push(p1);
-	restore();
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Factor small numerical powers
-//
-//	Input:		tos-2		Base (positive integer < 2^31 - 1)
-//
-//			tos-1		Exponent
-//
-//	Output:		Expr on stack
-//
-//-----------------------------------------------------------------------------
-
-#undef BASE
-#undef EXPO
-
-#define BASE p1
-#define EXPO p2
-
-void
-quickfactor(void)
-{
-	int h, i, n;
-	U **s;
-	save();
-	EXPO = pop();
-	BASE = pop();
-	h = tos;
-	push(BASE);
-	factor_small_number();
-	n = tos - h;
-	s = stack + h;
-	for (i = 0; i < n; i += 2) {
-		push(s[i]);		// factored base
-		push(s[i + 1]);		// factored exponent
-		push(EXPO);
-		multiply();
-		quickpower();
-	}
-	// stack has n results from factor_number_raw()
-	// on top of that are all the expressions from quickpower()
-	// multiply the quickpower() results
-	multiply_all(tos - h - n);
-	p1 = pop();
-	tos = h;
-	push(p1);
-	restore();
-}
-
-// BASE is a prime number so power is simpler
-
-void
-quickpower(void)
-{
-	int expo;
-	save();
-	EXPO = pop();
-	BASE = pop();
-	push(EXPO);
-	bignum_truncate();
-	p3 = pop();
-	push(EXPO);
-	push(p3);
-	subtract();
-	p4 = pop();
-	// fractional part of EXPO
-	if (!iszero(p4)) {
-		push_symbol(POWER);
-		push(BASE);
-		push(p4);
-		list(3);
-	}
-	push(p3);
-	expo = pop_integer();
-	if (expo == (int) 0x80000000) {
-		push_symbol(POWER);
-		push(BASE);
-		push(p3);
-		list(3);
-		restore();
-		return;
-	}
-	if (expo == 0) {
-		restore();
-		return;
-	}
-	push(BASE);
-	bignum_power_number(expo);
-	restore();
-}
-
-// Divide polynomials
 
 void
 eval_quotient(void)
@@ -16887,8 +17255,6 @@ eval_quotient(void)
 	divpoly();
 }
 
-//-----------------------------------------------------------------------------
-//
 //	Divide polynomials
 //
 //	Input:		tos-3		Dividend
@@ -16898,26 +17264,24 @@ eval_quotient(void)
 //			tos-1		x
 //
 //	Output:		tos-1		Quotient
-//
-//-----------------------------------------------------------------------------
 
 #undef DIVIDEND
 #undef DIVISOR
 #undef X
 #undef Q
-#undef QUOTIENT
+#undef QQUOTIENT
 
 #define DIVIDEND p1
 #define DIVISOR p2
 #define X p3
 #define Q p4
-#define QUOTIENT p5
+#define QQUOTIENT p5
 
 void
 divpoly(void)
 {
 	int h, i, m, n, x;
-	U **dividend, **divisor;
+	struct atom **dividend, **divisor;
 	save();
 	X = pop();
 	DIVISOR = pop();
@@ -16933,7 +17297,7 @@ divpoly(void)
 	n = coeff() - 1;	// n is divisor's power
 	x = m - n;
 	push_integer(0);
-	QUOTIENT = pop();
+	QQUOTIENT = pop();
 	while (x >= 0) {
 		push(dividend[m]);
 		push(divisor[n]);
@@ -16947,23 +17311,21 @@ divpoly(void)
 			subtract();
 			dividend[x + i] = pop();
 		}
-		push(QUOTIENT);
+		push(QQUOTIENT);
 		push(Q);
 		push(X);
 		push_integer(x);
 		power();
 		multiply();
 		add();
-		QUOTIENT = pop();
+		QQUOTIENT = pop();
 		m--;
 		x--;
 	}
 	tos = h;
-	push(QUOTIENT);
+	push(QQUOTIENT);
 	restore();
 }
-
-#define YYDEBUG 0
 
 void
 eval_rationalize(void)
@@ -16976,161 +17338,43 @@ eval_rationalize(void)
 void
 rationalize(void)
 {
-	int x = expanding;
 	save();
-	yyrationalize();
+	rationalize_nib();
 	restore();
-	expanding = x;
 }
 
 void
-yyrationalize(void)
-{
-	p1 = pop();
-	if (istensor(p1)) {
-		rationalize_tensor();
-		return;
-	}
-	expanding = 0;
-	if (car(p1) != symbol(ADD)) {
-		push(p1);
-		return;
-	}
-#if YYDEBUG
-	printf("rationalize: this is the input expr:\n");
-	print(p1);
-#endif
-	// get common denominator
-	push(one);
-	multiply_denominators(p1);
-	p2 = pop();
-#if YYDEBUG
-	printf("rationalize: this is the common denominator:\n");
-	print(p2);
-#endif
-	// multiply each term by common denominator
-	push(zero);
-	p3 = cdr(p1);
-	while (iscons(p3)) {
-		push(p2);
-		push(car(p3));
-		multiply();
-		add();
-		p3 = cdr(p3);
-	}
-#if YYDEBUG
-	printf("rationalize: original expr times common denominator:\n");
-	print(stack[tos - 1]);
-#endif
-	// collect common factors
-	Condense();
-#if YYDEBUG
-	printf("rationalize: after factoring:\n");
-	print(stack[tos - 1]);
-#endif
-	// divide by common denominator
-	push(p2);
-	divide();
-#if YYDEBUG
-	printf("rationalize: after dividing by common denom. (and we're done):\n");
-	print(stack[tos - 1]);
-#endif
-}
-
-void
-multiply_denominators(U *p)
-{
-	if (car(p) == symbol(ADD)) {
-		p = cdr(p);
-		while (iscons(p)) {
-			multiply_denominators_term(car(p));
-			p = cdr(p);
-		}
-	} else
-		multiply_denominators_term(p);
-}
-
-void
-multiply_denominators_term(U *p)
-{
-	if (car(p) == symbol(MULTIPLY)) {
-		p = cdr(p);
-		while (iscons(p)) {
-			multiply_denominators_factor(car(p));
-			p = cdr(p);
-		}
-	} else
-		multiply_denominators_factor(p);
-}
-
-void
-multiply_denominators_factor(U *p)
-{
-	if (car(p) != symbol(POWER))
-		return;
-	push(p);
-	p = caddr(p);
-	// like x^(-2) ?
-	if (isnegativenumber(p)) {
-		inverse();
-		rationalize_lcm();
-		return;
-	}
-	// like x^(-a) ?
-	if (car(p) == symbol(MULTIPLY) && isnegativenumber(cadr(p))) {
-		inverse();
-		rationalize_lcm();
-		return;
-	}
-	// no match
-	pop();
-}
-
-void
-rationalize_tensor(void)
+rationalize_nib(void)
 {
 	int i, n;
-	push(p1);
-	eval(); // makes a copy
 	p1 = pop();
-	if (!istensor(p1)) { // might be zero
+	if (istensor(p1)) {
+		n = p1->u.tensor->nelem;
+		for (i = 0; i < n; i++) {
+			push(p1->u.tensor->elem[i]);
+			rationalize();
+			p1->u.tensor->elem[i] = pop();
+		}
 		push(p1);
 		return;
 	}
-	n = p1->u.tensor->nelem;
-	for (i = 0; i < n; i++) {
-		push(p1->u.tensor->elem[i]);
-		rationalize();
-		p1->u.tensor->elem[i] = pop();
+	p2 = one;
+	while (cross_expr(p1)) {
+		p0 = pop();
+		push(p0);
+		push(p1);
+		cancel_factor();
+		p1 = pop();
+		push(p0);
+		push(p2);
+		multiply_noexpand();
+		p2 = pop();
 	}
 	push(p1);
-}
-
-void
-rationalize_lcm(void)
-{
-	save();
-	p1 = pop();
-	p2 = pop();
-	push(p1);
 	push(p2);
-	multiply();
-	push(p1);
-	push(p2);
-	gcd();
-	divide();
-	restore();
+	reciprocate();
+	multiply_noexpand();
 }
-
-/* Returns the real part of complex z
-
-	z		real(z)
-	-		-------
-
-	a + i b		a
-
-	exp(i a)	cos(a)
-*/
 
 void
 eval_real(void)
@@ -17150,17 +17394,10 @@ real(void)
 	push(p1);
 	conjugate();
 	add();
-	push_integer(2);
-	divide();
+	push_rational(1, 2);
+	multiply();
 	restore();
 }
-
-/* Convert complex z to rectangular form
-
-	Input:		push	z
-
-	Output:		Result on stack
-*/
 
 void
 eval_rect(void)
@@ -17174,87 +17411,78 @@ void
 rect(void)
 {
 	save();
+	rect_nib();
+	restore();
+}
+
+#undef BASE
+#undef EXPO
+
+#define BASE p3
+#define EXPO p4
+
+void
+rect_nib(void)
+{
+	int h;
 	p1 = pop();
 	if (car(p1) == symbol(ADD)) {
-		push_integer(0);
 		p1 = cdr(p1);
+		h = tos;
 		while (iscons(p1)) {
 			push(car(p1));
 			rect();
-			add();
 			p1 = cdr(p1);
 		}
-	} else {
-		push(p1);	// mag(z) * (cos(arg(z)) + i sin(arg(z)))
-		mag();
-		push(p1);
-		arg();
-		p1 = pop();
-		push(p1);
-		cosine();
-		push(imaginaryunit);
-		push(p1);
-		sine();
-		multiply();
-		add();
-		multiply();
-	}
-	restore();
-}
-
-// Rewrite by expanding all symbols
-
-void
-rewrite(void)
-{
-	int h;
-	save();
-	p1 = pop();
-	if (istensor(p1)) {
-		rewrite_tensor();
-		restore();
+		add_terms(tos - h);
 		return;
 	}
-	if (iscons(p1)) {
-		h = tos;
-		push(car(p1)); // Do not rewrite function name
+	if (car(p1) == symbol(MULTIPLY)) {
 		p1 = cdr(p1);
+		h = tos;
 		while (iscons(p1)) {
 			push(car(p1));
-			rewrite();
+			rect();
 			p1 = cdr(p1);
 		}
-		list(tos - h);
-		restore();
+		multiply_factors(tos - h);
 		return;
 	}
-	// If not a symbol then done
-	if (!issymbol(p1)) {
+	if (car(p1) != symbol(POWER)) {
 		push(p1);
-		restore();
 		return;
 	}
-	// Get the symbol's binding, try again
-	p2 = get_binding(p1);
-	push(p2);
-	if (p1 != p2)
-		rewrite();
-	restore();
-}
-
-void
-rewrite_tensor(void)
-{
-	int i;
-	push(p1);
-	copy_tensor();
-	p1 = pop();
-	for (i = 0; i < p1->u.tensor->nelem; i++) {
-		push(p1->u.tensor->elem[i]);
-		rewrite();
-		p1->u.tensor->elem[i] = pop();
+	BASE = cadr(p1);
+	EXPO = caddr(p1);
+	// handle sum in exponent
+	if (car(EXPO) == symbol(ADD)) {
+		p1 = cdr(EXPO);
+		h = tos;
+		while (iscons(p1)) {
+			push_symbol(POWER);
+			push(BASE);
+			push(car(p1));
+			list(3);
+			rect();
+			p1 = cdr(p1);
+		}
+		multiply_factors(tos - h);
+		return;
 	}
+	// return mag(p1) * cos(arg(p1)) + i sin(arg(p1)))
 	push(p1);
+	mag();
+	push(p1);
+	arg();
+	p2 = pop();
+	push(p2);
+	scos();
+	push(imaginaryunit);
+	push(p2);
+	ssin();
+	multiply();
+	add();
+	multiply();
 }
 
 #undef POLY
@@ -17323,7 +17551,7 @@ roots(void)
 		stop("roots: the polynomial is not factorable, try nroots");
 	if (n == 1)
 		return;
-	sort_stack(n);
+	sort(n);
 	save();
 	p1 = alloc_tensor(n);
 	p1->u.tensor->ndim = 1;
@@ -17379,8 +17607,6 @@ roots3(void)
 	restore();
 }
 
-//-----------------------------------------------------------------------------
-//
 //	Input:		stack[tos - 2]		polynomial
 //
 //			stack[tos - 1]		dependent symbol
@@ -17388,8 +17614,6 @@ roots3(void)
 //	Output:		stack			roots on stack
 //
 //						(input args are popped first)
-//
-//-----------------------------------------------------------------------------
 
 void
 mini_solve(void)
@@ -17451,37 +17675,50 @@ mini_solve(void)
 	restore();
 }
 
-// use these for tmp vars (required by garbage collector)
-
-U *p0, *p1, *p2, *p3, *p4, *p5, *p6, *p7, *p8, *p9;
-
-int expanding;
-int esc_flag;
-int draw_flag;
-int trigmode;
-int term_flag;
-int running;
-jmp_buf stop_return, draw_stop_return;
-
-void *
-run1(void *s)
-{
-	run((char *) s);
-	running = 0;
-	return NULL;
-}
+char *trace1;
+char *trace2;
 
 void
 run(char *s)
 {
-	int i, n;
 	if (setjmp(stop_return))
 		return;
-	term_flag = BLACK;
+	if (zero == NULL)
+		init();
+	prep();
+	binding[TRACE] = zero;
+	for (;;) {
+		s = scan_input(s);
+		if (s == NULL)
+			break; // end of input
+		eval_and_print_result();
+	}
+}
+
+void
+init(void)
+{
+	init_symbol_table();
+	prep();
+	init_bignums();
+	push_symbol(POWER);
+	push_integer(-1);
+	push_rational(1, 2);
+	list(3);
+	imaginaryunit = pop();
+	run_init_script();
+	prep();
+	gc();
+}
+
+void
+prep(void)
+{
 	tos = 0;
-	esc_flag = 0;
-	draw_flag = 0;
-	frame = stack + TOS;
+	tof = 0;
+	expanding = 1;
+	drawing = 0;
+	interrupt = 0;
 	p0 = symbol(NIL);
 	p1 = symbol(NIL);
 	p2 = symbol(NIL);
@@ -17492,81 +17729,217 @@ run(char *s)
 	p7 = symbol(NIL);
 	p8 = symbol(NIL);
 	p9 = symbol(NIL);
-	set_binding(symbol(TRACE), zero); // start with trace disabled
-	while (1) {
-		n = scan(s);
-		p1 = pop();
-		check_stack();
-		if (n == 0)
-			break;
-		// if debug mode then print the source text
-		if (equaln(get_binding(symbol(TRACE)), 1)) {
-			for (i = 0; i < n; i++)
-				if (s[i] != '\r')
-					printchar(s[i]);
-			if (s[n - 1] != '\n') // n is not zero, see above
-				printchar('\n');
-		}
-		s += n;
-		trigmode = 0;
-		if (equaln(get_binding(symbol(AUTOEXPAND)), 0))
-			expanding = 0;
-		else
-			expanding = 1;
-		push(p1);
-		eval_and_print_result(1);
-		check_stack();
+}
+
+char *
+scan_input(char *s)
+{
+	trace1 = s;
+	s = scan(s);
+	if (s) {
+		trace2 = s;
+		trace_input();
 	}
+	return s;
 }
 
 void
-check_stack(void)
+eval_and_print_result(void)
 {
-	if (tos != 0)
-		stop("stack error");
-	if (frame != stack + TOS)
-		stop("frame error");
-}
-
-// cannot reference symbols yet
-
-void
-echo_input(char *s)
-{
-	term_flag = BLUE;
-	printstr(s);
-	printstr("\n");
-	term_flag = BLACK;
-}
-
-void
-check_esc_flag(void)
-{
-	if (esc_flag)
-		stop(NULL);
+	save();
+	p1 = pop();
+	push(p1);
+	eval();
+	p2 = pop();
+	push(p1);
+	push(p2);
+	print_result();
+	if (p2 != symbol(NIL))
+		binding[LAST] = p2;
+	restore();
 }
 
 void
 stop(char *s)
 {
-	if (draw_flag == 2)
+	if (drawing > 1)
 		longjmp(draw_stop_return, 1);
-	else {
-		term_flag = RED;
+	if (s) {
+		print_input_line();
+		sprintf(tbuf, "Stop: %s\n", s);
+		printbuf(tbuf, RED);
+	}
+	longjmp(stop_return, 1);
+}
+
+void
+eval_run(void)
+{
+	push(cadr(p1));
+	eval();
+	p1 = pop();
+	if (!isstr(p1))
+		stop("run: file name expected");
+	run_file(p1->u.str);
+	push_symbol(NIL);
+}
+
+void
+run_file(char *filename)
+{
+	int fd, n;
+	char *buf, *s, *t1, *t2;
+	fd = open(filename, O_RDONLY, 0);
+	if (fd == -1)
+		stop("run: cannot open file");
+	// get file size
+	n = (int) lseek(fd, 0, SEEK_END);
+	if (n < 0) {
+		close(fd);
+		stop("run: lseek error");
+	}
+	lseek(fd, 0, SEEK_SET);
+	buf = malloc(n + 1);
+	if (buf == NULL) {
+		close(fd);
+		malloc_kaput();
+	}
+	p1 = alloc(); // do this so gc can free the buf in case of stop
+	p1->k = STR;
+	p1->u.str = buf;
+	string_count++;
+	push(p1); // popped below
+	if (read(fd, buf, n) != n) {
+		close(fd);
+		stop("run: read error");
+	}
+	close(fd);
+	buf[n] = 0;
+	s = buf;
+	t1 = trace1;
+	t2 = trace2;
+	for (;;) {
+		s = scan_input(s);
 		if (s == NULL)
-			printstr("Stop\n");
-		else {
-			printstr("Stop: ");
-			printstr(s);
-			printstr("\n");
+			break; // end of input
+		eval_and_print_result();
+	}
+	trace1 = t1;
+	trace2 = t2;
+	pop(); // pop file buffer
+}
+
+void
+trace_input(void)
+{
+	char c, *s;
+	if (iszero(binding[TRACE]))
+		return;
+	c = 0;
+	s = trace1;
+	outbuf_index = 0;
+	while (*s && s < trace2) {
+		c = *s++;
+		print_char(c);
+	}
+	if (c != '\n')
+		print_char('\n');
+	print_char('\0');
+	printbuf(outbuf, BLUE);
+}
+
+// suppress blank lines
+
+void
+print_input_line(void)
+{
+	char c, *s;
+	c = '\n';
+	s = trace1;
+	outbuf_index = 0;
+	while (*s && s < trace2) {
+		if (*s == '\n' && c == '\n') {
+			s++;
+			continue;
 		}
-		term_flag = BLACK;
-		longjmp(stop_return, 1);
+		c = *s++;
+		print_char(c);
+	}
+	if (c != '\n')
+		print_char('\n');
+	print_char('\0');
+	printbuf(outbuf, RED);
+}
+
+void
+print_scan_line(char *s)
+{
+	trace2 = s;
+	print_input_line();
+}
+
+void
+eval_status(void)
+{
+	outbuf_index = 0;
+	sprintf(tbuf, "block_count %d\n", block_count);
+	print_str(tbuf);
+	sprintf(tbuf, "free_count %d\n", free_count);
+	print_str(tbuf);
+	sprintf(tbuf, "gc_count %d\n", gc_count);
+	print_str(tbuf);
+	sprintf(tbuf, "bignum_count %d\n", bignum_count);
+	print_str(tbuf);
+	sprintf(tbuf, "ksym_count %d\n", ksym_count);
+	print_str(tbuf);
+	sprintf(tbuf, "usym_count %d\n", usym_count);
+	print_str(tbuf);
+	sprintf(tbuf, "string_count %d\n", string_count);
+	print_str(tbuf);
+	sprintf(tbuf, "tensor_count %d\n", tensor_count);
+	print_str(tbuf);
+	sprintf(tbuf, "max_stack %d (%d%%)\n", max_stack, 100 * max_stack / STACKSIZE);
+	print_str(tbuf);
+	sprintf(tbuf, "max_frame %d (%d%%)\n", max_frame, 100 * max_frame / FRAMESIZE);
+	print_str(tbuf);
+	print_char('\0');
+	printbuf(outbuf, BLACK);
+	push_symbol(NIL);
+}
+
+char *init_script[] = {
+	"e=exp(1)",
+	"i=sqrt(-1)",
+	"trange=(-pi,pi)",
+	"xrange=(-10,10)",
+	"yrange=(-10,10)",
+	"cross(u,v)=dot(u,(((0,0,0),(0,0,-1),(0,1,0)),((0,0,1),(0,0,0),(-1,0,0)),((0,-1,0),(1,0,0),(0,0,0))),v)",
+	"curl(u)=(d(u[3],y)-d(u[2],z),d(u[1],z)-d(u[3],x),d(u[2],x)-d(u[1],y))",
+	"div(u)=d(u[1],x)+d(u[2],y)+d(u[3],z)",
+	"ln(x)=log(x)",
+	"last=0",
+	"tty=0",
+	NULL,
+};
+
+void
+run_init_script(void)
+{
+	char **s = init_script;
+	while (*s) {
+		scan(*s++);
+		eval();
+		pop();
 	}
 }
 
-// This scanner uses the recursive descent method.
-//
+void
+malloc_kaput(void)
+{
+	fprintf(stderr, "malloc kaput\n");
+	exit(1);
+}
+
 // The char pointers token_str and scan_str are pointers to the input string as
 // in the following example.
 //
@@ -17589,135 +17962,102 @@ stop(char *s)
 #define T_GTEQ 1008
 #define T_LTEQ 1009
 #define T_EQ 1010
+#define T_END 1011
 
-int token, newline_flag, meta_mode;
-char *input_str, *scan_str, *token_str, *token_buf;
+int token;
+int scan_mode;
+int scan_level;
 
-// Returns number of chars scanned and expr on stack.
+char *scan_str;
+char *token_str;
+char *token_buf;
 
-// Returns zero when nothing left to scan.
-
-int
+char *
 scan(char *s)
 {
-	meta_mode = 0;
-	expanding++;
-	input_str = s;
-	scan_str = s;
-	get_next_token();
-	if (token == 0) {
-		push(symbol(NIL));
-		expanding--;
-		return 0;
-	}
-	scan_stmt();
-	expanding--;
-	return (int) (token_str - input_str);
+	scan_mode = 0;
+	return scan_nib(s);
 }
 
-int
-scan_meta(char *s)
+char *
+scan1(char *s)
 {
-	meta_mode = 1;
-	expanding++;
-	input_str = s;
+	scan_mode = 1; // mode for table of integrals
+	return scan_nib(s);
+}
+
+char *
+scan_nib(char *s)
+{
 	scan_str = s;
-	get_next_token();
-	if (token == 0) {
-		push(symbol(NIL));
-		expanding--;
-		return 0;
-	}
+	scan_level = 0;
+	get_token_skip_newlines();
+	if (token == T_END)
+		return NULL;
 	scan_stmt();
-	expanding--;
-	return (int) (token_str - input_str);
+	if (token != T_NEWLINE && token != T_END)
+		scan_error("expected newline");
+	return scan_str;
 }
 
 void
 scan_stmt(void)
 {
-	scan_relation();
+	scan_comparison();
 	if (token == '=') {
-		get_next_token();
+		get_token_skip_newlines(); // get token after '='
 		push_symbol(SETQ);
 		swap();
-		scan_relation();
+		scan_comparison();
 		list(3);
 	}
 }
 
 void
-scan_relation(void)
+scan_comparison(void)
 {
 	scan_expression();
 	switch (token) {
 	case T_EQ:
-		push_symbol(TESTEQ);
-		swap();
-		get_next_token();
-		scan_expression();
-		list(3);
+		push_symbol(TESTEQ); // ==
 		break;
 	case T_LTEQ:
 		push_symbol(TESTLE);
-		swap();
-		get_next_token();
-		scan_expression();
-		list(3);
 		break;
 	case T_GTEQ:
 		push_symbol(TESTGE);
-		swap();
-		get_next_token();
-		scan_expression();
-		list(3);
 		break;
 	case '<':
 		push_symbol(TESTLT);
-		swap();
-		get_next_token();
-		scan_expression();
-		list(3);
 		break;
 	case '>':
 		push_symbol(TESTGT);
-		swap();
-		get_next_token();
-		scan_expression();
-		list(3);
 		break;
 	default:
-		break;
+		return;
 	}
+	swap();
+	get_token_skip_newlines(); // get token after rel op
+	scan_expression();
+	list(3);
 }
 
 void
 scan_expression(void)
 {
-	int h = tos;
-	switch (token) {
-	case '+':
-		get_next_token();
+	int h = tos, t;
+	t = token;
+	if (token == '+' || token == '-')
+		get_token_skip_newlines();
+	scan_term();
+	if (t == '-')
+		static_negate();
+	while (token == '+' || token == '-') {
+		t = token;
+		get_token_skip_newlines(); // get token after '+' or '-'
 		scan_term();
-		break;
-	case '-':
-		get_next_token();
-		scan_term();
-		negate();
-		break;
-	default:
-		scan_term();
-		break;
-	}
-	while (newline_flag == 0 && (token == '+' || token == '-')) {
-		if (token == '+') {
-			get_next_token();
-			scan_term();
-		} else {
-			get_next_token();
-			scan_term();
-			negate();
-		}
+		if (t == '-')
+			static_negate();
 	}
 	if (tos - h > 1) {
 		list(tos - h);
@@ -17728,23 +18068,18 @@ scan_expression(void)
 }
 
 int
-is_factor(void)
+another_factor_pending(void)
 {
 	switch (token) {
 	case '*':
 	case '/':
-		return 1;
 	case '(':
 	case T_SYMBOL:
 	case T_FUNCTION:
 	case T_INTEGER:
 	case T_DOUBLE:
 	case T_STRING:
-		if (newline_flag) {	// implicit mul can't cross line
-			scan_str = token_str;	// better error display
-			return 0;
-		} else
-			return 1;
+		return 1;
 	default:
 		break;
 	}
@@ -17754,31 +18089,17 @@ is_factor(void)
 void
 scan_term(void)
 {
-	int h = tos;
+	int h = tos, t;
 	scan_power();
-	// discard integer 1
-	if (tos > h && isrational(stack[tos - 1]) && equaln(stack[tos - 1], 1))
-		pop();
-	while (is_factor()) {
-		if (token == '*') {
-			get_next_token();
-			scan_power();
-		} else if (token == '/') {
-			get_next_token();
-			scan_power();
-			inverse();
-		} else
-			scan_power();
-		// fold constants
-		if (tos > h + 1 && isnum(stack[tos - 2]) && isnum(stack[tos - 1]))
-			multiply();
-		// discard integer 1
-		if (tos > h && isrational(stack[tos - 1]) && equaln(stack[tos - 1], 1))
-			pop();
+	while (another_factor_pending()) {
+		t = token;
+		if (token == '*' || token == '/')
+			get_token_skip_newlines();
+		scan_power();
+		if (t == '/')
+			static_reciprocate();
 	}
-	if (h == tos)
-		push_integer(1);
-	else if (tos - h > 1) {
+	if (tos - h > 1) {
 		list(tos - h);
 		push_symbol(MULTIPLY);
 		swap();
@@ -17791,7 +18112,7 @@ scan_power(void)
 {
 	scan_factor();
 	if (token == '^') {
-		get_next_token();
+		get_token_skip_newlines();
 		push_symbol(POWER);
 		swap();
 		scan_power();
@@ -17802,41 +18123,51 @@ scan_power(void)
 void
 scan_factor(void)
 {
-	int h;
-	h = tos;
-	if (token == '(')
+	int h = tos;
+	switch (token) {
+	case '(':
 		scan_subexpr();
-	else if (token == T_SYMBOL)
+		break;
+	case T_SYMBOL:
 		scan_symbol();
-	else if (token == T_FUNCTION)
+		break;
+	case T_FUNCTION:
 		scan_function_call();
-	else if (token == T_INTEGER) {
+		break;
+	case T_INTEGER:
 		bignum_scan_integer(token_buf);
-		get_next_token();
-	} else if (token == T_DOUBLE) {
-		bignum_scan_float(token_buf);
-		get_next_token();
-	} else if (token == T_STRING)
+		get_token();
+		break;
+	case T_DOUBLE:
+		push_double(atof(token_buf));
+		get_token();
+		break;
+	case T_STRING:
 		scan_string();
-	else
-		error("syntax error");
+		break;
+	default:
+		scan_error("expected operand");
+		break;
+	}
 	// index
 	if (token == '[') {
-		get_next_token();
+		scan_level++;
+		get_token(); // get token after '['
 		push_symbol(INDEX);
 		swap();
 		scan_expression();
 		while (token == ',') {
-			get_next_token();
+			get_token(); // get token after ','
 			scan_expression();
 		}
 		if (token != ']')
-			error("] expected");
-		get_next_token();
+			scan_error("expected ']'");
+		scan_level--;
+		get_token(); // get token after ']'
 		list(tos - h);
 	}
 	while (token == '!') {
-		get_next_token();
+		get_token(); // get token after '!'
 		push_symbol(FACTORIAL);
 		swap();
 		list(2);
@@ -17846,153 +18177,120 @@ scan_factor(void)
 void
 scan_symbol(void)
 {
-	if (token != T_SYMBOL)
-		error("symbol expected");
-	if (meta_mode && strlen(token_buf) == 1)
+	if (scan_mode && strlen(token_buf) == 1)
 		switch (token_buf[0]) {
 		case 'a':
-			push(symbol(METAA));
+			push_symbol(METAA);
 			break;
 		case 'b':
-			push(symbol(METAB));
+			push_symbol(METAB);
 			break;
 		case 'x':
-			push(symbol(METAX));
+			push_symbol(METAX);
 			break;
 		default:
-			push(usr_symbol(token_buf));
+			push(lookup(token_buf));
 			break;
 		}
 	else
-		push(usr_symbol(token_buf));
-	get_next_token();
+		push(lookup(token_buf));
+	get_token();
 }
 
 void
 scan_string(void)
 {
-	new_string(token_buf);
-	get_next_token();
+	push_string(token_buf);
+	get_token();
 }
 
 void
 scan_function_call(void)
 {
-	int n = 1;
-	U *p;
-	p = usr_symbol(token_buf);
-	push(p);
-	get_next_token();	// function name
-	get_next_token();	// left paren
-	if (token != ')') {
+	int h = tos;
+	scan_level++;
+	push(lookup(token_buf)); // push function name
+	get_token(); // get token after function name
+	get_token(); // get token after '('
+	if (token == ')') {
+		scan_level--;
+		get_token(); // get token after ')'
+		list(1); // function call with no args
+		return;
+	}
+	scan_stmt();
+	while (token == ',') {
+		get_token(); // get token after ','
 		scan_stmt();
-		n++;
-		while (token == ',') {
-			get_next_token();
-			scan_stmt();
-			n++;
-		}
 	}
 	if (token != ')')
-		error(") expected");
-	get_next_token();
-	list(n);
+		scan_error("expected ')'");
+	scan_level--;
+	get_token(); // get token after ')'
+	list(tos - h);
 }
-
-// scan subexpression
 
 void
 scan_subexpr(void)
 {
-	int n;
-	if (token != '(')
-		error("( expected");
-	get_next_token();
+	int h = tos;
+	scan_level++;
+	get_token(); // get token after '('
 	scan_stmt();
-	if (token == ',') {
-		n = 1;
-		while (token == ',') {
-			get_next_token();
-			scan_stmt();
-			n++;
-		}
-		build_tensor(n);
+	while (token == ',') {
+		get_token(); // get token after ','
+		scan_stmt();
 	}
 	if (token != ')')
-		error(") expected");
-	get_next_token();
+		scan_error("expected ')'");
+	scan_level--;
+	get_token(); // get token after ')'
+	if (tos - h > 1)
+		build_tensor(h);
 }
 
 void
-error(char *errmsg)
+get_token_skip_newlines(void)
 {
-	printchar('\n');
-	// try not to put question mark on orphan line
-	while (input_str != scan_str) {
-		if ((*input_str == '\n' || *input_str == '\r') && input_str + 1 == scan_str)
-			break;
-		printchar(*input_str++);
-	}
-	printstr(" ??? ");
-	while (*input_str && (*input_str != '\n' && *input_str != '\r'))
-		printchar(*input_str++);
-	printchar('\n');
-	stop(errmsg);
-}
-
-// There are n expressions on the stack, possibly tensors.
-//
-// This function assembles the stack expressions into a single tensor.
-//
-// For example, at the top level of the expression ((a,b),(c,d)), the vectors
-// (a,b) and (c,d) would be on the stack.
-
-void
-build_tensor(int n)
-{
-	// int i, j, k, ndim, nelem;
-	int i;
-	U **s;
-	save();
-	s = stack + tos - n;
-	p2 = alloc_tensor(n);
-	p2->u.tensor->ndim = 1;
-	p2->u.tensor->dim[0] = n;
-	for (i = 0; i < n; i++)
-		p2->u.tensor->elem[i] = s[i];
-	tos -= n;
-	push(p2);
-	restore();
-}
-
-void
-get_next_token(void)
-{
-	newline_flag = 0;
-	while (1) {
-		get_token();
-		if (token != T_NEWLINE)
-			break;
-		newline_flag = 1;
-	}
+	scan_level++;
+	get_token();
+	scan_level--;
 }
 
 void
 get_token(void)
 {
+	get_token_nib();
+	if (scan_level)
+		while (token == T_NEWLINE)
+			get_token_nib();
+}
+
+void
+get_token_nib(void)
+{
 	// skip spaces
-	while (isspace(*scan_str)) {
-		if (*scan_str == '\n' || *scan_str == '\r') {
-			token = T_NEWLINE;
-			scan_str++;
-			return;
-		}
+	while (isspace(*scan_str) && *scan_str != '\n')
 		scan_str++;
-	}
 	token_str = scan_str;
 	// end of string?
-	if (*scan_str == 0) {
-		token = 0;
+	if (*scan_str == '\0') {
+		token = T_END;
+		return;
+	}
+	// newline?
+	if (*scan_str == '\n') {
+		scan_str++;
+		token = T_NEWLINE;
+		return;
+	}
+	// comment?
+	if (*scan_str == '#' || (scan_str[0] == '-' && scan_str[1] == '-')) {
+		while (*scan_str && *scan_str != '\n')
+			scan_str++;
+		if (*scan_str)
+			scan_str++;
+		token = T_NEWLINE;
 		return;
 	}
 	// number?
@@ -18003,11 +18301,8 @@ get_token(void)
 			scan_str++;
 			while (isdigit(*scan_str))
 				scan_str++;
-			if (*scan_str == 'e' && (scan_str[1] == '+' || scan_str[1] == '-' || isdigit(scan_str[1]))) {
-				scan_str += 2;
-				while (isdigit(*scan_str))
-					scan_str++;
-			}
+			if (token_str + 1 == scan_str)
+				scan_error("expected decimal digit"); // only a decimal point
 			token = T_DOUBLE;
 		} else
 			token = T_INTEGER;
@@ -18029,22 +18324,15 @@ get_token(void)
 	if (*scan_str == '"') {
 		scan_str++;
 		while (*scan_str != '"') {
-			if (*scan_str == 0 || *scan_str == '\n' || *scan_str == '\r')
-				error("runaway string");
+			if (*scan_str == '\0' || *scan_str == '\n') {
+				token_str = scan_str;
+				scan_error("runaway string");
+			}
 			scan_str++;
 		}
 		scan_str++;
 		token = T_STRING;
-		update_token_buf(token_str + 1, scan_str - 1);
-		return;
-	}
-	// comment?
-	if (*scan_str == '#' || (*scan_str == '-' && scan_str[1] == '-')) {
-		while (*scan_str && *scan_str != '\n' && *scan_str != '\r')
-			scan_str++;
-		if (*scan_str)
-			scan_str++;
-		token = T_NEWLINE;
+		update_token_buf(token_str + 1, scan_str - 1); // don't include quote chars
 		return;
 	}
 	// relational operator?
@@ -18075,27 +18363,279 @@ update_token_buf(char *a, char *b)
 		free(token_buf);
 	n = (int) (b - a);
 	token_buf = (char *) malloc(n + 1);
-	if (token_buf == 0)
-		stop("malloc failure");
+	if (token_buf == NULL)
+		malloc_kaput();
 	strncpy(token_buf, a, n);
-	token_buf[n] = 0;
+	token_buf[n] = '\0';
 }
 
-//	Notes:
+void
+scan_error(char *errmsg)
+{
+	print_scan_line(scan_str);
+	outbuf_index = 0;
+	print_str("Stop: Syntax error, ");
+	print_str(errmsg);
+	if (token_str < scan_str) {
+		print_str(" instead of '");
+		while (*token_str && token_str < scan_str)
+			print_char(*token_str++);
+		print_str("'");
+	}
+	print_char('\n');
+	print_char('\0');
+	printbuf(outbuf, RED);
+	stop(NULL);
+}
+
+// There are n expressions on the stack, possibly tensors.
+// This function assembles the stack expressions into a single tensor.
+// For example, at the top level of the expression ((a,b),(c,d)), the vectors
+// (a,b) and (c,d) would be on the stack.
+
+void
+build_tensor(int h)
+{
+	int i, n = tos - h;
+	struct atom **s = stack + h;
+	save();
+	p2 = alloc_tensor(n);
+	p2->u.tensor->ndim = 1;
+	p2->u.tensor->dim[0] = n;
+	for (i = 0; i < n; i++)
+		p2->u.tensor->elem[i] = s[i];
+	tos = h;
+	push(p2);
+	restore();
+}
+
+void
+static_negate(void)
+{
+	save();
+	static_negate_nib();
+	restore();
+}
+
+void
+static_negate_nib(void)
+{
+	p1 = pop();
+	if (isnum(p1)) {
+		push(p1);
+		negate();
+		return;
+	}
+	if (car(p1) == symbol(MULTIPLY)) {
+		push(car(p1));
+		if (isnum(cadr(p1))) {
+			push(cadr(p1));
+			negate();
+			push(cddr(p1));
+		} else {
+			push_integer(-1);
+			push(cdr(p1));
+		}
+		cons();
+		cons();
+		return;
+	}
+	push_symbol(MULTIPLY);
+	push_integer(-1);
+	push(p1);
+	list(3);
+}
+
+void
+static_reciprocate(void)
+{
+	save();
+	static_reciprocate_nib();
+	restore();
+}
+
+void
+static_reciprocate_nib(void)
+{
+	p2 = pop();
+	p1 = pop();
+	push(p1);
+	// save divide by zero error for runtime
+	if (iszero(p2)) {
+		push_symbol(POWER);
+		push(p2);
+		push_integer(-1);
+		list(3);
+		return;
+	}
+	if (isnum(p1) && isnum(p2)) {
+		push(p2);
+		divide();
+		return;
+	}
+	if (isnum(p2)) {
+		push(p2);
+		reciprocate();
+		return;
+	}
+	push_symbol(POWER);
+	push(p2);
+	push_integer(-1);
+	list(3);
+}
+
+void
+eval_setq(void)
+{
+	if (caadr(p1) == symbol(INDEX))
+		setq_indexed();
+	else if (iscons(cadr(p1)))
+		setq_userfunc();
+	else {
+		if (!issymbol(cadr(p1)))
+			stop("assignment: symbol expected");
+		push(caddr(p1));
+		eval();
+		p2 = pop();
+		set_binding(cadr(p1), p2);
+	}
+	push_symbol(NIL);
+}
+
+//	Example: a[1] = b
 //
-//	Formerly add() and multiply() were used to construct expressions but
-//	this preevaluation caused problems.
+//	p1----->cons--->cons------------------->cons
+//		|	|			|
+//		setq	cons--->cons--->cons	b
+//			|	|	|
+//			index	a	1
 //
-//	For example, suppose A has the floating point value inf.
+//	caadr(p1) = index
+//	cadadr(p1) = a
+//	caddr(p1) = b
+
+#undef S
+#undef LVAL
+#undef RVAL
+
+#define S p3
+#define LVAL p4
+#define RVAL p5
+
+void
+setq_indexed(void)
+{
+	int h;
+	S = cadadr(p1);
+	if (!issymbol(S))
+		stop("symbol expected");
+	push(S);
+	eval();
+	LVAL = pop();
+	push(caddr(p1));
+	eval();
+	RVAL = pop();
+	// eval indices
+	p1 = cddadr(p1);
+	h = tos;
+	while (iscons(p1)) {
+		push(car(p1));
+		eval();
+		p1 = cdr(p1);
+	}
+	set_component(h);
+	set_binding(S, LVAL);
+}
+
+void
+set_component(int h)
+{
+	save();
+	set_component_nib(h);
+	restore();
+}
+
+void
+set_component_nib(int h)
+{
+	int i, k, m, n, t;
+	if (!istensor(LVAL))
+		stop("index error");
+	// n is the number of indices
+	n = tos - h;
+	if (n < 1 || n > LVAL->u.tensor->ndim)
+		stop("index error");
+	// k is the combined index
+	k = 0;
+	for (i = 0; i < n; i++) {
+		push(stack[h + i]);
+		t = pop_integer();
+		if (t < 1 || t > LVAL->u.tensor->dim[i])
+			stop("index error");
+		k = k * LVAL->u.tensor->dim[i] + t - 1;
+	}
+	tos = h; // pop all
+	if (istensor(RVAL)) {
+		m = RVAL->u.tensor->ndim;
+		if (n + m != LVAL->u.tensor->ndim)
+			stop("index error");
+		for (i = 0; i < m; i++)
+			if (LVAL->u.tensor->dim[n + i] != RVAL->u.tensor->dim[i])
+				stop("index error");
+		m = RVAL->u.tensor->nelem;
+		for (i = 0; i < m; i++)
+			LVAL->u.tensor->elem[m * k + i] = RVAL->u.tensor->elem[i];
+	} else {
+		if (n != LVAL->u.tensor->ndim)
+			stop("index error");
+		LVAL->u.tensor->elem[k] = RVAL;
+	}
+}
+
+// Example:
 //
-//	Before, the expression A/A resulted in 1 because the scanner would
-//	divide the symbols.
+//      f(x,y)=x^y
 //
-//	After removing add() and multiply(), A/A results in nan which is the
-//	correct result.
+// For this definition, p1 points to the following structure.
 //
-//	The functions negate() and inverse() are used but they do not cause
-//	problems with preevaluation of symbols.
+//     p1
+//      |
+//   ___v__    ______                        ______
+//  |CONS  |->|CONS  |--------------------->|CONS  |
+//  |______|  |______|                      |______|
+//      |         |                             |
+//   ___v__    ___v__    ______    ______    ___v__    ______    ______
+//  |SETQ  |  |CONS  |->|CONS  |->|CONS  |  |CONS  |->|CONS  |->|CONS  |
+//  |______|  |______|  |______|  |______|  |______|  |______|  |______|
+//                |         |         |         |         |         |
+//             ___v__    ___v__    ___v__    ___v__    ___v__    ___v__
+//            |SYM f |  |SYM x |  |SYM y |  |POWER |  |SYM x |  |SYM y |
+//            |______|  |______|  |______|  |______|  |______|  |______|
+//
+// We have
+//
+//	caadr(p1) points to f
+//	cdadr(p1) points to the list (x y)
+//	caddr(p1) points to (power x y)
+
+#undef F
+#undef A
+#undef B
+
+#define F p3 // F points to the function name
+#define A p4 // A points to the argument list
+#define B p5 // B points to the function body
+
+void
+setq_userfunc(void)
+{
+	F = caadr(p1);
+	A = cdadr(p1);
+	B = caddr(p1);
+	if (!issymbol(F))
+		stop("function name?");
+	set_binding_and_arglist(F, B, A);
+}
 
 void
 eval_sgn(void)
@@ -18123,246 +18663,6 @@ sgn(void)
 	restore();
 }
 
-// Simplify factorials
-//
-// The following script
-//
-//	F(n,k) = k binomial(n,k)
-//	(F(n,k) + F(n,k-1)) / F(n+1,k)
-//
-// generates
-//
-//        k! n!             n! (1 - k + n)!              k! n!
-// -------------------- + -------------------- - ----------------------
-//  (-1 + k)! (1 + n)!     (1 + n)! (-k + n)!     k (-1 + k)! (1 + n)!
-//
-// Simplify each term to get
-//
-//    k       1 - k + n       1
-// ------- + ----------- - -------
-//  1 + n       1 + n       1 + n
-//
-// Then simplify the sum to get
-//
-//    n
-// -------
-//  1 + n
-
-// simplify factorials term-by-term
-
-void
-eval_simfac(void)
-{
-	push(cadr(p1));
-	eval();
-	simfac();
-}
-
-#if 1
-
-void
-simfac(void)
-{
-	int h;
-	save();
-	p1 = pop();
-	if (car(p1) == symbol(ADD)) {
-		h = tos;
-		p1 = cdr(p1);
-		while (p1 != symbol(NIL)) {
-			push(car(p1));
-			simfac_term();
-			p1 = cdr(p1);
-		}
-		add_all(tos - h);
-	} else {
-		push(p1);
-		simfac_term();
-	}
-	restore();
-}
-
-#else
-
-void
-simfac(void)
-{
-	int h;
-	save();
-	p1 = pop();
-	if (car(p1) == symbol(ADD)) {
-		h = tos;
-		p1 = cdr(p1);
-		while (p1 != symbol(NIL)) {
-			push(car(p1));
-			simfac_term();
-			p1 = cdr(p1);
-		}
-		addk(tos - h);
-		p1 = pop();
-		if (find(p1, symbol(FACTORIAL))) {
-			push(p1);
-			if (car(p1) == symbol(ADD)) {
-				Condense();
-				simfac_term();
-			}
-		}
-	} else {
-		push(p1);
-		simfac_term();
-	}
-	restore();
-}
-
-#endif
-
-void
-simfac_term(void)
-{
-	int h;
-	save();
-	p1 = pop();
-	// if not a product of factors then done
-	if (car(p1) != symbol(MULTIPLY)) {
-		push(p1);
-		restore();
-		return;
-	}
-	// push all factors
-	h = tos;
-	p1 = cdr(p1);
-	while (p1 != symbol(NIL)) {
-		push(car(p1));
-		p1 = cdr(p1);
-	}
-	// keep trying until no more to do
-	while (yysimfac(h))
-		;
-	multiply_all_noexpand(tos - h);
-	restore();
-}
-
-// try all pairs of factors
-
-int
-yysimfac(int h)
-{
-	int i, j;
-	for (i = h; i < tos; i++) {
-		p1 = stack[i];
-		for (j = h; j < tos; j++) {
-			if (i == j)
-				continue;
-			p2 = stack[j];
-			//	n! / n		->	(n - 1)!
-			if (car(p1) == symbol(FACTORIAL)
-			&& car(p2) == symbol(POWER)
-			&& isminusone(caddr(p2))
-			&& equal(cadr(p1), cadr(p2))) {
-				push(cadr(p1));
-				push(one);
-				subtract();
-				factorial();
-				stack[i] = pop();
-				stack[j] = one;
-				return 1;
-			}
-			//	n / n!		->	1 / (n - 1)!
-			if (car(p2) == symbol(POWER)
-			&& isminusone(caddr(p2))
-			&& caadr(p2) == symbol(FACTORIAL)
-			&& equal(p1, cadadr(p2))) {
-				push(p1);
-				push_integer(-1);
-				add();
-				factorial();
-				reciprocate();
-				stack[i] = pop();
-				stack[j] = one;
-				return 1;
-			}
-			//	(n + 1) n!	->	(n + 1)!
-			if (car(p2) == symbol(FACTORIAL)) {
-				push(p1);
-				push(cadr(p2));
-				subtract();
-				p3 = pop();
-				if (isplusone(p3)) {
-					push(p1);
-					factorial();
-					stack[i] = pop();
-					stack[j] = one;
-					return 1;
-				}
-			}
-			//	1 / ((n + 1) n!)	->	1 / (n + 1)!
-			if (car(p1) == symbol(POWER)
-			&& isminusone(caddr(p1))
-			&& car(p2) == symbol(POWER)
-			&& isminusone(caddr(p2))
-			&& caadr(p2) == symbol(FACTORIAL)) {
-				push(cadr(p1));
-				push(cadr(cadr(p2)));
-				subtract();
-				p3 = pop();
-				if (isplusone(p3)) {
-					push(cadr(p1));
-					factorial();
-					reciprocate();
-					stack[i] = pop();
-					stack[j] = one;
-					return 1;
-				}
-			}
-			//	(n + 1)! / n!	->	n + 1
-			//	n! / (n + 1)!	->	1 / (n + 1)
-			if (car(p1) == symbol(FACTORIAL)
-			&& car(p2) == symbol(POWER)
-			&& isminusone(caddr(p2))
-			&& caadr(p2) == symbol(FACTORIAL)) {
-				push(cadr(p1));
-				push(cadr(cadr(p2)));
-				subtract();
-				p3 = pop();
-				if (isplusone(p3)) {
-					stack[i] = cadr(p1);
-					stack[j] = one;
-					return 1;
-				}
-				if (isminusone(p3)) {
-					push(cadr(cadr(p2)));
-					reciprocate();
-					stack[i] = pop();
-					stack[j] = one;
-					return 1;
-				}
-				if (equaln(p3, 2)) {
-					stack[i] = cadr(p1);
-					push(cadr(p1));
-					push_integer(-1);
-					add();
-					stack[j] = pop();
-					return 1;
-				}
-				if (equaln(p3, -2)) {
-					push(cadr(cadr(p2)));
-					reciprocate();
-					stack[i] = pop();
-					push(cadr(cadr(p2)));
-					push_integer(-1);
-					add();
-					reciprocate();
-					stack[j] = pop();
-					return 1;
-				}
-			}
-		}
-	}
-	return 0;
-}
-
-extern int trigmode;
-
 void
 eval_simplify(void)
 {
@@ -18375,195 +18675,151 @@ void
 simplify(void)
 {
 	save();
-	simplify_main();
+	simplify_nib();
 	restore();
 }
 
 void
-simplify_main(void)
+simplify_nib(void)
 {
+	int i, h, n;
 	p1 = pop();
 	if (istensor(p1)) {
-		simplify_tensor();
+		push(p1);
+		copy_tensor();
+		p1 = pop();
+		n = p1->u.tensor->nelem;
+		for (i = 0; i < n; i++) {
+			push(p1->u.tensor->elem[i]);
+			simplify();
+			p1->u.tensor->elem[i] = pop();
+		}
+		push(p1);
 		return;
 	}
-	if (find(p1, symbol(FACTORIAL))) {
+	if (car(p1) == symbol(ADD)) {
+		// simplify each term
+		h = tos;
+		p1 = cdr(p1);
+		while (iscons(p1)) {
+			push(car(p1));
+			simplify_expr();
+			p1 = cdr(p1);
+		}
+		add_terms(tos - h);
+		p1 = pop();
+		if (car(p1) == symbol(ADD)) {
+			push(p1);
+			simplify_expr(); // try rationalizing
+			p1 = pop();
+		}
 		push(p1);
-		simfac();
-		p2 = pop();
+		simplify_trig();
+		return;
+	}
+	// p1 is a term (factor or product of factors)
+	push(p1);
+	simplify_expr();
+	simplify_trig();
+}
+
+void
+simplify_expr(void)
+{
+	save();
+	simplify_expr_nib();
+	restore();
+}
+
+#undef NUM
+#undef DEN
+#undef R
+#undef T
+
+#define NUM p2
+#define DEN p3
+#define R p4
+#define T p5
+
+void
+simplify_expr_nib(void)
+{
+	p1 = pop();
+	if (car(p1) == symbol(ADD)) {
 		push(p1);
 		rationalize();
-		simfac();
-		p3 = pop();
-		if (count(p2) < count(p3))
-			p1 = p2;
-		else
-			p1 = p3;
-	}
-	f1();
-	f2();
-	f3();
-	f4();
-	f5();
-	f9();
-	push(p1);
-}
-
-void
-simplify_tensor(void)
-{
-	int i;
-	p2 = alloc_tensor(p1->u.tensor->nelem);
-	p2->u.tensor->ndim = p1->u.tensor->ndim;
-	for (i = 0; i < p1->u.tensor->ndim; i++)
-		p2->u.tensor->dim[i] = p1->u.tensor->dim[i];
-	for (i = 0; i < p1->u.tensor->nelem; i++) {
-		push(p1->u.tensor->elem[i]);
-		simplify();
-		p2->u.tensor->elem[i] = pop();
-	}
-	if (iszero(p2))
-		p2 = zero; // null tensor becomes scalar zero
-	push(p2);
-}
-
-int
-count(U *p)
-{
-	int n;
-	if (iscons(p)) {
-		n = 0;
-		while (iscons(p)) {
-			n += count(car(p)) + 1;
-			p = cdr(p);
+		T = pop();
+		if (car(T) == symbol(ADD)) {
+			push(p1); // no change
+			return;
 		}
 	} else
-		n = 1;
-	return n;
-}
-
-// try rationalizing
-
-void
-f1(void)
-{
-	if (car(p1) != symbol(ADD))
+		T = p1;
+	push(T);
+	numerator();
+	NUM = pop();
+	push(T);
+	denominator();
+	eval(); // to expand denominator
+	DEN = pop();
+	// if DEN is a sum then rationalize it
+	if (car(DEN) == symbol(ADD)) {
+		push(DEN);
+		rationalize();
+		T = pop();
+		if (car(T) != symbol(ADD)) {
+			// update NUM
+			push(T);
+			denominator();
+			eval(); // to expand denominator
+			push(NUM);
+			multiply();
+			NUM = pop();
+			// update DEN
+			push(T);
+			numerator();
+			DEN = pop();
+		}
+	}
+	// are NUM and DEN congruent sums?
+	if (car(NUM) != symbol(ADD) || car(DEN) != symbol(ADD) || length(NUM) != length(DEN)) {
+		// no, but NUM over DEN might be simpler than p1
+		push(NUM);
+		push(DEN);
+		divide();
+		T = pop();
+		if (complexity(T) < complexity(p1))
+			p1 = T;
+		push(p1);
 		return;
+	}
+	push(cadr(NUM)); // push first term of numerator
+	push(cadr(DEN)); // push first term of denominator
+	divide();
+	R = pop(); // provisional ratio
+	push(R);
+	push(DEN);
+	multiply();
+	push(NUM);
+	subtract();
+	T = pop();
+	if (iszero(T))
+		p1 = R;
 	push(p1);
-	rationalize();
-	p2 = pop();
-	if (count(p2) < count(p1))
-		p1 = p2;
 }
-
-// try condensing
-
-void
-f2(void)
-{
-	if (car(p1) != symbol(ADD))
-		return;
-	push(p1);
-	Condense();
-	p2 = pop();
-	if (count(p2) <= count(p1))
-		p1 = p2;
-}
-
-// this simplifies forms like (A-B) / (B-A)
-
-void
-f3(void)
-{
-	push(p1);
-	rationalize();
-	negate();
-	rationalize();
-	negate();
-	rationalize();
-	p2 = pop();
-	if (count(p2) < count(p1))
-		p1 = p2;
-}
-
-// try expanding denominators
-
-void
-f4(void)
-{
-	if (iszero(p1))
-		return;
-	push(p1);
-	rationalize();
-	inverse();
-	rationalize();
-	inverse();
-	rationalize();
-	p2 = pop();
-	if (count(p2) < count(p1))
-		p1 = p2;
-}
-
-// simplifies trig forms
 
 void
 simplify_trig(void)
 {
-	save();
 	p1 = pop();
-	f5();
 	push(p1);
-	restore();
-}
-
-void
-f5(void)
-{
-	if (find(p1, symbol(SIN)) == 0 && find(p1, symbol(COS)) == 0)
-		return;
-	p2 = p1;
-	trigmode = 1;
-	push(p2);
-	eval();
-	p3 = pop();
-	trigmode = 2;
-	push(p2);
-	eval();
-	p4 = pop();
-	trigmode = 0;
-	if (count(p4) < count(p3) || nterms(p4) < nterms(p3))
-		p3 = p4;
-	if (count(p3) < count(p1) || nterms(p3) < nterms(p1))
-		p1 = p3;
-}
-
-// if it's a sum then try to simplify each term
-
-void
-f9(void)
-{
-	if (car(p1) != symbol(ADD))
-		return;
-	push_integer(0);
-	p2 = cdr(p1);
-	while (iscons(p2)) {
-		push(car(p2));
-		simplify();
-		add();
-		p2 = cdr(p2);
-	}
+	circexp();
+	rationalize();
+	eval(); // to normalize
 	p2 = pop();
-	if (count(p2) < count(p1))
+	if (complexity(p2) < complexity(p1))
 		p1 = p2;
-}
-
-int
-nterms(U *p)
-{
-	if (car(p) != symbol(ADD))
-		return 1;
-	else
-		return length(p) - 1;
+	push(p1);
 }
 
 void
@@ -18571,90 +18827,73 @@ eval_sin(void)
 {
 	push(cadr(p1));
 	eval();
-	sine();
+	ssin();
 }
 
 void
-sine(void)
+ssin(void)
 {
 	save();
-	p1 = pop();
-	if (car(p1) == symbol(ADD))
-		sine_of_angle_sum();
-	else
-		sine_of_angle();
+	ssin_nib();
 	restore();
 }
 
-// Use angle sum formula for special angles.
+#undef X
+#undef Y
 
-#undef A
-#undef B
-
-#define A p3
-#define B p4
+#define X p5
+#define Y p6
 
 void
-sine_of_angle_sum(void)
-{
-	p2 = cdr(p1);
-	while (iscons(p2)) {
-		B = car(p2);
-		if (isnpi(B)) {
-			push(p1);
-			push(B);
-			subtract();
-			A = pop();
-			push(A);
-			sine();
-			push(B);
-			cosine();
-			multiply();
-			push(A);
-			cosine();
-			push(B);
-			sine();
-			multiply();
-			add();
-			return;
-		}
-		p2 = cdr(p2);
-	}
-	sine_of_angle();
-}
-
-void
-sine_of_angle(void)
+ssin_nib(void)
 {
 	int n;
-	double d;
-	if (car(p1) == symbol(ARCSIN)) {
-		push(cadr(p1));
-		return;
-	}
+	p1 = pop();
 	if (isdouble(p1)) {
-		d = sin(p1->u.d);
-		if (fabs(d) < 1e-10)
-			d = 0.0;
-		push_double(d);
+		push_double(sin(p1->u.d));
 		return;
 	}
-	// sine function is antisymmetric, sin(-x) = -sin(x)
+	// sin(z) = -i/2 (exp(i z) - exp(-i z))
+	if (isdoublez(p1)) {
+		push_double(-0.5);
+		push(imaginaryunit);
+		multiply();
+		push(imaginaryunit);
+		push(p1);
+		multiply();
+		exponential();
+		push(imaginaryunit);
+		negate();
+		push(p1);
+		multiply();
+		exponential();
+		subtract();
+		multiply();
+		return;
+	}
+	// sin(-x) = -sin(x)
 	if (isnegative(p1)) {
 		push(p1);
 		negate();
-		sine();
+		ssin();
 		negate();
 		return;
 	}
-	// sin(arctan(x)) = x / sqrt(1 + x^2)
-	// see p. 173 of the CRC Handbook of Mathematical Sciences
+	if (car(p1) == symbol(ADD)) {
+		ssin_of_sum();
+		return;
+	}
+	// sin(arctan(y,x)) = y (x^2 + y^2)^(-1/2)
 	if (car(p1) == symbol(ARCTAN)) {
-		push(cadr(p1));
-		push_integer(1);
-		push(cadr(p1));
-		push_integer(2);
-		power();
+		X = caddr(p1);
+		Y = cadr(p1);
+		push(Y);
+		push(X);
+		push(X);
+		multiply();
+		push(Y);
+		push(Y);
+		multiply();
 		add();
 		push_rational(-1, 2);
 		power();
@@ -18662,14 +18901,14 @@ sine_of_angle(void)
 		return;
 	}
 	// multiply by 180/pi
-	push(p1);
+	push(p1); // nonnegative by code above
 	push_integer(180);
 	multiply();
 	push_symbol(PI);
 	divide();
 	n = pop_integer();
-	if (n < 0) {
-		push(symbol(SIN));
+	if (n == ERR) {
+		push_symbol(SIN);
 		push(p1);
 		list(2);
 		return;
@@ -18726,51 +18965,98 @@ sine_of_angle(void)
 		push_integer(-1);
 		break;
 	default:
-		push(symbol(SIN));
+		push_symbol(SIN);
 		push(p1);
 		list(2);
 		break;
 	}
 }
 
-//	          exp(x) - exp(-x)
-//	sinh(x) = ----------------
-//	                 2
+// sin(x + n/2 pi) = sin(x) cos(n/2 pi) + cos(x) sin(n/2 pi)
+
+void
+ssin_of_sum(void)
+{
+	int n;
+	p2 = cdr(p1);
+	while (iscons(p2)) {
+		push_integer(2);
+		push(car(p2));
+		multiply();
+		push_symbol(PI);
+		divide();
+		n = pop_integer();
+		if (n != ERR) {
+			push(p1);
+			push(car(p2));
+			subtract();
+			p3 = pop();
+			push(p3);
+			ssin();
+			push(car(p2));
+			scos();
+			multiply();
+			push(p3);
+			scos();
+			push(car(p2));
+			ssin();
+			multiply();
+			add();
+			return;
+		}
+		p2 = cdr(p2);
+	}
+	push_symbol(SIN);
+	push(p1);
+	list(2);
+}
 
 void
 eval_sinh(void)
 {
 	push(cadr(p1));
 	eval();
-	ysinh();
+	ssinh();
 }
 
 void
-ysinh(void)
+ssinh(void)
 {
 	save();
-	yysinh();
+	ssinh_nib();
 	restore();
 }
 
 void
-yysinh(void)
+ssinh_nib(void)
 {
-	double d;
 	p1 = pop();
-	if (car(p1) == symbol(ARCSINH)) {
-		push(cadr(p1));
-		return;
-	}
-	if (isdouble(p1)) {
-		d = sinh(p1->u.d);
-		if (fabs(d) < 1e-10)
-			d = 0.0;
-		push_double(d);
+	// sinh(z) = 1/2 (exp(z) - exp(-z))
+	if (isdouble(p1) || isdoublez(p1)) {
+		push_rational(1, 2);
+		push(p1);
+		exponential();
+		push(p1);
+		negate();
+		exponential();
+		subtract();
+		multiply();
 		return;
 	}
 	if (iszero(p1)) {
-		push(zero);
+		push_integer(0);
+		return;
+	}
+	// sinh(-x) -> -sinh(x)
+	if (isnegative(p1)) {
+		push(p1);
+		negate();
+		ssinh();
+		negate();
+		return;
+	}
+	if (car(p1) == symbol(ARCSINH)) {
+		push(cadr(p1));
 		return;
 	}
 	push_symbol(SINH);
@@ -18778,328 +19064,463 @@ yysinh(void)
 	list(2);
 }
 
-//	 _______
-//	|	| <- stack
-//	|	|
-//	|_______|
-//	|	| <- stack + tos
-//	|	|
-//	|	|
-//	|_______|
-//	|	| <- frame
-//	|_______|
-//		  <- stack + TOS
-//
-//	The stack grows from low memory towards high memory. This is so that
-//	multiple expressions can be pushed on the stack and then accessed as an
-//	array.
-//
-//	The frame area holds local variables and grows from high memory towards
-//	low memory. The frame area makes local variables visible to the garbage
-//	collector.
-
-U **frame, *stack[TOS];
-int tos;
-
 void
-push(U *p)
+push(struct atom *p)
 {
-	if (stack + tos >= frame)
-		stop("memory full");
+	if (tos < 0 || tos > STACKSIZE)
+		stop("stack error 1");
+	if (tos == STACKSIZE)
+		stop("stack full");
 	stack[tos++] = p;
+	if (tos > max_stack)
+		max_stack = tos;
 }
 
-U *
+struct atom *
 pop(void)
 {
-	if (tos == 0)
-		stop("stack error");
+	if (tos < 1 || tos > STACKSIZE)
+		stop("stack error 2");
 	return stack[--tos];
-}
-
-void
-push_frame(int n)
-{
-	int i;
-	frame -= n;
-	if (frame < stack + tos)
-		stop("memory full");
-	for (i = 0; i < n; i++)
-		frame[i] = symbol(NIL);
-}
-
-void
-pop_frame(int n)
-{
-	frame += n;
-	if (frame > stack + TOS)
-		stop("frame error");
 }
 
 void
 save(void)
 {
-	frame -= 10;
-	if (frame < stack + tos)
-		stop("memory full");
-	frame[0] = p0;
-	frame[1] = p1;
-	frame[2] = p2;
-	frame[3] = p3;
-	frame[4] = p4;
-	frame[5] = p5;
-	frame[6] = p6;
-	frame[7] = p7;
-	frame[8] = p8;
-	frame[9] = p9;
+	if (interrupt)
+		stop("Interrupt");
+	if (tof < 0 || tof > FRAMESIZE)
+		stop("frame error 1");
+	if (tof + 10 > FRAMESIZE)
+		stop("frame error, circular definition?");
+	frame[tof + 0] = p0;
+	frame[tof + 1] = p1;
+	frame[tof + 2] = p2;
+	frame[tof + 3] = p3;
+	frame[tof + 4] = p4;
+	frame[tof + 5] = p5;
+	frame[tof + 6] = p6;
+	frame[tof + 7] = p7;
+	frame[tof + 8] = p8;
+	frame[tof + 9] = p9;
+	tof += 10;
+	if (tof > max_frame)
+		max_frame = tof;
 }
 
 void
 restore(void)
 {
-	if (frame > stack + TOS - 10)
-		stop("frame error");
-	p0 = frame[0];
-	p1 = frame[1];
-	p2 = frame[2];
-	p3 = frame[3];
-	p4 = frame[4];
-	p5 = frame[5];
-	p6 = frame[6];
-	p7 = frame[7];
-	p8 = frame[8];
-	p9 = frame[9];
-	frame += 10;
+	if (tof < 10 || tof > FRAMESIZE)
+		stop("frame error 2");
+	tof -= 10;
+	p0 = frame[tof + 0];
+	p1 = frame[tof + 1];
+	p2 = frame[tof + 2];
+	p3 = frame[tof + 3];
+	p4 = frame[tof + 4];
+	p5 = frame[tof + 5];
+	p6 = frame[tof + 6];
+	p7 = frame[tof + 7];
+	p8 = frame[tof + 8];
+	p9 = frame[tof + 9];
 }
 
-// Local U * is OK here because there is no functional path to the garbage collector.
+void
+save_binding(struct atom *p)
+{
+	if (tof < 0 || tof > FRAMESIZE)
+		stop("frame error 3");
+	if (tof + 2 > FRAMESIZE)
+		stop("frame error, circular definition?");
+	if (p->k == USYM) {
+		frame[tof + 0] = binding[p->u.usym.index];
+		frame[tof + 1] = arglist[p->u.usym.index];
+	} else {
+		frame[tof + 0] = symbol(NIL);
+		frame[tof + 1] = symbol(NIL);
+	}
+	tof += 2;
+	if (tof > max_frame)
+		max_frame = tof;
+}
+
+void
+restore_binding(struct atom *p)
+{
+	if (tof < 2 || tof > FRAMESIZE)
+		stop("frame error 4");
+	tof -= 2;
+	if (p->k == USYM) {
+		binding[p->u.usym.index] = frame[tof + 0];
+		arglist[p->u.usym.index] = frame[tof + 1];
+	}
+}
 
 void
 swap(void)
 {
-	U *p, *q;
-	p = pop();
-	q = pop();
-	push(p);
-	push(q);
+	struct atom *p1, *p2; // ok, no gc before push
+	p1 = pop();
+	p2 = pop();
+	push(p1);
+	push(p2);
 }
-
-// Local U * is OK here because there is no functional path to the garbage collector.
 
 void
-dupl(void)
+push_string(char *s)
 {
-	U *p;
-	p = pop();
+	struct atom *p; // ok, no gc before push
+	p = alloc();
+	p->k = STR;
+	p->u.str = strdup(s);
+	if (p->u.str == NULL)
+		malloc_kaput();
 	push(p);
-	push(p);
+	string_count++;
 }
-
-/*	Substitute new expr for old expr in expr.
-
-	Input:	push	expr
-
-		push	old expr
-
-		push	new expr
-
-	Output:	Result on stack
-*/
-
-void
-subst(void)
-{
-	int i;
-	save();
-	p3 = pop(); // new expr
-	p2 = pop(); // old expr
-	if (p2 == symbol(NIL) || p3 == symbol(NIL)) {
-		restore();
-		return;
-	}
-	p1 = pop(); // expr
-	if (istensor(p1)) {
-		p4 = alloc_tensor(p1->u.tensor->nelem);
-		p4->u.tensor->ndim = p1->u.tensor->ndim;
-		for (i = 0; i < p1->u.tensor->ndim; i++)
-			p4->u.tensor->dim[i] = p1->u.tensor->dim[i];
-		for (i = 0; i < p1->u.tensor->nelem; i++) {
-			push(p1->u.tensor->elem[i]);
-			push(p2);
-			push(p3);
-			subst();
-			p4->u.tensor->elem[i] = pop();
-		}
-		push(p4);
-	} else if (equal(p1, p2))
-		push(p3);
-	else if (iscons(p1)) {
-		push(car(p1));
-		push(p2);
-		push(p3);
-		subst();
-		push(cdr(p1));
-		push(p2);
-		push(p3);
-		subst();
-		cons();
-	} else
-		push(p1);
-	restore();
-}
-
-// 'sum' function
-
-#undef I
-#undef X
-
-#define I p5
-#define X p6
 
 void
 eval_sum(void)
 {
-	int i, j, k;
-	// 1st arg (quoted)
-	X = cadr(p1);
-	if (!issymbol(X))
+	int h, j, k;
+	p1 = cdr(p1);
+	p2 = car(p1);
+	if (!issymbol(p2))
 		stop("sum: 1st arg?");
-	// 2nd arg
-	push(caddr(p1));
+	p1 = cdr(p1);
+	push(car(p1));
 	eval();
 	j = pop_integer();
-	if (j == (int) 0x80000000)
+	if (j == ERR)
 		stop("sum: 2nd arg?");
-	// 3rd arg
-	push(cadddr(p1));
+	p1 = cdr(p1);
+	push(car(p1));
 	eval();
 	k = pop_integer();
-	if (k == (int) 0x80000000)
+	if (k == ERR)
 		stop("sum: 3rd arg?");
-	// 4th arg
-	p1 = caddddr(p1);
-	push_binding(X);
-	push_integer(0);
-	for (i = j; i <= k; i++) {
-		push_integer(i);
-		set_binding(X, pop());
+	p1 = cadr(p1);
+	save_binding(p2);
+	h = tos;
+	for (;;) {
+		push_integer(j);
+		p3 = pop();
+		set_binding(p2, p3);
 		push(p1);
 		eval();
-		add();
-	}
-	p1 = pop();
-	pop_binding(X);
-	push(p1);
-}
-
-// The symbol table is a simple array of struct U.
-
-U symtab[NSYM];
-U *binding[NSYM];
-U *arglist[NSYM];
-
-// put symbol at index n
-
-void
-std_symbol(char *s, int n)
-{
-	U *p;
-	p = symtab + n;
-	p->u.printname = strdup(s);
-}
-
-// symbol lookup, create symbol if need be
-
-U *
-usr_symbol(char *s)
-{
-	int i;
-	U *p;
-	for (i = 0; i < NSYM; i++) {
-		if (symtab[i].u.printname == 0)
+		if (j < k)
+			j++;
+		else if (j > k)
+			j--;
+		else
 			break;
-		if (strcmp(s, symtab[i].u.printname) == 0)
-			return symtab + i;
+	}
+	add_terms(tos - h);
+	restore_binding(p2);
+}
+
+// symbol lookup, create symbol if not found
+
+struct atom *
+lookup(char *s)
+{
+	int c, i, j;
+	char *t;
+	struct atom *p;
+	c = tolower(*s) - 'a';
+	if (c < 0 || c > 25)
+		c = 26;
+	j = NSYM * c;
+	for (i = 0; i < NSYM; i++) {
+		p = symtab[j];
+		if (p == NULL)
+			break;
+		if (p->k == KSYM)
+			t = p->u.ksym.name;
+		else
+			t = p->u.usym.name;
+		if (strcmp(s, t) == 0)
+			return p;
+		j++;
 	}
 	if (i == NSYM)
-		stop("symbol table overflow");
-	p = symtab + i;
-	p->u.printname = strdup(s);
+		stop("symbol table full");
+	p = alloc();
+	s = strdup(s);
+	if (s == NULL)
+		malloc_kaput();
+	p->k = USYM;
+	p->u.usym.name = s;
+	p->u.usym.index = j;
+	symtab[j] = p;
+	binding[j] = p;
+	arglist[j] = symbol(NIL);
+	usym_count++;
 	return p;
 }
 
-// get the symbol's printname
-
 char *
-get_printname(U *p)
+printname(struct atom *p)
 {
-	if (p->k != SYM)
-		stop("symbol error");
-	return p->u.printname;
+	if (p->k == KSYM)
+		return p->u.ksym.name;
+	else if (p->k == USYM)
+		return p->u.usym.name;
+	else
+		return "?";
 }
 
 void
-set_binding(U *p, U *b)
+set_binding(struct atom *p, struct atom *b)
 {
-	if (p->k != SYM || p - symtab < MARK2) {
-		printf("%d %d\n", MARK2, (int) (p - symtab));
+	if (p->k != USYM)
 		stop("reserved symbol");
+	binding[p->u.usym.index] = b;
+	arglist[p->u.usym.index] = symbol(NIL);
+}
+
+void
+set_binding_and_arglist(struct atom *p, struct atom *b, struct atom *a)
+{
+	if (p->k != USYM)
+		stop("reserved symbol");
+	binding[p->u.usym.index] = b;
+	arglist[p->u.usym.index] = a;
+}
+
+struct atom *
+get_binding(struct atom *p)
+{
+	if (p->k != USYM)
+		stop("symbol error");
+	return binding[p->u.usym.index];
+}
+
+struct atom *
+get_arglist(struct atom *p)
+{
+	if (p->k != USYM)
+		stop("symbol error");
+	return arglist[p->u.usym.index];
+}
+
+struct se {
+	char *str;
+	int index;
+	void (*func)(void);
+};
+
+struct se stab[] = {
+
+	{ "abs",		ABS,		eval_abs		},
+	{ "adj",		ADJ,		eval_adj		},
+	{ "and",		AND,		eval_and		},
+	{ "arccos",		ARCCOS,		eval_arccos		},
+	{ "arccosh",		ARCCOSH,	eval_arccosh		},
+	{ "arcsin",		ARCSIN,		eval_arcsin		},
+	{ "arcsinh",		ARCSINH,	eval_arcsinh		},
+	{ "arctan",		ARCTAN,		eval_arctan		},
+	{ "arctanh",		ARCTANH,	eval_arctanh		},
+	{ "arg",		ARG,		eval_arg		},
+	{ "atomize",		ATOMIZE,	eval_atomize		},
+
+	{ "besselj",		BESSELJ,	eval_besselj		},
+	{ "bessely",		BESSELY,	eval_bessely		},
+	{ "binding",		BINDING,	eval_binding		},
+	{ "binomial",		BINOMIAL,	eval_binomial		},
+
+	{ "ceiling",		CEILING,	eval_ceiling		},
+	{ "check",		CHECK,		eval_check		},
+	{ "choose",		CHOOSE,		eval_choose		},
+	{ "circexp",		CIRCEXP,	eval_circexp		},
+	{ "clear",		CLEAR,		eval_clear		},
+	{ "clock",		CLOCK,		eval_clock		},
+	{ "coeff",		COEFF,		eval_coeff		},
+	{ "cofactor",		COFACTOR,	eval_cofactor		},
+	{ "conj",		CONJ,		eval_conj		},
+	{ "contract",		CONTRACT,	eval_contract		},
+	{ "cos",		COS,		eval_cos		},
+	{ "cosh",		COSH,		eval_cosh		},
+
+	{ "d",			SYMBOL_D,	NULL			},
+	{ "defint",		DEFINT,		eval_defint		},
+	{ "deg",		DEGREE,		eval_degree		},
+	{ "denominator",	DENOMINATOR,	eval_denominator	},
+	{ "derivative",		DERIVATIVE,	eval_derivative		},
+	{ "det",		DET,		eval_det		},
+	{ "dim",		DIM,		eval_dim		},
+	{ "do",			DO,		eval_do			},
+	{ "dot",		DOT,		eval_inner		},
+	{ "draw",		DRAW,		eval_draw		},
+
+	{ "eigen",		EIGEN,		eval_eigen		},
+	{ "eigenval",		EIGENVAL,	eval_eigenval		},
+	{ "eigenvec",		EIGENVEC,	eval_eigenvec		},
+	{ "erf",		ERF,		eval_erf		},
+	{ "erfc",		ERFC,		eval_erfc		},
+	{ "eval",		EVAL,		eval_eval		},
+	{ "exit",		EXIT,		eval_exit		},
+	{ "exp",		EXP,		eval_exp		},
+	{ "expand",		EXPAND,		eval_expand		},
+	{ "expcos",		EXPCOS,		eval_expcos		},
+	{ "expcosh",		EXPCOSH,	eval_expcosh		},
+	{ "expsin",		EXPSIN,		eval_expsin		},
+	{ "expsinh",		EXPSINH,	eval_expsinh		},
+	{ "exptan",		EXPTAN,		eval_exptan		},
+	{ "exptanh",		EXPTANH,	eval_exptanh		},
+
+	{ "factor",		FACTOR,		eval_factor		},
+	{ "factorial",		FACTORIAL,	eval_factorial		},
+	{ "filter",		FILTER,		eval_filter		},
+	{ "float",		FLOATF,		eval_float		},
+	{ "floor",		FLOOR,		eval_floor		},
+	{ "for",		FOR,		eval_for		},
+
+	{ "gcd",		GCD,		eval_gcd		},
+
+	{ "hermite",		HERMITE,	eval_hermite		},
+	{ "hilbert",		HILBERT,	eval_hilbert		},
+
+	{ "i",			SYMBOL_I,	NULL			},
+	{ "imag",		IMAG,		eval_imag		},
+	{ "inner",		INNER,		eval_inner		},
+	{ "integral",		INTEGRAL,	eval_integral		},
+	{ "inv",		INV,		eval_inv		},
+	{ "isprime",		ISPRIME,	eval_isprime		},
+
+	{ "j",			SYMBOL_J,	NULL			},
+
+	{ "laguerre",		LAGUERRE,	eval_laguerre		},
+	{ "last",		LAST,		NULL			},
+	{ "latex",		LATEX,		eval_latex		},
+	{ "lcm",		LCM,		eval_lcm		},
+	{ "leading",		LEADING,	eval_leading		},
+	{ "legendre",		LEGENDRE,	eval_legendre		},
+	{ "lisp",		LISP,		eval_lisp		},
+	{ "log",		LOG,		eval_log		},
+
+	{ "mag",		MAG,		eval_mag		},
+	{ "mathjax",		MATHJAX,	eval_mathjax		},
+	{ "mathml",		MATHML,		eval_mathml		},
+	{ "mod",		MOD,		eval_mod		},
+
+	{ "nil",		NIL,		eval_nil		},
+	{ "not",		NOT,		eval_not		},
+	{ "nroots",		NROOTS,		eval_nroots		},
+	{ "number",		NUMBER,		eval_number		},
+	{ "numerator",		NUMERATOR,	eval_numerator		},
+
+	{ "or",			OR,		eval_or			},
+	{ "outer",		OUTER,		eval_outer		},
+
+	{ "pi",			PI,		NULL			},
+	{ "polar",		POLAR,		eval_polar		},
+	{ "prime",		PRIME,		eval_prime		},
+	{ "print",		PRINT,		eval_print		},
+	{ "product",		PRODUCT,	eval_product		},
+
+	{ "quote",		QUOTE,		eval_quote		},
+	{ "quotient",		QUOTIENT,	eval_quotient		},
+
+	{ "rank",		RANK,		eval_rank		},
+	{ "rationalize",	RATIONALIZE,	eval_rationalize	},
+	{ "real",		REAL,		eval_real		},
+	{ "rect",		RECTF,		eval_rect		},
+	{ "roots",		ROOTS,		eval_roots		},
+	{ "run",		RUN,		eval_run		},
+
+	{ "s",			SYMBOL_S,	NULL			},
+	{ "sgn",		SGN,		eval_sgn		},
+	{ "simplify",		SIMPLIFY,	eval_simplify		},
+	{ "sin",		SIN,		eval_sin		},
+	{ "sinh",		SINH,		eval_sinh		},
+	{ "sqrt",		SQRT,		eval_sqrt		},
+	{ "status",		STATUS,		eval_status		},
+	{ "stop",		STOP,		eval_stop		},
+	{ "string",		STRING,		eval_string		},
+	{ "subst",		SUBST,		eval_subst		},
+	{ "sum",		SUM,		eval_sum		},
+
+	{ "t",			SYMBOL_T,	NULL			},
+	{ "tan",		TAN,		eval_tan		},
+	{ "tanh",		TANH,		eval_tanh		},
+	{ "taylor",		TAYLOR,		eval_taylor		},
+	{ "test",		TEST,		eval_test		},
+	{ "testeq",		TESTEQ,		eval_testeq		},
+	{ "testge",		TESTGE,		eval_testge		},
+	{ "testgt",		TESTGT,		eval_testgt		},
+	{ "testle",		TESTLE,		eval_testle		},
+	{ "testlt",		TESTLT,		eval_testlt		},
+	{ "trace",		TRACE,		NULL			},
+	{ "transpose",		TRANSPOSE,	eval_transpose		},
+	{ "tty",		TTY,		NULL			},
+
+	{ "unit",		UNIT,		eval_unit		},
+
+	{ "x",			SYMBOL_X,	NULL			},
+
+	{ "y",			SYMBOL_Y,	NULL			},
+
+	{ "z",			SYMBOL_Z,	NULL			},
+	{ "zero",		ZERO,		eval_zero		},
+
+	{ "+",			ADD,		eval_add		},
+	{ "*",			MULTIPLY,	eval_multiply		},
+	{ "^",			POWER,		eval_power		},
+	{ "[",			INDEX,		eval_index		},
+	{ "=",			SETQ,		eval_setq		},
+	{ "(e)",		EXP1,		NULL			},
+	{ "(a)",		METAA,		NULL			},
+	{ "(b)",		METAB,		NULL			},
+	{ "(x)",		METAX,		NULL			},
+	{ "(X)",		SPECX,		NULL			},
+};
+
+void
+init_symbol_table(void)
+{
+	int i, n;
+	char *s;
+	struct atom *p;
+	memset(symtab, 0, 27 * NSYM * sizeof (struct atom *));
+	memset(binding, 0, 27 * NSYM * sizeof (struct atom *));
+	memset(arglist, 0, 27 * NSYM * sizeof (struct atom *));
+	n = sizeof stab / sizeof (struct se);
+	for (i = 0; i < n; i++) {
+		p = alloc();
+		s = strdup(stab[i].str);
+		if (s == NULL)
+			malloc_kaput();
+		if (stab[i].func) {
+			p->k = KSYM;
+			p->u.ksym.name = s;
+			p->u.ksym.func = stab[i].func;
+			ksym_count++;
+		} else {
+			p->k = USYM;
+			p->u.usym.name = s;
+			p->u.usym.index = stab[i].index;
+			usym_count++;
+		}
+		symtab[stab[i].index] = p;
 	}
-	binding[p - symtab] = b;
-	arglist[p - symtab] = symbol(NIL);
+	clear_symbols();
 }
 
 void
-set_binding_and_arglist(U *p, U *b, U *a)
+clear_symbols(void)
 {
-	if (p->k != SYM || p - symtab < MARK2)
-		stop("reserved symbol");
-	binding[p - symtab] = b;
-	arglist[p - symtab] = a;
-}
-
-U *
-get_binding(U *p)
-{
-	if (p->k != SYM)
-		stop("symbol error");
-	return binding[p - symtab];
-}
-
-U *
-get_arglist(U *p)
-{
-	if (p->k != SYM)
-		stop("symbol error");
-	return arglist[p - symtab];
-}
-
-// get symbol's number from ptr
-
-int
-symnum(U *p)
-{
-	if (p->k != SYM)
-		stop("symbol error");
-	return (int) (p - symtab);
-}
-
-void
-push_binding(U *p)
-{
-	if (p->k != SYM)
-		stop("symbol expected");
-	push(binding[p - symtab]);
-	push(arglist[p - symtab]);
-}
-
-void
-pop_binding(U *p)
-{
-	if (p->k != SYM)
-		stop("symbol expected");
-	arglist[p - symtab] = pop();
-	binding[p - symtab] = pop();
+	int i, j, k;
+	for (i = 0; i < 27; i++) {
+		for (j = 0; j < NSYM; j++) {
+			k = NSYM * i + j;
+			if (symtab[k] == NULL)
+				break;
+			binding[k] = symtab[k];
+			arglist[k] = symbol(NIL);
+		}
+	}
 }
 
 void
@@ -19107,50 +19528,60 @@ eval_tan(void)
 {
 	push(cadr(p1));
 	eval();
-	tangent();
+	stan();
 }
 
 void
-tangent(void)
+stan(void)
 {
 	save();
-	yytangent();
+	stan_nib();
 	restore();
 }
 
 void
-yytangent(void)
+stan_nib(void)
 {
 	int n;
-	double d;
 	p1 = pop();
-	if (car(p1) == symbol(ARCTAN)) {
-		push(cadr(p1));
-		return;
-	}
 	if (isdouble(p1)) {
-		d = tan(p1->u.d);
-		if (fabs(d) < 1e-10)
-			d = 0.0;
-		push_double(d);
+		push_double(tan(p1->u.d));
 		return;
 	}
-	// tan function is antisymmetric, tan(-x) = -tan(x)
+	if (isdoublez(p1)) {
+		push(p1);
+		ssin();
+		push(p1);
+		scos();
+		divide();
+		return;
+	}
+	// tan(-x) = -tan(x)
 	if (isnegative(p1)) {
 		push(p1);
 		negate();
-		tangent();
+		stan();
 		negate();
 		return;
 	}
+	if (car(p1) == symbol(ADD)) {
+		stan_of_sum();
+		return;
+	}
+	if (car(p1) == symbol(ARCTAN)) {
+		push(cadr(p1));
+		push(caddr(p1));
+		divide();
+		return;
+	}
 	// multiply by 180/pi
-	push(p1);
+	push(p1); // nonnegative by code above
 	push_integer(180);
 	multiply();
 	push_symbol(PI);
 	divide();
 	n = pop_integer();
-	if (n < 0) {
+	if (n == ERR) {
 		push_symbol(TAN);
 		push(p1);
 		list(2);
@@ -19199,80 +19630,101 @@ yytangent(void)
 		negate();
 		break;
 	default:
-		push(symbol(TAN));
+		push_symbol(TAN);
 		push(p1);
 		list(2);
 		break;
 	}
 }
 
-//	           exp(2 x) - 1
-//	tanh(x) = --------------
-//	           exp(2 x) + 1
+// tan(x + n pi) = tan(x)
 
 void
-eval_tanh(void)
+stan_of_sum(void)
 {
-	double d;
-	push(cadr(p1));
-	eval();
-	p1 = pop();
-	if (car(p1) == symbol(ARCTANH)) {
-		push(cadr(p1));
-		return;
+	int n;
+	p2 = cdr(p1);
+	while (iscons(p2)) {
+		push(car(p2));
+		push_symbol(PI);
+		divide();
+		n = pop_integer();
+		if (n != ERR) {
+			push(p1);
+			push(car(p2));
+			subtract();
+			stan();
+			return;
+		}
+		p2 = cdr(p2);
 	}
-	if (isdouble(p1)) {
-		d = tanh(p1->u.d);
-		if (fabs(d) < 1e-10)
-			d = 0.0;
-		push_double(d);
-		return;
-	}
-	if (iszero(p1)) {
-		push(zero);
-		return;
-	}
-	push(symbol(TANH));
+	push_symbol(TAN);
 	push(p1);
 	list(2);
 }
 
-/* Taylor expansion of a function
+void
+eval_tanh(void)
+{
+	push(cadr(p1));
+	eval();
+	stanh();
+}
 
-	push(F)
-	push(X)
-	push(N)
-	push(A)
-	taylor()
-*/
+void
+stanh(void)
+{
+	save();
+	stanh_nib();
+	restore();
+}
+
+void
+stanh_nib(void)
+{
+	p1 = pop();
+	if (isdouble(p1) || isdoublez(p1)) {
+		push(p1);
+		ssinh();
+		push(p1);
+		scosh();
+		divide();
+		return;
+	}
+	if (iszero(p1)) {
+		push_integer(0);
+		return;
+	}
+	// tanh(-x) = -tanh(x)
+	if (isnegative(p1)) {
+		push(p1);
+		negate();
+		stanh();
+		negate();
+		return;
+	}
+	if (car(p1) == symbol(ARCTANH)) {
+		push(cadr(p1));
+		return;
+	}
+	push_symbol(TANH);
+	push(p1);
+	list(2);
+}
 
 void
 eval_taylor(void)
 {
-	// 1st arg
-	p1 = cdr(p1);
+	p1 = cdr(p1);	// f
 	push(car(p1));
 	eval();
-	// 2nd arg
-	p1 = cdr(p1);
+	p1 = cdr(p1);	// x
 	push(car(p1));
 	eval();
-	p2 = pop();
-	if (p2 == symbol(NIL))
-		guess();
-	else
-		push(p2);
-	// 3rd arg
-	p1 = cdr(p1);
+	p1 = cdr(p1);	// n
 	push(car(p1));
 	eval();
-	p2 = pop();
-	if (p2 == symbol(NIL))
-		push_integer(24); // default number of terms
-	else
-		push(p2);
-	// 4th arg
-	p1 = cdr(p1);
+	p1 = cdr(p1);	// a
 	push(car(p1));
 	eval();
 	p2 = pop();
@@ -19281,6 +19733,14 @@ eval_taylor(void)
 	else
 		push(p2);
 	taylor();
+}
+
+void
+taylor(void)
+{
+	save();
+	taylor_nib();
+	restore();
 }
 
 #undef F
@@ -19296,33 +19756,24 @@ eval_taylor(void)
 #define C p5
 
 void
-taylor(void)
+taylor_nib(void)
 {
-	int i, k;
-	save();
+	int h, i, k;
 	A = pop();
 	N = pop();
 	X = pop();
 	F = pop();
 	push(N);
 	k = pop_integer();
-	if (k == (int) 0x80000000) {
-		push(symbol(TAYLOR));
-		push(F);
-		push(X);
-		push(N);
-		push(A);
-		list(5);
-		restore();
-		return;
-	}
+	if (k == ERR)
+		stop("taylor: 3rd arg not numeric or out of range");
+	h = tos;
 	push(F);	// f(a)
 	push(X);
 	push(A);
 	subst();
 	eval();
-	push_integer(1);
-	C = pop();
+	C = one;
 	for (i = 1; i <= k; i++) {
 		push(F);	// f = f'
 		push(X);
@@ -19330,6 +19781,8 @@ taylor(void)
 		F = pop();
 		if (iszero(F))
 			break;
+		if (car(F) == symbol(DERIVATIVE))
+			stop("taylor: 1st arg not differentiable");
 		push(C);	// c = c * (x - a)
 		push(X);
 		push(A);
@@ -19346,227 +19799,168 @@ taylor(void)
 		push_integer(i);
 		factorial();
 		divide();
-		add();
 	}
-	restore();
+	add_terms(tos - h);
 }
-
-//-----------------------------------------------------------------------------
-//
-//	Called from the "eval" module to evaluate tensor elements.
-//
-//	p1 points to the tensor operand.
-//
-//-----------------------------------------------------------------------------
 
 void
 eval_tensor(void)
 {
-	int i, ndim, nelem;
-	U **a, **b;
-	//---------------------------------------------------------------------
-	//
-	//	create a new tensor for the result
-	//
-	//---------------------------------------------------------------------
-	nelem = p1->u.tensor->nelem;
-	ndim = p1->u.tensor->ndim;
-	p2 = alloc_tensor(nelem);
-	p2->u.tensor->ndim = ndim;
-	for (i = 0; i < ndim; i++)
-		p2->u.tensor->dim[i] = p1->u.tensor->dim[i];
-	//---------------------------------------------------------------------
-	//
-	//	b = eval(a)
-	//
-	//---------------------------------------------------------------------
-	a = p1->u.tensor->elem;
-	b = p2->u.tensor->elem;
-	for (i = 0; i < nelem; i++) {
-		push(a[i]);
+	int i;
+	push(p1);
+	copy_tensor();
+	p1 = pop();
+	for (i = 0; i < p1->u.tensor->nelem; i++) {
+		push(p1->u.tensor->elem[i]);
 		eval();
-		b[i] = pop();
+		p1->u.tensor->elem[i] = pop();
 	}
-	//---------------------------------------------------------------------
-	//
-	//	push the result
-	//
-	//---------------------------------------------------------------------
-	push(p2);
+	push(p1);
 	promote_tensor();
 }
 
-//-----------------------------------------------------------------------------
-//
-//	Add tensors
-//
-//	Input:		Operands on stack
-//
-//	Output:		Result on stack
-//
-//-----------------------------------------------------------------------------
+// tensors with elements that are also tensors get promoted to a higher rank
 
 void
-tensor_plus_tensor(void)
+promote_tensor(void)
 {
-	int i, ndim, nelem;
-	U **a, **b, **c;
+	save();
+	promote_tensor_nib();
+	restore();
+}
+
+void
+promote_tensor_nib(void)
+{
+	int i, j, k, ndim1, ndim2, nelem1, nelem2;
+	p1 = pop();
+	if (!istensor(p1)) {
+		push(p1);
+		return;
+	}
+	ndim1 = p1->u.tensor->ndim;
+	nelem1 = p1->u.tensor->nelem;
+	// check
+	p2 = p1->u.tensor->elem[0];
+	for (i = 1; i < nelem1; i++) {
+		p3 = p1->u.tensor->elem[i];
+		if (!compatible_dimensions(p2, p3))
+			stop("tensor dimensions");
+	}
+	if (!istensor(p2)) {
+		push(p1);
+		return; // all elements are scalars
+	}
+	ndim2 = p2->u.tensor->ndim;
+	nelem2 = p2->u.tensor->nelem;
+	if (ndim1 + ndim2 > MAXDIM)
+		stop("rank exceeds max");
+	// alloc
+	p3 = alloc_tensor(nelem1 * nelem2);
+	// merge dimensions
+	k = 0;
+	for (i = 0; i < ndim1; i++)
+		p3->u.tensor->dim[k++] = p1->u.tensor->dim[i];
+	for (i = 0; i < ndim2; i++)
+		p3->u.tensor->dim[k++] = p2->u.tensor->dim[i];
+	p3->u.tensor->ndim = ndim1 + ndim2;
+	// merge elements
+	k = 0;
+	for (i = 0; i < nelem1; i++) {
+		p2 = p1->u.tensor->elem[i];
+		for (j = 0; j < nelem2; j++)
+			p3->u.tensor->elem[k++] = p2->u.tensor->elem[j];
+	}
+	push(p3);
+}
+
+int
+compatible_dimensions(struct atom *p, struct atom *q)
+{
+	int i, n;
+	if (!istensor(p) && !istensor(q))
+		return 1; // both p and q are scalars
+	if (!istensor(p) || !istensor(q))
+		return 0; // scalar and tensor
+	n = p->u.tensor->ndim;
+	if (n != q->u.tensor->ndim)
+		return 0;
+	for (i = 0; i < n; i++)
+		if (p->u.tensor->dim[i] != q->u.tensor->dim[i])
+			return 0;
+	return 1;
+}
+
+void
+add_tensors(void)
+{
+	int i, nelem;
+	struct atom **a, **b;
 	save();
 	p2 = pop();
 	p1 = pop();
-	// are the dimension lists equal?
-	ndim = p1->u.tensor->ndim;
-	if (ndim != p2->u.tensor->ndim) {
-		push(symbol(NIL));
-		restore();
-		return;
-	}
-	for (i = 0; i < ndim; i++)
-		if (p1->u.tensor->dim[i] != p2->u.tensor->dim[i]) {
-			push(symbol(NIL));
-			restore();
-			return;
-		}
-	// create a new tensor for the result
-	nelem = p1->u.tensor->nelem;
-	p3 = alloc_tensor(nelem);
-	p3->u.tensor->ndim = ndim;
-	for (i = 0; i < ndim; i++)
-		p3->u.tensor->dim[i] = p1->u.tensor->dim[i];
-	// c = a + b
+	if (!compatible_dimensions(p1, p2))
+		stop("incompatible tensor arithmetic");
+	push(p1);
+	copy_tensor();
+	p1 = pop();
 	a = p1->u.tensor->elem;
 	b = p2->u.tensor->elem;
-	c = p3->u.tensor->elem;
+	nelem = p1->u.tensor->nelem;
 	for (i = 0; i < nelem; i++) {
 		push(a[i]);
 		push(b[i]);
 		add();
-		c[i] = pop();
+		a[i] = pop();
 	}
-	// push the result
-	push(p3);
+	push(p1);
 	restore();
 }
 
-//-----------------------------------------------------------------------------
-//
-//	careful not to reorder factors
-//
-//-----------------------------------------------------------------------------
-
-void
-tensor_times_scalar(void)
-{
-	int i, ndim, nelem;
-	U **a, **b;
-	save();
-	p2 = pop();
-	p1 = pop();
-	ndim = p1->u.tensor->ndim;
-	nelem = p1->u.tensor->nelem;
-	p3 = alloc_tensor(nelem);
-	p3->u.tensor->ndim = ndim;
-	for (i = 0; i < ndim; i++)
-		p3->u.tensor->dim[i] = p1->u.tensor->dim[i];
-	a = p1->u.tensor->elem;
-	b = p3->u.tensor->elem;
-	for (i = 0; i < nelem; i++) {
-		push(a[i]);
-		push(p2);
-		multiply();
-		b[i] = pop();
-	}
-	push(p3);
-	restore();
-}
-
-void
-scalar_times_tensor(void)
-{
-	int i, ndim, nelem;
-	U **a, **b;
-	save();
-	p2 = pop();
-	p1 = pop();
-	ndim = p2->u.tensor->ndim;
-	nelem = p2->u.tensor->nelem;
-	p3 = alloc_tensor(nelem);
-	p3->u.tensor->ndim = ndim;
-	for (i = 0; i < ndim; i++)
-		p3->u.tensor->dim[i] = p2->u.tensor->dim[i];
-	a = p2->u.tensor->elem;
-	b = p3->u.tensor->elem;
-	for (i = 0; i < nelem; i++) {
-		push(p1);
-		push(a[i]);
-		multiply();
-		b[i] = pop();
-	}
-	push(p3);
-	restore();
-}
-
-int
-is_square_matrix(U *p)
-{
-	if (istensor(p) && p->u.tensor->ndim == 2 && p->u.tensor->dim[0] == p->u.tensor->dim[1])
-		return 1;
-	else
-		return 0;
-}
-
-//-----------------------------------------------------------------------------
-//
-//	gradient of tensor
-//
-//-----------------------------------------------------------------------------
+// gradient of tensor p1 wrt vector p2
 
 void
 d_tensor_tensor(void)
 {
-	int i, j, ndim, nelem;
-	U **a, **b, **c;
+	int i, j, n1, n2, ndim;
+	struct atom **a, **b, **c;
+	if (p2->u.tensor->ndim != 1)
+		stop("vector expected");
 	ndim = p1->u.tensor->ndim;
-	nelem = p1->u.tensor->nelem;
-	if (ndim + 1 >= MAXDIM)
-		goto dont_evaluate;
-	p3 = alloc_tensor(nelem * p2->u.tensor->nelem);
+	if (ndim + 1 > MAXDIM)
+		stop("rank exceeds max");
+	n1 = p1->u.tensor->nelem;
+	n2 = p2->u.tensor->nelem;
+	p3 = alloc_tensor(n1 * n2);
+	// add dim info
 	p3->u.tensor->ndim = ndim + 1;
 	for (i = 0; i < ndim; i++)
 		p3->u.tensor->dim[i] = p1->u.tensor->dim[i];
-	p3->u.tensor->dim[ndim] = p2->u.tensor->dim[0];
+	p3->u.tensor->dim[ndim] = n2;
+	// gradient
 	a = p1->u.tensor->elem;
 	b = p2->u.tensor->elem;
 	c = p3->u.tensor->elem;
-	for (i = 0; i < nelem; i++) {
-		for (j = 0; j < p2->u.tensor->nelem; j++) {
+	for (i = 0; i < n1; i++) {
+		for (j = 0; j < n2; j++) {
 			push(a[i]);
 			push(b[j]);
 			derivative();
-			c[i * p2->u.tensor->nelem + j] = pop();
+			c[n2 * i + j] = pop();
 		}
 	}
 	push(p3);
-	return;
-dont_evaluate:
-	push(symbol(DERIVATIVE));
-	push(p1);
-	push(p2);
-	list(3);
 }
 
-/* Generalized gradient of scalar
-
-	p1	scalar expression
-
-	p2	tensor
-*/
+// gradient of scalar p1 wrt vector p2
 
 void
 d_scalar_tensor(void)
 {
 	int i, n;
-	U **a, **b;
+	struct atom **a, **b;
+	if (p2->u.tensor->ndim != 1)
+		stop("vector expected");
 	push(p2);
 	copy_tensor();
 	p3 = pop();
@@ -19582,24 +19976,20 @@ d_scalar_tensor(void)
 	push(p3);
 }
 
-//-----------------------------------------------------------------------------
-//
-//	Derivative of tensor
-//
-//-----------------------------------------------------------------------------
+// derivative of tensor p1 wrt scalar p2
 
 void
 d_tensor_scalar(void)
 {
-	int i;
-	U **a, **b;
-	p3 = alloc_tensor(p1->u.tensor->nelem);
-	p3->u.tensor->ndim = p1->u.tensor->ndim;
-	for (i = 0; i < p1->u.tensor->ndim; i++)
-		p3->u.tensor->dim[i] = p1->u.tensor->dim[i];
+	int i, n;
+	struct atom **a, **b;
+	push(p1);
+	copy_tensor();
+	p3 = pop();
 	a = p1->u.tensor->elem;
 	b = p3->u.tensor->elem;
-	for (i = 0; i < p1->u.tensor->nelem; i++) {
+	n = p1->u.tensor->nelem;
+	for (i = 0; i < n; i++) {
 		push(a[i]);
 		push(p2);
 		derivative();
@@ -19609,7 +19999,7 @@ d_tensor_scalar(void)
 }
 
 int
-compare_tensors(U *p1, U *p2)
+compare_tensors(struct atom *p1, struct atom *p2)
 {
 	int i;
 	if (p1->u.tensor->ndim < p2->u.tensor->ndim)
@@ -19633,17 +20023,7 @@ compare_tensors(U *p1, U *p2)
 	return 0;
 }
 
-//-----------------------------------------------------------------------------
-//
-//	Raise a tensor to a power
-//
-//	Input:		p1	tensor
-//
-//			p2	exponent
-//
-//	Output:		Result on stack
-//
-//-----------------------------------------------------------------------------
+// tensor p1 to the power p2
 
 void
 power_tensor(void)
@@ -19652,7 +20032,7 @@ power_tensor(void)
 	// first and last dims must be equal
 	k = p1->u.tensor->ndim - 1;
 	if (p1->u.tensor->dim[0] != p1->u.tensor->dim[k]) {
-		push(symbol(POWER));
+		push_symbol(POWER);
 		push(p1);
 		push(p2);
 		list(3);
@@ -19660,21 +20040,16 @@ power_tensor(void)
 	}
 	push(p2);
 	n = pop_integer();
-	if (n == (int) 0x80000000) {
-		push(symbol(POWER));
+	if (n == ERR) {
+		push_symbol(POWER);
 		push(p1);
 		push(p2);
 		list(3);
 		return;
 	}
 	if (n == 0) {
-		if (p1->u.tensor->ndim != 2)
-			stop("power(tensor,0) with tensor rank not equal to 2");
 		n = p1->u.tensor->dim[0];
-		p1 = alloc_tensor(n * n);
-		p1->u.tensor->ndim = 2;
-		p1->u.tensor->dim[0] = n;
-		p1->u.tensor->dim[1] = n;
+		p1 = alloc_matrix(n, n);
 		for (i = 0; i < n; i++)
 			p1->u.tensor->elem[n * i + i] = one;
 		push(p1);
@@ -19690,8 +20065,6 @@ power_tensor(void)
 	for (i = 1; i < n; i++) {
 		push(p1);
 		inner();
-		if (iszero(stack[tos - 1]))
-			break;
 	}
 }
 
@@ -19711,65 +20084,87 @@ copy_tensor(void)
 	restore();
 }
 
-// Tensors with elements that are also tensors get promoted to a higher rank.
+void
+eval_dim(void)
+{
+	int n;
+	push(cadr(p1));
+	eval();
+	p2 = pop();
+	if (iscons(cddr(p1))) {
+		push(caddr(p1));
+		eval();
+		n = pop_integer();
+	} else
+		n = 1;
+	if (!istensor(p2))
+		push_integer(1); // dim of scalar is 1
+	else if (n < 1 || n > p2->u.tensor->ndim)
+		push(p1);
+	else
+		push_integer(p2->u.tensor->dim[n - 1]);
+}
 
 void
-promote_tensor(void)
+eval_rank(void)
 {
-	int i, j, k, nelem, ndim;
-	save();
+	push(cadr(p1));
+	eval();
 	p1 = pop();
-	if (!istensor(p1)) {
-		push(p1);
-		restore();
-		return;
-	}
-	p2 = p1->u.tensor->elem[0];
-	for (i = 1; i < p1->u.tensor->nelem; i++)
-		if (!compatible(p2, p1->u.tensor->elem[i]))
-			stop("Cannot promote tensor due to inconsistent tensor components.");
-	if (!istensor(p2)) {
-		push(p1);
-		restore();
-		return;
-	}
-	ndim = p1->u.tensor->ndim + p2->u.tensor->ndim;
-	if (ndim > MAXDIM)
-		stop("tensor rank > 24");
-	nelem = p1->u.tensor->nelem * p2->u.tensor->nelem;
-	p3 = alloc_tensor(nelem);
-	p3->u.tensor->ndim = ndim;
-	for (i = 0; i < p1->u.tensor->ndim; i++)
-		p3->u.tensor->dim[i] = p1->u.tensor->dim[i];
-	for (j = 0; j < p2->u.tensor->ndim; j++)
-		p3->u.tensor->dim[i + j] = p2->u.tensor->dim[j];
-	k = 0;
-	for (i = 0; i < p1->u.tensor->nelem; i++) {
-		p2 = p1->u.tensor->elem[i];
-		for (j = 0; j < p2->u.tensor->nelem; j++)
-			p3->u.tensor->elem[k++] = p2->u.tensor->elem[j];
-	}
-	push(p3);
-	restore();
+	if (istensor(p1))
+		push_integer(p1->u.tensor->ndim);
+	else
+		push_integer(0);
 }
 
-int
-compatible(U *p, U *q)
+void
+eval_unit(void)
 {
-	int i;
-	if (!istensor(p) && !istensor(q))
-		return 1;
-	if (!istensor(p) || !istensor(q))
-		return 0;
-	if (p->u.tensor->ndim != q->u.tensor->ndim)
-		return 0;
-	for (i = 0; i < p->u.tensor->ndim; i++)
-		if (p->u.tensor->dim[i] != q->u.tensor->dim[i])
-			return 0;
-	return 1;
+	int i, n;
+	push(cadr(p1));
+	eval();
+	n = pop_integer();
+	if (n < 1)
+		stop("unit: index error");
+	if (n == 1) {
+		push_integer(1);
+		return;
+	}
+	p1 = alloc_matrix(n, n);
+	for (i = 0; i < n; i++)
+		p1->u.tensor->elem[n * i + i] = one;
+	push(p1);
 }
 
-// If the number of args is odd then the last arg is the default result.
+void
+eval_zero(void)
+{
+	int dim[MAXDIM], i, m, n;
+	m = 1;
+	n = 0;
+	p1 = cdr(p1);
+	while (iscons(p1)) {
+		if (n == MAXDIM)
+			stop("zero: rank exceeds max");
+		push(car(p1));
+		eval();
+		i = pop_integer();
+		if (i == ERR || i < 2)
+			stop("zero: dimension error");
+		m *= i;
+		dim[n++] = i;
+		p1 = cdr(p1);
+	}
+	if (n == 0) {
+		push_integer(0);
+		return;
+	}
+	p1 = alloc_tensor(m);
+	p1->u.tensor->ndim = n;
+	for (i = 0; i < n; i++)
+		p1->u.tensor->dim[i] = dim[i];
+	push(p1);
+}
 
 void
 eval_test(void)
@@ -19782,7 +20177,7 @@ eval_test(void)
 			return;
 		}
 		push(car(p1));
-		eval_predicate();
+		evalp();
 		p2 = pop();
 		if (!iszero(p2)) {
 			push(cadr(p1));
@@ -19794,31 +20189,171 @@ eval_test(void)
 	push_integer(0);
 }
 
-// The test for equality is weaker than the other relational operators.
-
-// For example, A<=B causes a stop when the result of A minus B is not a
-// numerical value.
-
-// However, A==B never causes a stop.
-
-// For A==B, any nonzero result for A minus B indicates inequality.
+void
+eval_check(void)
+{
+	push(cadr(p1));
+	evalp();
+	p1 = pop();
+	if (iszero(p1))
+		stop("check");
+	push_symbol(NIL); // no result is printed
+}
 
 void
 eval_testeq(void)
 {
+	int i, n;
 	push(cadr(p1));
 	eval();
 	push(caddr(p1));
 	eval();
-	subtract();
+	p2 = pop();
 	p1 = pop();
-	if (iszero(p1))
+	// null tensors are equal no matter the dimensions
+	if (iszero(p1) && iszero(p2)) {
 		push_integer(1);
-	else
+		return;
+	}
+	if (!istensor(p1) && !istensor(p2)) {
+		if (testeq(p1, p2))
+			push_integer(1);
+		else
+			push_integer(0);
+		return;
+	}
+	if (!istensor(p1) && istensor(p2)) {
+		p3 = p1;
+		p1 = p2;
+		p2 = p3;
+	}
+	if (istensor(p1) && !istensor(p2)) {
+		if (!iszero(p2)) {
+			push_integer(0); // tensor not equal scalar
+			return;
+		}
+		n = p1->u.tensor->nelem;
+		for (i = 0; i < n; i++) {
+			if (testeq(p1->u.tensor->elem[i], zero))
+				continue;
+			push_integer(0);
+			return;
+		}
+		push_integer(1);
+		return;
+	}
+	// both p1 and p2 are tensors
+	if (!compatible_dimensions(p1, p2)) {
 		push_integer(0);
+		return;
+	}
+	n = p1->u.tensor->nelem;
+	for (i = 0; i < n; i++) {
+		if (testeq(p1->u.tensor->elem[i], p2->u.tensor->elem[i]))
+			continue;
+		push_integer(0);
+		return;
+	}
+	push_integer(1);
 }
 
-// Relational operators expect a numeric result for operand difference.
+int
+testeq(struct atom *q1, struct atom *q2)
+{
+	int t;
+	save();
+	push(q1);
+	push(q2);
+	subtract();
+	p1 = pop();
+	while (cross_expr(p1)) {
+		push(p1);
+		cancel_factor();
+		p1 = pop();
+	}
+	t = iszero(p1);
+	restore();
+	return t;
+}
+
+int
+cross_expr(struct atom *p)
+{
+	if (car(p) == symbol(ADD)) {
+		p = cdr(p);
+		while (iscons(p)) {
+			if (cross_term(car(p)))
+				return 1;
+			p = cdr(p);
+		}
+		return 0;
+	}
+	return cross_term(p);
+}
+
+int
+cross_term(struct atom *p)
+{
+	if (car(p) == symbol(MULTIPLY)) {
+		p = cdr(p);
+		while (iscons(p)) {
+			if (cross_factor(car(p)))
+				return 1;
+			p = cdr(p);
+		}
+		return 0;
+	}
+	return cross_factor(p);
+}
+
+int
+cross_factor(struct atom *p)
+{
+	if (isrational(p)) {
+		if (MEQUAL(p->u.q.b, 1))
+			return 0;
+		push_rational_number(MPLUS, mcopy(p->u.q.b), mint(1));
+		return 1;
+	}
+	if (car(p) == symbol(POWER) && !isminusone(cadr(p)) && isnegativeterm(caddr(p))) {
+		if (isminusone(caddr(p)))
+			push(cadr(p));
+		else {
+			push_symbol(POWER);
+			push(cadr(p));
+			push(caddr(p));
+			negate();
+			list(3);
+		}
+		return 1;
+	}
+	return 0;
+}
+
+void
+cancel_factor(void)
+{
+	int h;
+	save();
+	p2 = pop();
+	p1 = pop();
+	if (car(p2) == symbol(ADD)) {
+		h = tos;
+		p2 = cdr(p2);
+		while (iscons(p2)) {
+			push(p1);
+			push(car(p2));
+			multiply();
+			p2 = cdr(p2);
+		}
+		add_terms(tos - h);
+	} else {
+		push(p1);
+		push(p2);
+		multiply();
+	}
+	restore();
+}
 
 void
 eval_testge(void)
@@ -19860,7 +20395,7 @@ void
 eval_not(void)
 {
 	push(cadr(p1));
-	eval_predicate();
+	evalp();
 	p1 = pop();
 	if (iszero(p1))
 		push_integer(1);
@@ -19874,7 +20409,7 @@ eval_and(void)
 	p1 = cdr(p1);
 	while (iscons(p1)) {
 		push(car(p1));
-		eval_predicate();
+		evalp();
 		p2 = pop();
 		if (iszero(p2)) {
 			push_integer(0);
@@ -19891,7 +20426,7 @@ eval_or(void)
 	p1 = cdr(p1);
 	while (iscons(p1)) {
 		push(car(p1));
-		eval_predicate();
+		evalp();
 		p2 = pop();
 		if (!iszero(p2)) {
 			push_integer(1);
@@ -19902,8 +20437,6 @@ eval_or(void)
 	push_integer(0);
 }
 
-// use subtract for cases like A < A + 1
-
 int
 cmp_args(void)
 {
@@ -19912,253 +20445,146 @@ cmp_args(void)
 	eval();
 	push(caddr(p1));
 	eval();
+	p2 = pop();
+	p1 = pop();
+	if (istensor(p1) || istensor(p2))
+		stop("tensor comparison");
+	push(p1);
+	push(p2);
 	subtract();
 	p1 = pop();
-	// try floating point if necessary
-	if (p1->k != NUM && p1->k != DOUBLE) {
+	if (!isnum(p1)) {
 		push(p1);
-		yyfloat();
-		eval();
+		sfloat(); // try converting pi and e
 		p1 = pop();
+		if (!isnum(p1))
+			stop("non-numerical comparison");
 	}
 	if (iszero(p1))
-		return 0;
-	switch (p1->k) {
-	case NUM:
-		if (MSIGN(p1->u.q.a) == -1)
-			t = -1;
-		else
-			t = 1;
-		break;
-	case DOUBLE:
-		if (p1->u.d < 0.0)
-			t = -1;
-		else
-			t = 1;
-		break;
-	default:
-		stop("relational operator: cannot determine due to non-numerical comparison");
 		t = 0;
-	}
+	else if (isrational(p1))
+		t = (p1->sign == MMINUS) ? -1 : 1;
+	else
+		t = (p1->u.d < 0.0) ? -1 : 1;
 	return t;
 }
 
-/* Transform an expression using table look-up
-
-The expression and free variable are on the stack.
-
-The argument s is a null terminated list of transform rules.
-
-For example, see itab.cpp
-
-Internally, the following symbols are used:
-
-	F	input expression
-
-	X	free variable, i.e. F of X
-
-	A	template expression
-
-	B	result expression
-
-	C	list of conditional expressions
-*/
-
-// p1 and p2 are tmps
-
-#undef F
-#undef X
-#undef A
-#undef B
-#undef C
-
-#define F p3
-#define X p4
-#define A p5
-#define B p6
-#define C p7
+// like eval() except '=' is evaluated as '=='
 
 void
-transform(char **s)
+evalp(void)
 {
-	int h;
 	save();
-	X = pop();
-	F = pop();
-	// save symbol context in case eval(B) below calls transform
-	push(get_binding(symbol(METAA)));
-	push(get_binding(symbol(METAB)));
-	push(get_binding(symbol(METAX)));
-	set_binding(symbol(METAX), X);
-	// put constants in F(X) on the stack
-	h = tos;
-	push_integer(1);
-	push(F);
-	push(X);
-	polyform(); // collect coefficients of x, x^2, etc.
-	push(X);
-	decomp_nib();
-	while (*s) {
-		scan_meta(*s);
-		p1 = pop();
-		A = cadr(p1);
-		B = caddr(p1);
-		C = cdddr(p1);
-		if (f_equals_a(h))
-			break;
-		s++;
-	}
-	tos = h;
-	if (*s) {
-		push(B);
+	p1 = pop();
+	if (car(p1) == symbol(SETQ))
+		eval_testeq();
+	else {
+		push(p1);
 		eval();
-		p1 = pop();
-	} else
-		p1 = symbol(NIL);
-	set_binding(symbol(METAX), pop());
-	set_binding(symbol(METAB), pop());
-	set_binding(symbol(METAA), pop());
-	push(p1);
+	}
 	restore();
 }
-
-// search for a METAA and METAB such that F = A
-
-int
-f_equals_a(int h)
-{
-	int i, j;
-	for (i = h; i < tos; i++) {
-		set_binding(symbol(METAA), stack[i]);
-		for (j = h; j < tos; j++) {
-			set_binding(symbol(METAB), stack[j]);
-			p1 = C;				// are conditions ok?
-			while (iscons(p1)) {
-				push(car(p1));
-				eval();
-				p2 = pop();
-				if (iszero(p2))
-					break;
-				p1 = cdr(p1);
-			}
-			if (iscons(p1))			// no, try next j
-				continue;
-			push(F);			// F = A?
-			push(A);
-			eval();
-			subtract();
-			p1 = pop();
-			if (iszero(p1))
-				return 1;		// yes
-		}
-	}
-	return 0;					// no
-}
-
-// Transpose tensor indices
 
 void
 eval_transpose(void)
 {
 	push(cadr(p1));
 	eval();
-	if (cddr(p1) == symbol(NIL)) {
+	p2 = pop();
+	push(p2);
+	if (!istensor(p2) || p2->u.tensor->ndim == 1)
+		return; // scalar or vector
+	p1 = cddr(p1);
+	if (!iscons(p1)) {
 		push_integer(1);
 		push_integer(2);
-	} else {
-		push(caddr(p1));
-		eval();
-		push(cadddr(p1));
-		eval();
+		transpose();
+		return;
 	}
-	transpose();
+	while (iscons(p1)) {
+		push(car(p1));
+		eval();
+		push(cadr(p1));
+		eval();
+		transpose();
+		p1 = cddr(p1);
+	}
 }
 
 void
 transpose(void)
 {
-	int i, j, k, l, m, ndim, nelem, t;
-	int ai[MAXDIM], an[MAXDIM];
-	U **a, **b;
 	save();
-	p3 = pop();
-	p2 = pop();
-	p1 = pop();
-	if (!istensor(p1)) {
-		if (!iszero(p1))
-			stop("transpose: tensor expected, 1st arg is not a tensor");
-		push(zero);
-		restore();
-		return;
-	}
-	ndim = p1->u.tensor->ndim;
-	nelem = p1->u.tensor->nelem;
-	// vector?
-	if (ndim == 1) {
-		push(p1);
-		restore();
-		return;
-	}
-	push(p2);
-	l = pop_integer();
-	push(p3);
-	m = pop_integer();
-	if (l < 1 || l > ndim || m < 1 || m > ndim)
-		stop("transpose: index out of range");
-	l--;
-	m--;
-	p2 = alloc_tensor(nelem);
-	p2->u.tensor->ndim = ndim;
-	for (i = 0; i < ndim; i++)
-		p2->u.tensor->dim[i] = p1->u.tensor->dim[i];
-	p2->u.tensor->dim[l] = p1->u.tensor->dim[m];
-	p2->u.tensor->dim[m] = p1->u.tensor->dim[l];
-	a = p1->u.tensor->elem;
-	b = p2->u.tensor->elem;
-	for (i = 0; i < ndim; i++) {
-		ai[i] = 0;
-		an[i] = p1->u.tensor->dim[i];
-	}
-	// copy components from a to b
-	for (i = 0; i < nelem; i++) {
-		t = ai[l]; ai[l] = ai[m]; ai[m] = t;
-		t = an[l]; an[l] = an[m]; an[m] = t;
-		k = 0;
-		for (j = 0; j < ndim; j++)
-			k = (k * an[j]) + ai[j];
-		t = ai[l]; ai[l] = ai[m]; ai[m] = t;
-		t = an[l]; an[l] = an[m]; an[m] = t;
-		b[k] = a[i];
-		for (j = ndim - 1; j >= 0; j--) {
-			if (++ai[j] < an[j])
-				break;
-			ai[j] = 0;
-		}
-	}
-	push(p2);
+	transpose_nib();
 	restore();
 }
 
-// Evaluate a user defined function
+void
+transpose_nib(void)
+{
+	int i, j, k, m, n, ndim, nelem;
+	int index[MAXDIM];
+	struct atom **a, **b;
+	p3 = pop();
+	p2 = pop();
+	p1 = pop();
+	ndim = p1->u.tensor->ndim;
+	nelem = p1->u.tensor->nelem;
+	push(p2);
+	n = pop_integer();
+	push(p3);
+	m = pop_integer();
+	if (n < 1 || n > ndim || m < 1 || m > ndim)
+		stop("transpose: index error");
+	n--; // make zero based
+	m--;
+	push(p1);
+	copy_tensor();
+	p2 = pop();
+	// interchange indices n and m
+	p2->u.tensor->dim[n] = p1->u.tensor->dim[m];
+	p2->u.tensor->dim[m] = p1->u.tensor->dim[n];
+	// copy from a to b
+	a = p1->u.tensor->elem;
+	b = p2->u.tensor->elem;
+	for (i = 0; i < ndim; i++)
+		index[i] = 0;
+	for (i = 0; i < nelem; i++) {
+		k = 0;
+		for (j = 0; j < ndim; j++) {
+			if (j == n)
+				k = k * p1->u.tensor->dim[m] + index[m];
+			else if (j == m)
+				k = k * p1->u.tensor->dim[n] + index[n];
+			else
+				k = k * p1->u.tensor->dim[j] + index[j];
+		}
+		b[k] = a[i];
+		// increment index
+		for (j = ndim - 1; j >= 0; j--) {
+			if (++index[j] < p1->u.tensor->dim[j])
+				break;
+			index[j] = 0;
+		}
+	}
+	push(p2);
+}
 
 #undef F
 #undef A
 #undef B
 #undef S
 
-#define F p3 // F is the function body
-#define A p4 // A is the formal argument list
-#define B p5 // B is the calling argument list
-#define S p6 // S is the argument substitution list
-
-int rewrite_args(void);
-int rewrite_args_tensor(void);
+#define F p4 // F is the function body
+#define A p5 // A is the formal argument list
+#define B p6 // B is the calling argument list
+#define S p7 // S is the argument substitution list
 
 void
 eval_user_function(void)
 {
 	int h;
-	// Use "derivative" instead of "d" if there is no user function "d"
+	// use "derivative" instead of "d" if there is no user function "d"
 	if (car(p1) == symbol(SYMBOL_D) && get_arglist(symbol(SYMBOL_D)) == symbol(NIL)) {
 		eval_derivative();
 		return;
@@ -20166,7 +20592,7 @@ eval_user_function(void)
 	F = get_binding(car(p1));
 	A = get_arglist(car(p1));
 	B = cdr(p1);
-	// Undefined function?
+	// undefined function?
 	if (F == car(p1)) {
 		h = tos;
 		push(F);
@@ -20179,7 +20605,7 @@ eval_user_function(void)
 		list(tos - h);
 		return;
 	}
-	// Create the argument substitution list S
+	// create the argument substitution list S
 	p1 = A;
 	p2 = B;
 	h = tos;
@@ -20192,201 +20618,78 @@ eval_user_function(void)
 	}
 	list(tos - h);
 	S = pop();
-	// Evaluate the function body
+	// evaluate the function body
 	push(F);
-	if (iscons(S)) {
-		push(S);
-		rewrite_args();
-	}
+	if (iscons(S))
+		rewrite();
 	eval();
 }
 
-// Rewrite by expanding symbols that contain args
+int
+rewrite(void)
+{
+	int n;
+	save();
+	n = rewrite_nib();
+	restore();
+	return n;
+}
 
 int
-rewrite_args(void)
+rewrite_nib(void)
 {
-	int h, n = 0;
-	save();
-	p2 = pop(); // subst. list
-	p1 = pop(); // expr
+	int h, i, m, n = 0;
+	p1 = pop();
 	if (istensor(p1)) {
-		n = rewrite_args_tensor();
-		restore();
+		push(p1);
+		copy_tensor();
+		p1 = pop();
+		m = p1->u.tensor->nelem;
+		for (i = 0; i < m; i++) {
+			push(p1->u.tensor->elem[i]);
+			n += rewrite();
+			p1->u.tensor->elem[i] = pop();
+		}
+		push(p1);
 		return n;
 	}
 	if (iscons(p1)) {
 		h = tos;
-		push(car(p1)); // Do not rewrite function name
+		push(car(p1)); // don't rewrite function name
 		p1 = cdr(p1);
 		while (iscons(p1)) {
 			push(car(p1));
-			push(p2);
-			n += rewrite_args();
+			n += rewrite();
 			p1 = cdr(p1);
 		}
 		list(tos - h);
-		restore();
 		return n;
 	}
-	// If not a symbol then done
+	// if not a symbol then done
 	if (!issymbol(p1)) {
 		push(p1);
-		restore();
-		return 0;
+		return 0; // no substitution
 	}
-	// Try for an argument substitution first
-	p3 = p2;
-	while (iscons(p3)) {
-		if (p1 == car(p3)) {
-			push(cadr(p3));
-			restore();
-			return 1;
-		}
-		p3 = cddr(p3);
-	}
-	// Get the symbol's binding, try again
-	p3 = get_binding(p1);
-	push(p3);
-	if (p1 != p3) {
-		push(p2); // subst. list
-		n = rewrite_args();
-		if (n == 0) {
-			pop();
-			push(p1); // restore if not rewritten with arg
-		}
-	}
-	restore();
-	return n;
-}
-
-int
-rewrite_args_tensor(void)
-{
-	int i, n = 0;
-	push(p1);
-	copy_tensor();
-	p1 = pop();
-	for (i = 0; i < p1->u.tensor->nelem; i++) {
-		push(p1->u.tensor->elem[i]);
-		push(p2);
-		n += rewrite_args();
-		p1->u.tensor->elem[i] = pop();
-	}
-	push(p1);
-	return n;
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Scan expr for vars, return in vector
-//
-//	Input:		Expression on stack
-//
-//	Output:		Vector
-//
-//-----------------------------------------------------------------------------
-
-int global_h;
-
-void
-variables(void)
-{
-	int i, n;
-	save();
-	p1 = pop();
-	global_h = tos;
-	lscan(p1);
-	n = tos - global_h;
-	if (n > 1)
-		qsort(stack + global_h, n, sizeof (U *), var_cmp);
-	p1 = alloc_tensor(n);
-	p1->u.tensor->ndim = 1;
-	p1->u.tensor->dim[0] = n;
-	for (i = 0; i < n; i++)
-		p1->u.tensor->elem[i] = stack[i];
-	tos = global_h;
-	push(p1);
-	restore();
-}
-
-void
-lscan(U *p)
-{
-	int i;
-	if (iscons(p)) {
-		p = cdr(p);
-		while (iscons(p)) {
-			lscan(car(p));
-			p = cdr(p);
-		}
-	} else if (issymbol(p) && p != symbol(EXP1)) {
-		for (i = global_h; i < tos; i++)
-			if (stack[i] == p)
-				return;
-		push(p);
-	}
-}
-
-int
-var_cmp(const void *p1, const void *p2)
-{
-	return cmp_expr(*((U **) p1), *((U **) p2));
-}
-
-//-----------------------------------------------------------------------------
-//
-//	Encapsulate stack values in a vector
-//
-//	Input:		n		Number of values on stack
-//
-//			tos-n		Start of value
-//
-//	Output:		Vector on stack
-//
-//-----------------------------------------------------------------------------
-
-void
-vectorize(int n)
-{
-	int i;
-	save();
-	p1 = alloc_tensor(n);
-	p1->u.tensor->ndim = 1;
-	p1->u.tensor->dim[0] = n;
-	for (i = 0; i < n; i++)
-		p1->u.tensor->elem[i] = stack[tos - n + i];
-	tos -= n;
-	push(p1);
-	restore();
-}
-
-void
-eval_zero(void)
-{
-	int i, k[MAXDIM], m, n;
-	m = 1;
-	n = 0;
-	p2 = cdr(p1);
+	// check argument substitution list
+	p2 = S;
 	while (iscons(p2)) {
-		push(car(p2));
-		eval();
-		i = pop_integer();
-		if (i < 2) {
-			push(zero);
-			return;
+		if (p1 == car(p2)) {
+			push(cadr(p2));
+			return 1; // substitution occurred
 		}
-		m *= i;
-		k[n++] = i;
-		p2 = cdr(p2);
+		p2 = cddr(p2);
 	}
+	// get the symbol's binding, try again
+	p2 = get_binding(p1);
+	if (p1 == p2) {
+		push(p1);
+		return 0; // no substitution
+	}
+	push(p2);
+	n = rewrite();
 	if (n == 0) {
-		push(zero);
-		return;
+		p2 = pop(); // undo
+		push(p1);
 	}
-	p1 = alloc_tensor(m);
-	p1->u.tensor->ndim = n;
-	for (i = 0; i < n; i++)
-		p1->u.tensor->dim[i] = k[i];
-	push(p1);
+	return n;
 }
